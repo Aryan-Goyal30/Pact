@@ -1,0 +1,148 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+// ---------------------------------------------------------------------------
+// PACT data model — Phase 1 foundation.
+//
+// These tables exist now so later phases (negotiation agents, Razorpay
+// payments, recovery) have somewhere to write without a schema rewrite.
+// No negotiation/payment/recovery *logic* is implemented yet.
+// ---------------------------------------------------------------------------
+
+// A single merchant profile. PACT is single-tenant for the hackathon MVP,
+// so this table only ever holds one row.
+model Merchant {
+  id                 String   @id @default(cuid())
+  name               String
+  deliveryPolicy     String
+  returnPolicy       String
+  negotiationEnabled Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+}
+
+// A product the merchant sells. listedPrice/availableQty are public
+// (safe to expose in the future AI-readable manifest). minPrice is the
+// merchant's private price floor and must never be exposed to a buyer
+// agent — only used internally by the future negotiation rule engine.
+model CatalogItem {
+  id                   String   @id @default(cuid())
+  sku                  String   @unique
+  name                 String
+  description          String
+  listedPrice          Float
+  minPrice             Float
+  availableQty         Int
+  standardDeliveryDays Int
+  maxDeliveryDays      Int
+  negotiationEnabled   Boolean  @default(true)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  negotiationMessages NegotiationMessage[]
+  agreements          Agreement[]
+}
+
+// One buyer-initiated negotiation thread. Created when a buyer agent
+// sends a structured requirement; closes as "agreed", "rejected", or
+// "expired" (round limit reached without agreement).
+model NegotiationSession {
+  id              String   @id @default(cuid())
+  status          String   @default("open") // open | agreed | rejected | expired
+  buyerRequestRaw String
+  roundCount      Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  messages  NegotiationMessage[]
+  agreement Agreement?
+  auditLogs AuditLog[]
+}
+
+// One turn in a negotiation (a request, offer, counter-offer, accept, or
+// reject). isValid records whether the rule engine accepted the proposed
+// terms — an LLM-proposed action that fails validation is still logged
+// here for the audit trail, with isValid = false.
+model NegotiationMessage {
+  id            String   @id @default(cuid())
+  sessionId     String
+  sender        String // buyer | merchant
+  type          String // request | offer | counter_offer | accept | reject
+  catalogItemId String?
+  quantity      Int?
+  pricePerUnit  Float?
+  deliveryDays  Int?
+  messageText   String
+  isValid       Boolean  @default(true)
+  round         Int
+  createdAt     DateTime @default(now())
+
+  session     NegotiationSession @relation(fields: [sessionId], references: [id])
+  catalogItem CatalogItem?       @relation(fields: [catalogItemId], references: [id])
+}
+
+// The bounded terms both agents settled on. Payment can only ever be
+// created from a valid Agreement, never directly from a negotiation.
+model Agreement {
+  id            String   @id @default(cuid())
+  sessionId     String   @unique
+  catalogItemId String
+  quantity      Int
+  pricePerUnit  Float
+  deliveryDays  Int
+  totalAmount   Float
+  status        String   @default("pending_payment") // pending_payment | paid | failed | recovered | closed
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  session         NegotiationSession @relation(fields: [sessionId], references: [id])
+  catalogItem     CatalogItem        @relation(fields: [catalogItemId], references: [id])
+  paymentAttempts PaymentAttempt[]
+  auditLogs       AuditLog[]
+}
+
+// One Razorpay payment try for an Agreement. isRecovery distinguishes the
+// original attempt from the single bounded retry/fallback attempt allowed
+// by the future recovery flow.
+model PaymentAttempt {
+  id              String   @id @default(cuid())
+  agreementId     String
+  attemptNumber   Int
+  isRecovery      Boolean  @default(false)
+  razorpayOrderId String?
+  status          String   @default("created") // created | success | failed
+  failureReason   String?
+  createdAt       DateTime @default(now())
+
+  agreement Agreement  @relation(fields: [agreementId], references: [id])
+  auditLogs AuditLog[]
+}
+
+// Append-only event log covering the whole flow: buyer request, merchant
+// evaluation, offers/counter-offers, validation results, agreement,
+// payment attempts/results, recovery actions. This is what makes PACT's
+// money-related decisions explainable and auditable.
+model AuditLog {
+  id               String   @id @default(cuid())
+  eventType        String
+  sessionId        String?
+  agreementId      String?
+  paymentAttemptId String?
+  payload          String // JSON-encoded event details
+  createdAt        DateTime @default(now())
+
+  session        NegotiationSession? @relation(fields: [sessionId], references: [id])
+  agreement      Agreement?          @relation(fields: [agreementId], references: [id])
+  paymentAttempt PaymentAttempt?     @relation(fields: [paymentAttemptId], references: [id])
+}
