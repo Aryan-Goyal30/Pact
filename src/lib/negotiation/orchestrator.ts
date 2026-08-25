@@ -166,34 +166,31 @@ export async function runNegotiationTurn(
     };
   }
 
-  // Buyer sent a genuine ask ("request" or "counter_offer"). Before
-  // spending a counter-offer round, check whether the merchant could
-  // simply accept it as-is — validateProposedAgreement is the same gate
-  // that will later decide Agreement eligibility, reused here exactly
-  // as Phase 3 intended ("reusable later by BOTH the buyer and merchant
-  // agent flow"). This is what lets a negotiation converge once the
-  // buyer's ask is already within the merchant's real (private)
-  // constraints, instead of the merchant re-countering with the same
-  // anchored-midpoint offer forever.
-  const directAcceptCheck = validateProposedAgreement(context.item, {
-    sku: buyerResponse.action.sku,
-    quantity: buyerResponse.action.quantity,
-    unitPrice: buyerResponse.action.unitPrice,
-    deliveryDays: buyerResponse.action.deliveryDays,
-  });
-
-  if (directAcceptCheck.outcome === "ACCEPTED") {
-    return closeNegotiation(state, buyerMessage, buyerResponse.action, true, []);
-  }
-
-  // Otherwise, fall back to a fresh deterministic evaluation + LLM
-  // phrasing via the existing Phase 4 Merchant Agent.
-  const merchantAgentResponse = await runMerchantAgent(context.item, {
-    sku: buyerResponse.action.sku,
-    quantity: buyerResponse.action.quantity,
-    maxUnitPrice: buyerResponse.action.unitPrice,
-    deliveryDeadlineDays: buyerResponse.action.deliveryDays,
-  });
+  // Buyer sent a genuine ask ("request" or "counter_offer"). The
+  // merchant does NOT accept just because the ask clears its private
+  // floor — minPrice is an absolute floor, not a target. It evaluates
+  // the request deterministically and, when a price concession is
+  // actually in play, prices its response with the round-aware
+  // concession strategy (computeMerchantConcessionPrice) so it keeps
+  // trying for the highest valid price across rounds instead of
+  // caving to the buyer's number the first time it's technically
+  // acceptable. The negotiation only ever closes when the BUYER
+  // explicitly decides (via buyerRules.ts, in the branches above) that
+  // a specific merchant offer is good enough to accept.
+  const merchantAgentResponse = await runMerchantAgent(
+    context.item,
+    {
+      sku: buyerResponse.action.sku,
+      quantity: buyerResponse.action.quantity,
+      maxUnitPrice: buyerResponse.action.unitPrice,
+      deliveryDeadlineDays: buyerResponse.action.deliveryDays,
+    },
+    {
+      round: state.round + 1,
+      maxRounds: state.maxRounds,
+      previousOfferUnitPrice: previousMerchantResult?.unitPrice ?? undefined,
+    },
+  );
   const merchantResult = merchantAgentResponse.decision;
   const nextState = advanceNegotiationState(state, merchantResult.outcome);
 

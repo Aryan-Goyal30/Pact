@@ -139,6 +139,93 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
       expect(JSON.stringify(turn.buyer)).not.toContain("44000");
     }
   });
+
+  // 1, 3, 6. Correction: the merchant must not cave to 45000 the first
+  // time it's technically above the floor — it should gradually concede
+  // (round 2), only settling once it has no better valid counter left
+  // to make (round 3), with the buyer then explicitly accepting
+  // (round 4). This pins the exact turn-by-turn trace so a regression
+  // back to "accept as soon as it clears the floor" would fail loudly.
+  it("gradually concedes across rounds instead of accepting 45000 the first time it clears the floor", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(demoContext(), 4);
+
+    expect(transcript.map((t) => t.merchant.type)).toEqual([
+      "counter_offer",
+      "counter_offer",
+      "counter_offer",
+      "accept",
+    ]);
+    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([46500, 45750, 45000, 45000]);
+    // Every merchant counter strictly decreases toward (never below) the
+    // buyer's ceiling — genuine gradual concession, not a static repeat.
+    expect(transcript[1].merchant.unitPrice!).toBeLessThan(transcript[0].merchant.unitPrice!);
+    expect(transcript[2].merchant.unitPrice!).toBeLessThan(transcript[1].merchant.unitPrice!);
+    // 5. The buyer never proposes or accepts above its own ceiling, on any turn.
+    for (const turn of transcript) {
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(demoBuyerConstraints.maxUnitPrice);
+      }
+    }
+    expect(finalState.status).toBe("AGREED");
+  });
+});
+
+// 7. A second product scenario, proving the concession strategy is
+// general rather than tuned to the laptop's specific numbers.
+describe("runNegotiationToCompletion — a different product (monitor)", () => {
+  const monitor: CatalogItemSnapshot = {
+    sku: "MONITOR-24-FHD",
+    listedPrice: 9500,
+    minPrice: 8200,
+    availableQty: 250,
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 10,
+    negotiationEnabled: true,
+  };
+
+  const monitorManifestListing: PublicManifestProduct = {
+    sku: "MONITOR-24-FHD",
+    name: "24-inch Full HD Monitor",
+    description: "Standard office monitor, 1920x1080.",
+    listedPrice: 9500,
+    availableQuantity: 250,
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 10,
+    negotiable: true,
+  };
+
+  it("converges without ever violating this product's own floor, stock, or delivery constraints", async () => {
+    const context: NegotiationContext = {
+      item: monitor,
+      manifestProduct: monitorManifestListing,
+      buyerConstraints: {
+        sku: "MONITOR-24-FHD",
+        quantity: 50,
+        maxUnitPrice: 8800,
+        deliveryDeadlineDays: 8,
+      },
+    };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(context, 4);
+
+    expect(finalState.status).toBe("AGREED");
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(monitor.minPrice);
+        expect(turn.merchant.unitPrice).toBeLessThanOrEqual(monitor.listedPrice);
+      }
+      if (turn.merchant.quantity !== null) {
+        expect(turn.merchant.quantity).toBeLessThanOrEqual(monitor.availableQty);
+      }
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(8800);
+      }
+    }
+    // Same qualitative shape as the laptop demo: gradual concession, not
+    // an instant accept — proving the strategy isn't laptop-specific.
+    expect(transcript[0].merchant.type).toBe("counter_offer");
+    expect(transcript[0].merchant.unitPrice).not.toBe(8800);
+  });
 });
 
 // 7. Negotiation round count remains bounded.

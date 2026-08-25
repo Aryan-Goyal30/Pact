@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { CatalogItemSnapshot } from "./catalogRules";
 import {
   computeCounterOfferPrice,
+  computeMerchantConcessionPrice,
   evaluateNegotiationRequest,
   validateProposedAgreement,
+  type MerchantConcessionContext,
 } from "./negotiationEngine";
 
 const item: CatalogItemSnapshot = {
@@ -156,6 +158,64 @@ describe("computeCounterOfferPrice", () => {
     expect(computeCounterOfferPrice(item, 900)).toBe(950); // midpoint of 1000 and 900
     expect(computeCounterOfferPrice(item, 0)).toBe(item.minPrice); // clamped up to floor
     expect(computeCounterOfferPrice(item, 1000)).toBeLessThanOrEqual(item.listedPrice);
+  });
+});
+
+describe("computeMerchantConcessionPrice", () => {
+  const roundContext = (
+    round: number,
+    previousOfferUnitPrice?: number,
+    maxRounds = 4,
+  ): MerchantConcessionContext => ({ round, maxRounds, previousOfferUnitPrice });
+
+  it("matches computeCounterOfferPrice exactly on the opening round (no previous offer)", () => {
+    expect(computeMerchantConcessionPrice(item, 900, roundContext(1))).toBe(
+      computeCounterOfferPrice(item, 900),
+    );
+  });
+
+  // 2. The merchant can produce a valid counter-offer above the buyer's
+  // current proposed price while remaining <= listedPrice and >= minPrice.
+  it("concedes only partway toward the buyer's ceiling on a middle round, staying above it", () => {
+    const price = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+    expect(price).toBeGreaterThan(900); // still above the buyer's ask — not caving
+    expect(price).toBeLessThan(950); // but has moved down from its own previous position
+    expect(price).toBeLessThanOrEqual(item.listedPrice);
+    expect(price).toBeGreaterThanOrEqual(item.minPrice);
+  });
+
+  // 1 & 3. On the final usable round(s), the merchant settles exactly at
+  // the buyer's ceiling rather than holding out for a price the buyer
+  // has already refused every prior round — this is the "no better
+  // valid counter to make" convergence point.
+  it("settles exactly at the buyer's ceiling once few rounds remain", () => {
+    expect(computeMerchantConcessionPrice(item, 900, roundContext(3, 925))).toBe(900);
+    expect(computeMerchantConcessionPrice(item, 900, roundContext(4, 900))).toBe(900);
+  });
+
+  // 4. The merchant can never produce a price below minPrice.
+  it("never returns a price below minPrice, even for a buyer ceiling far below the floor", () => {
+    expect(computeMerchantConcessionPrice(item, 1, roundContext(1))).toBeGreaterThanOrEqual(
+      item.minPrice,
+    );
+    expect(computeMerchantConcessionPrice(item, 1, roundContext(4, 810))).toBe(item.minPrice);
+  });
+
+  it("is general across different listed/floor/ceiling combinations, not tuned to one SKU", () => {
+    const monitor: CatalogItemSnapshot = {
+      sku: "MONITOR-24-FHD",
+      listedPrice: 9500,
+      minPrice: 8200,
+      availableQty: 250,
+      standardDeliveryDays: 4,
+      maxDeliveryDays: 10,
+      negotiationEnabled: true,
+    };
+    const opening = computeMerchantConcessionPrice(monitor, 8800, roundContext(1));
+    expect(opening).toBe(computeCounterOfferPrice(monitor, 8800));
+    const settled = computeMerchantConcessionPrice(monitor, 8800, roundContext(4, opening));
+    expect(settled).toBe(8800);
+    expect(settled).toBeGreaterThanOrEqual(monitor.minPrice);
   });
 });
 

@@ -13,6 +13,16 @@
 // last NegotiationResult (which, like the manifest, never carries
 // minPrice or any other private field — see negotiationEngine.ts).
 // CatalogItemSnapshot is never imported here.
+//
+// Objective, mirrored against the merchant's: the buyer seeks the
+// LOWEST acceptable price, the merchant seeks the HIGHEST valid price
+// (see negotiationEngine.ts's computeMerchantConcessionPrice). The
+// buyer enforces its side of that by never conceding upward past its
+// own maxUnitPrice (isPriceAcceptable in buyerRules.ts is a hard
+// ceiling, not a target) and by holding at that ceiling on every
+// counter_offer rather than proposing something higher just to close
+// faster — it only ever accepts a specific merchant offer once that
+// offer's own price already satisfies the ceiling, never before.
 
 import type { PublicManifestProduct } from "@/types/manifest";
 import type { NegotiationResult, ProposedAgreement } from "@/lib/rules/negotiationEngine";

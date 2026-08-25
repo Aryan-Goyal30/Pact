@@ -95,6 +95,60 @@ export function computeCounterOfferPrice(
   return clamp(midpoint, item.minPrice, item.listedPrice);
 }
 
+/** Round context a multi-round negotiation orchestrator supplies to computeMerchantConcessionPrice. */
+export interface MerchantConcessionContext {
+  /** Which merchant response this is, 1-indexed — the opening counter is round 1. */
+  round: number;
+  maxRounds: number;
+  /** The merchant's own previously quoted unit price for this SKU, if any. Undefined for the opening counter. */
+  previousOfferUnitPrice?: number;
+}
+
+/**
+ * Round-aware merchant concession strategy.
+ *
+ * minPrice is an absolute floor, not a target — the merchant tries to
+ * hold as close to the listed price as it can, and only surrenders
+ * ground gradually:
+ *
+ *  - Each round (until the last one), it concedes half the remaining
+ *    gap between its own previous position (or the listed price, for
+ *    the opening counter — which makes this function produce exactly
+ *    the same number as computeCounterOfferPrice on round 1) and the
+ *    buyer's stated ceiling. This is a standard, general "split the
+ *    remaining difference" schedule: it works for any listedPrice /
+ *    minPrice / buyerMaxUnitPrice / maxRounds combination, not just
+ *    this SKU.
+ *  - On the final available round, it settles exactly at the buyer's
+ *    ceiling (still clamped to minPrice) rather than risk losing an
+ *    already-profitable sale to round expiry over the last sliver of
+ *    leverage.
+ *  - The result is always clamped to [minPrice, listedPrice], so it can
+ *    never go below the private floor no matter how low the buyer's
+ *    ceiling is or how many rounds have passed.
+ *
+ * This function only computes a NUMBER. It never decides whether the
+ * negotiation is over — that stays with negotiationState.ts and the
+ * orchestrator's own accept/reject logic (an offer at the buyer's
+ * ceiling still has to be explicitly accepted, same as any other
+ * counter-offer).
+ */
+export function computeMerchantConcessionPrice(
+  item: CatalogItemSnapshot,
+  buyerMaxUnitPrice: number,
+  context: MerchantConcessionContext,
+): number {
+  const roundsLeft = Math.max(1, context.maxRounds - context.round + 1);
+
+  if (roundsLeft <= 2) {
+    return clamp(buyerMaxUnitPrice, item.minPrice, item.listedPrice);
+  }
+
+  const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
+  const conceded = anchor - (anchor - buyerMaxUnitPrice) / 2;
+  return clamp(conceded, item.minPrice, item.listedPrice);
+}
+
 type PriceResolution =
   | { fit: "full"; unitPrice: number }
   | { fit: "counter"; unitPrice: number }

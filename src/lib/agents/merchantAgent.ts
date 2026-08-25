@@ -10,7 +10,9 @@
 
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 import {
+  computeMerchantConcessionPrice,
   evaluateNegotiationRequest,
+  type MerchantConcessionContext,
   type NegotiationRequest,
   type NegotiationResult,
 } from "@/lib/rules/negotiationEngine";
@@ -63,6 +65,57 @@ function toPublicContext(result: NegotiationResult): Record<string, unknown> {
   };
 }
 
+/**
+ * Overrides a fresh NegotiationResult's price with the round-aware
+ * concession strategy (computeMerchantConcessionPrice), when a round
+ * context is supplied and a genuine price negotiation is actually in
+ * play. This is what stops the merchant from treating "the buyer's ask
+ * is at or above minPrice" as a reason to accept outright — minPrice is
+ * a floor, not a target, so evaluateNegotiationRequest's single-shot
+ * "meet in the middle once" price is replaced with a position that
+ * still tries to hold closer to the listed price, conceding only
+ * gradually across rounds.
+ *
+ * A no-op (returns `decision` unchanged) whenever there's nothing to
+ * override: no round context supplied (preserves every existing
+ * single-shot caller's exact behavior), the buyer's ceiling already
+ * meets or beats the listed price (no negotiation needed at all), or
+ * the outcome isn't one that carries a negotiated price in the first
+ * place (REJECTED / no price adjustment needed).
+ */
+function applyMerchantConcession(
+  item: CatalogItemSnapshot,
+  request: NegotiationRequest,
+  decision: NegotiationResult,
+  concessionContext: MerchantConcessionContext,
+): NegotiationResult {
+  if (
+    request.maxUnitPrice === undefined ||
+    request.maxUnitPrice >= item.listedPrice ||
+    decision.unitPrice === null ||
+    (decision.outcome !== "COUNTER_OFFER" && decision.outcome !== "PARTIAL_FULFILLMENT")
+  ) {
+    return decision;
+  }
+
+  const concededPrice = computeMerchantConcessionPrice(
+    item,
+    request.maxUnitPrice,
+    concessionContext,
+  );
+  if (concededPrice === decision.unitPrice) {
+    return decision;
+  }
+
+  const reasons = decision.reasons
+    .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
+    .concat(
+      `Countering with an adjusted unit price of ${concededPrice} instead of the listed ${item.listedPrice}.`,
+    );
+
+  return { ...decision, unitPrice: concededPrice, reasons };
+}
+
 function toOffer(result: NegotiationResult): MerchantAgentOffer | null {
   if (
     result.offeredQuantity === null ||
@@ -85,12 +138,24 @@ function toOffer(result: NegotiationResult): MerchantAgentOffer | null {
  * whatever the caller's catalog lookup returned — pass null for "SKU
  * not found" (see catalogRepository.findCatalogItemBySku), the engine
  * handles it the same way it does everywhere else in the codebase.
+ *
+ * `concessionContext` is optional and only meaningful for a multi-round
+ * negotiation (see negotiation/orchestrator.ts) — when supplied, it
+ * makes the merchant negotiate for the highest valid price it can
+ * across rounds instead of settling for evaluateNegotiationRequest's
+ * single-shot "meet in the middle once" price. Omitting it (every
+ * existing single-shot caller, e.g. POST /api/negotiate) leaves
+ * behavior exactly as it was before this option existed.
  */
 export async function runMerchantAgent(
   item: CatalogItemSnapshot | null,
   request: NegotiationRequest,
+  concessionContext?: MerchantConcessionContext,
 ): Promise<MerchantAgentResponse> {
-  const decision = evaluateNegotiationRequest(item, request);
+  let decision = evaluateNegotiationRequest(item, request);
+  if (item && concessionContext) {
+    decision = applyMerchantConcession(item, request, decision, concessionContext);
+  }
   const message = await getLlmProvider().generateAgentMessage({
     systemPrompt: MERCHANT_SYSTEM_PROMPT,
     context: toPublicContext(decision),

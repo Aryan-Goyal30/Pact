@@ -123,4 +123,65 @@ describe("runMerchantAgent", () => {
     expect(input.context).not.toHaveProperty("minPrice");
     expect(JSON.stringify(input.context)).not.toContain(String(item.minPrice));
   });
+
+  describe("with a concessionContext (multi-round negotiation)", () => {
+    it("does not change behavior when omitted — every existing single-shot caller is unaffected", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(item, {
+        sku: item.sku,
+        quantity: 10,
+        maxUnitPrice: 45000,
+      });
+      expect(response.decision.unitPrice).toBe(46500); // unchanged single-shot midpoint
+    });
+
+    it("overrides the price toward the round-aware concession value instead of the flat midpoint", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+        { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      );
+      expect(response.decision.unitPrice).toBe(45750);
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+    });
+
+    // 1. The merchant does not immediately accept 45000 merely because
+    // it is above the floor — round 2 still produces a counter above
+    // the buyer's price, not an outright acceptance of it.
+    it("still counters (does not jump to accepting) even though the buyer's price is already above the floor", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+        { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      );
+      expect(response.decision.unitPrice).not.toBe(45000);
+      expect(response.decision.unitPrice!).toBeGreaterThan(45000);
+      expect(response.offer?.unitPrice).not.toBe(45000);
+    });
+
+    // 4. The merchant can never produce a price below minPrice, even
+    // with a concessionContext pushing it toward settlement.
+    it("never overrides the price to something below minPrice", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 1 },
+        { round: 4, maxRounds: 4, previousOfferUnitPrice: 44500 },
+      );
+      expect(response.decision.unitPrice).toBe(item.minPrice);
+    });
+
+    it("keeps the reasons text consistent with the overridden price, not the original one", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+        { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      );
+      expect(response.decision.reasons.join(" ")).toContain("45750");
+      expect(response.decision.reasons.join(" ")).not.toContain("46500");
+    });
+  });
 });
