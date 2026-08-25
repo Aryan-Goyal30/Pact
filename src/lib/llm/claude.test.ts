@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { generateMerchantMessage, MissingApiKeyError } from "./claude";
+import { claudeProvider, MissingApiKeyError } from "./claude";
 
-// generateMerchantMessage() checks for ANTHROPIC_API_KEY and throws
-// before it ever constructs the Anthropic client or makes a network
-// call, so this test needs no mocking and makes no real API request.
-describe("generateMerchantMessage — missing API key", () => {
+// claudeProvider.generateAgentMessage() checks for ANTHROPIC_API_KEY and
+// throws before it ever constructs the Anthropic client or makes a
+// network call, so this test needs no mocking and makes no real API
+// request.
+describe("claudeProvider.generateAgentMessage — missing API key", () => {
   const originalKey = process.env.ANTHROPIC_API_KEY;
 
   beforeEach(() => {
@@ -19,17 +20,12 @@ describe("generateMerchantMessage — missing API key", () => {
     }
   });
 
-  // 6. Missing ANTHROPIC_API_KEY produces a controlled error.
   it("rejects with a clear MissingApiKeyError instead of crashing mysteriously", async () => {
     await expect(
-      generateMerchantMessage({
-        outcome: "EXACT_MATCH",
-        sku: "TEST-SKU",
-        requestedQuantity: 1,
-        offeredQuantity: 1,
-        unitPrice: 100,
-        deliveryDays: 5,
-        reasons: [],
+      claudeProvider.generateAgentMessage({
+        systemPrompt: "You are a test persona.",
+        context: { outcome: "EXACT_MATCH" },
+        instruction: "Say something.",
       }),
     ).rejects.toBeInstanceOf(MissingApiKeyError);
   });
