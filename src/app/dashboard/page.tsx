@@ -26,6 +26,7 @@ export default async function DashboardPage() {
               <p className="text-base font-medium text-zinc-900 dark:text-zinc-100">
                 {merchant.name}
               </p>
+              <p>{merchant.description}</p>
               <p>{merchant.deliveryPolicy}</p>
               <p>{merchant.returnPolicy}</p>
               <p>

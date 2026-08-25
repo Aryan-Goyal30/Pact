@@ -15,6 +15,7 @@ async function main() {
   await prisma.merchant.create({
     data: {
       name: "PACT Demo Electronics",
+      description: "B2B electronics supplier offering laptops, monitors, and accessories for bulk office orders.",
       deliveryPolicy: "Standard delivery within listed lead time; bulk orders may be split into batches.",
       returnPolicy: "7-day return window for unopened units.",
       negotiationEnabled: true,

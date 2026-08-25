@@ -24,12 +24,43 @@ delivery constraints, negotiation round limits, agreement validity, payment
 state, and recovery state. An LLM-proposed action that violates a rule is
 rejected before it becomes a real negotiation event.
 
-## Current status: Phase 1 — foundation
+## Current status: Phase 2 — AI-readable manifest + rule-engine foundation
 
-This phase only sets up the application skeleton: framework, styling,
-database schema, and a read-only merchant dashboard. No agents, no LLM
-calls, no Razorpay integration, and no negotiation logic exist yet — those
-are later phases.
+Phase 1 set up the application skeleton. Phase 2 adds the public,
+AI-readable commerce layer and the deterministic rules the future
+negotiation agents will run on. No agents, no LLM calls, no Razorpay
+integration, and no negotiation loop exist yet — those are later phases.
+
+### `GET /api/manifest`
+
+The AI-readable manifest a buyer agent reads before sending a structured
+requirement. Returns merchant name/description, whether negotiation is
+supported, public policies, and the catalog (SKU, name, description,
+listed price, available quantity, standard/max delivery days, whether the
+item is negotiable).
+
+The response is built by [`getPublicManifest()`](src/lib/manifest.ts),
+which explicitly whitelists each field onto the
+[`PublicManifest`](src/types/manifest.ts) type rather than serializing
+Prisma records — so `CatalogItem.minPrice` and any other private column
+can't accidentally leak into it. In development the endpoint pretty-prints
+its JSON so it's readable directly in a browser or via `curl`, with no
+separate inspector UI.
+
+### Deterministic catalog rules
+
+[`src/lib/rules/catalogRules.ts`](src/lib/rules/catalogRules.ts) contains
+pure, DB-free functions — `checkQuantityAvailable`,
+`checkDeliveryAchievable`, `checkPriceAtOrAboveFloor`, and
+`evaluateFulfillment` — that classify a buyer request against a catalog
+item as `exact_fulfillment`, `partial_fulfillment`,
+`price_adjustment_required`, or `impossible`. These are the functions a
+future LLM-driven agent proposes to, and never the other way around: no
+LLM decides a price, quantity, or delivery day here. See
+[`catalogRules.test.ts`](src/lib/rules/catalogRules.test.ts) for coverage.
+[`catalogRepository.ts`](src/lib/rules/catalogRepository.ts) holds the one
+DB-touching function (`findCatalogItemBySku`), kept separate so the rule
+logic itself stays pure and testable.
 
 ## Tech stack
 
@@ -46,10 +77,17 @@ prisma/
   seed.ts             Seeds one demo merchant + a small catalog
 src/
   app/
-    page.tsx          Landing page
-    dashboard/        Read-only merchant dashboard (merchant info + catalog)
+    page.tsx           Landing page
+    dashboard/         Read-only merchant dashboard (merchant info + catalog)
+    api/manifest/       GET /api/manifest — AI-readable public manifest
   lib/
-    prisma.ts          Prisma client singleton (SQLite driver adapter)
+    prisma.ts           Prisma client singleton (SQLite driver adapter)
+    manifest.ts         Builds the public manifest DTO
+    rules/
+      catalogRules.ts    Deterministic fulfillment rules (pure, unit-tested)
+      catalogRepository.ts  DB lookup (findCatalogItemBySku)
+  types/
+    manifest.ts          Public manifest response types
   generated/prisma/    Generated Prisma client (gitignored, not committed)
 ```
 
@@ -57,8 +95,8 @@ src/
 
 Defined in [`prisma/schema.prisma`](prisma/schema.prisma):
 
-- **Merchant** — single-row profile: name, delivery/return policy text,
-  whether negotiation is enabled
+- **Merchant** — single-row profile: name, description, delivery/return
+  policy text, whether negotiation is enabled
 - **CatalogItem** — product with a public `listedPrice` and a private
   `minPrice` (the merchant's price floor — never to be exposed to a buyer
   agent, only used internally by the future rule engine)
@@ -117,6 +155,7 @@ yet.
 npm run dev      # start the dev server
 npm run build    # production build
 npm run lint     # ESLint
+npm run test     # run the unit test suite (Vitest)
 npx prisma studio     # browse the local SQLite database
 npx prisma db seed    # re-seed demo data
 ```

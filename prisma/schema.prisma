@@ -25,6 +25,7 @@ datasource db {
 model Merchant {
   id                 String   @id @default(cuid())
   name               String
+  description        String
   deliveryPolicy     String
   returnPolicy       String
   negotiationEnabled Boolean  @default(true)
