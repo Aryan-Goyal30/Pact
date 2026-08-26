@@ -11,7 +11,10 @@ import type {
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import {
   buyerThinkingLabel,
+  computeMaxOrderValue,
+  formatInr,
   merchantThinkingLabel,
+  negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
   negotiationMessageTypeLabel,
   negotiationStatusBadgeClass,
@@ -19,14 +22,6 @@ import {
   parseBuyerRequestForm,
   type BuyerRequestFormValues,
 } from "./negotiationUi";
-
-function formatInr(amount: number) {
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -75,6 +70,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   const [formError, setFormError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+  const [started, setStarted] = useState(false);
 
   const [maxRounds, setMaxRounds] = useState<number | null>(null);
   const [round, setRound] = useState(0);
@@ -84,6 +80,14 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     null,
   );
   const [agreement, setAgreement] = useState<NegotiationAgreementDTO | null>(null);
+
+  const selectedProduct = products.find((p) => p.sku === form.sku) ?? null;
+  const parsedQuantity = Number(form.quantity);
+  const parsedMaxPrice = Number(form.maxUnitPrice);
+  const maxOrderValuePreview =
+    Number.isFinite(parsedQuantity) && Number.isFinite(parsedMaxPrice) && parsedQuantity > 0 && parsedMaxPrice > 0
+      ? computeMaxOrderValue(parsedQuantity, parsedMaxPrice)
+      : null;
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -97,9 +101,11 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     }
 
     setRunning(true);
+    setStarted(true);
     setTranscript([]);
     setAgreement(null);
     setRound(0);
+    setStatus(null);
     setThinking({ agent: "buyer", label: buyerThinkingLabel(1) });
 
     try {
@@ -167,72 +173,125 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   }
 
   const lastTurn = transcript[transcript.length - 1];
+  const previousTurn = transcript[transcript.length - 2];
   const latestBuyerOffer = lastTurn?.buyer ?? null;
-  const latestMerchantOffer = lastTurn?.merchant ?? latestBuyerOffer;
+  const latestMerchantOffer = lastTurn?.merchant ?? null;
 
   return (
     <div className="flex flex-col gap-8">
+      <AgentObjectivesHeader />
+
       <section className="flex flex-col gap-3">
-        <h2 className="text-lg font-medium text-black dark:text-zinc-50">
-          Start a negotiation
-        </h2>
+        <div>
+          <h2 className="text-lg font-medium text-black dark:text-zinc-50">
+            Start a negotiation
+          </h2>
+          <p className="text-sm text-zinc-600 dark:text-zinc-400">
+            Tell the Buyer Agent what it&apos;s shopping for. It will negotiate with
+            the Merchant Agent on your behalf, one real exchange at a time.
+          </p>
+        </div>
+
         <form
           onSubmit={handleSubmit}
-          className="grid grid-cols-1 gap-4 rounded-lg border border-black/[.08] p-4 dark:border-white/[.145] sm:grid-cols-4"
+          className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]"
         >
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-zinc-600 dark:text-zinc-400">Product</span>
-            <select
-              value={form.sku}
-              disabled={running}
-              onChange={(e) => setForm({ ...form, sku: e.target.value })}
-              className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-            >
-              {products.map((product) => (
-                <option key={product.sku} value={product.sku}>
-                  {product.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">Product</span>
+              <select
+                value={form.sku}
+                disabled={running}
+                onChange={(e) => setForm({ ...form, sku: e.target.value })}
+                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+              >
+                {products.map((product) => (
+                  <option key={product.sku} value={product.sku}>
+                    {product.name}
+                  </option>
+                ))}
+              </select>
+            </label>
 
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-zinc-600 dark:text-zinc-400">Quantity</span>
-            <input
-              type="number"
-              min={1}
-              disabled={running}
-              value={form.quantity}
-              onChange={(e) => setForm({ ...form, quantity: e.target.value })}
-              className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-            />
-          </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">Quantity</span>
+              <input
+                type="number"
+                min={1}
+                disabled={running}
+                value={form.quantity}
+                onChange={(e) => setForm({ ...form, quantity: e.target.value })}
+                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+              />
+            </label>
 
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-zinc-600 dark:text-zinc-400">Max unit price (₹)</span>
-            <input
-              type="number"
-              min={1}
-              disabled={running}
-              value={form.maxUnitPrice}
-              onChange={(e) => setForm({ ...form, maxUnitPrice: e.target.value })}
-              className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-            />
-          </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                Maximum price per unit (₹)
+              </span>
+              <input
+                type="number"
+                min={1}
+                disabled={running}
+                value={form.maxUnitPrice}
+                onChange={(e) => setForm({ ...form, maxUnitPrice: e.target.value })}
+                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+              />
+            </label>
 
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-zinc-600 dark:text-zinc-400">Delivery deadline (days)</span>
-            <input
-              type="number"
-              min={1}
-              disabled={running}
-              value={form.deliveryDeadlineDays}
-              onChange={(e) => setForm({ ...form, deliveryDeadlineDays: e.target.value })}
-              className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-            />
-          </label>
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                Delivery deadline (days)
+              </span>
+              <input
+                type="number"
+                min={1}
+                disabled={running}
+                value={form.deliveryDeadlineDays}
+                onChange={(e) => setForm({ ...form, deliveryDeadlineDays: e.target.value })}
+                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+              />
+            </label>
+          </div>
 
-          <div className="sm:col-span-4">
+          {selectedProduct && (
+            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg bg-black/[.03] px-4 py-3 text-xs text-zinc-600 dark:bg-white/[.04] dark:text-zinc-400">
+              <span>
+                Listed price:{" "}
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {formatInr(selectedProduct.listedPrice)} / unit
+                </span>
+              </span>
+              <span>
+                Available quantity:{" "}
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {selectedProduct.availableQuantity}
+                </span>
+              </span>
+              <span>
+                Standard delivery:{" "}
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {selectedProduct.standardDeliveryDays} day(s)
+                </span>
+              </span>
+              <span>
+                Negotiable:{" "}
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {selectedProduct.negotiable ? "Yes" : "No"}
+                </span>
+              </span>
+              {maxOrderValuePreview !== null && (
+                <span className="ml-auto">
+                  Maximum possible order value:{" "}
+                  <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                    {formatInr(maxOrderValuePreview)}
+                  </span>
+                </span>
+              )}
+            </div>
+          )}
+
+          <div>
             {formError && <p className="mb-2 text-sm text-red-600 dark:text-red-400">{formError}</p>}
             {apiError && <p className="mb-2 text-sm text-red-600 dark:text-red-400">{apiError}</p>}
             <button
@@ -246,94 +305,65 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
         </form>
       </section>
 
-      {(running || transcript.length > 0) && (
-        <section className="flex flex-col gap-4">
-          <div className="flex flex-col gap-3 rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-lg font-medium text-black dark:text-zinc-50">
-                AI-to-AI Negotiation
-              </h2>
-              <div className="flex items-center gap-2">
-                {status && (
-                  <span
-                    className={`rounded-full px-3 py-1 text-xs font-medium ${negotiationStatusBadgeClass(status)}`}
-                  >
-                    {negotiationStatusLabel(status)}
-                  </span>
-                )}
-                <span className="text-xs text-zinc-500 dark:text-zinc-500">
-                  Round {round} / {maxRounds ?? "—"}
-                </span>
-              </div>
-            </div>
+      {!started && (
+        <p className="rounded-lg border border-dashed border-black/[.15] p-6 text-center text-sm text-zinc-500 dark:border-white/[.2] dark:text-zinc-500">
+          Fill in the form above and start a negotiation to watch the Buyer and
+          Merchant Agents negotiate live, one real exchange at a time.
+        </p>
+      )}
 
-            <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-500">Buyer Agent</p>
-                <p className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {latestBuyerOffer?.unitPrice !== undefined && latestBuyerOffer?.unitPrice !== null
-                    ? formatInr(latestBuyerOffer.unitPrice)
-                    : "—"}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-500">Merchant Agent</p>
-                <p className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {latestMerchantOffer?.unitPrice !== undefined &&
-                  latestMerchantOffer?.unitPrice !== null
-                    ? formatInr(latestMerchantOffer.unitPrice)
-                    : "—"}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-500">Quantity</p>
-                <p className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {latestMerchantOffer?.quantity ?? "—"}
-                </p>
-              </div>
-              <div>
-                <p className="text-xs text-zinc-500 dark:text-zinc-500">Delivery</p>
-                <p className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {latestMerchantOffer?.deliveryDays !== undefined &&
-                  latestMerchantOffer?.deliveryDays !== null
-                    ? `${latestMerchantOffer.deliveryDays} day(s)`
-                    : "—"}
-                </p>
-              </div>
-            </div>
-          </div>
+      {started && (
+        <section className="flex flex-col gap-4">
+          <NegotiationStateHeader
+            status={status}
+            round={round}
+            maxRounds={maxRounds}
+            buyerOffer={latestBuyerOffer}
+            merchantOffer={latestMerchantOffer}
+            previousBuyerOffer={previousTurn?.buyer ?? null}
+            previousMerchantOffer={previousTurn?.merchant ?? null}
+          />
 
           <ol className="flex flex-col gap-4">
             {transcript.map((turn) => (
-              <li
-                key={turn.turn}
-                className="rounded-lg border border-black/[.08] p-4 dark:border-white/[.145]"
-              >
-                <p className="mb-3 text-xs font-medium text-zinc-500 dark:text-zinc-500">
-                  Turn {turn.turn}
+              <li key={turn.turn}>
+                <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">
+                  Round {turn.turn}
                 </p>
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                  <MessageCard label="Buyer Agent" msg={turn.buyer} />
-                  <MessageCard label="Merchant Agent" msg={turn.merchant} />
+                <div className="flex flex-col gap-3">
+                  <MessageBubble side="buyer" msg={turn.buyer} />
+                  <MessageBubble side="merchant" msg={turn.merchant} />
                 </div>
               </li>
             ))}
 
             {thinking && (
-              <li className="rounded-lg border border-dashed border-black/[.15] p-4 dark:border-white/[.25]">
-                <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-500">
-                  <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-zinc-400 dark:bg-zinc-600" />
-                  <span className="font-medium">
-                    {thinking.agent === "buyer" ? "Buyer Agent" : "Merchant Agent"}
+              <li>
+                <div
+                  className={`flex items-center gap-2 rounded-lg border border-dashed p-3 text-sm ${
+                    thinking.agent === "buyer"
+                      ? "border-blue-200 text-blue-700 dark:border-blue-900/50 dark:text-blue-300"
+                      : "border-amber-200 text-amber-700 dark:border-amber-900/50 dark:text-amber-300"
+                  } ${thinking.agent === "buyer" ? "" : "ml-6 sm:ml-12"}`}
+                >
+                  <span className="inline-flex gap-0.5">
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
+                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
                   </span>
-                  <span>— {thinking.label}</span>
+                  <span>{thinking.label}</span>
                 </div>
               </li>
             )}
           </ol>
 
           {status && TERMINAL_STATUSES.includes(status) && (
-            <OutcomeCard status={status} agreement={agreement} lastTurn={lastTurn} />
+            <OutcomeCard
+              status={status}
+              agreement={agreement}
+              lastTurn={lastTurn}
+              productName={selectedProduct?.name ?? null}
+            />
           )}
         </section>
       )}
@@ -341,10 +371,160 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   );
 }
 
-function MessageCard({ label, msg }: { label: string; msg: NegotiationMessageDTO | null }) {
+/** Static, always-visible explainer of what each agent is trying to do — never gated on a negotiation running. */
+function AgentObjectivesHeader() {
+  return (
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="rounded-xl border border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900/40 dark:bg-blue-950/20">
+        <p className="text-xs font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
+          Buyer Agent
+        </p>
+        <p className="mt-1 text-sm text-zinc-800 dark:text-zinc-200">
+          Goal: get the best possible price ↓
+        </p>
+        <p className="text-xs text-zinc-500 dark:text-zinc-500">
+          Constraint: maximum budget it can never exceed
+        </p>
+      </div>
+      <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4 dark:border-amber-900/40 dark:bg-amber-950/20">
+        <p className="text-xs font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
+          Merchant Agent
+        </p>
+        <p className="mt-1 text-sm text-zinc-800 dark:text-zinc-200">
+          Goal: get the best possible selling price ↑
+        </p>
+        <p className="text-xs text-zinc-500 dark:text-zinc-500">
+          Constraint: a private reservation price it can never go below
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function priceTrend(current: number | null, previous: number | null): "up" | "down" | null {
+  if (current === null || previous === null || current === previous) {
+    return null;
+  }
+  return current > previous ? "up" : "down";
+}
+
+function NegotiationStateHeader({
+  status,
+  round,
+  maxRounds,
+  buyerOffer,
+  merchantOffer,
+  previousBuyerOffer,
+  previousMerchantOffer,
+}: {
+  status: NegotiationStatus | null;
+  round: number;
+  maxRounds: number | null;
+  buyerOffer: NegotiationMessageDTO | null;
+  merchantOffer: NegotiationMessageDTO | null;
+  previousBuyerOffer: NegotiationMessageDTO | null;
+  previousMerchantOffer: NegotiationMessageDTO | null;
+}) {
+  const buyerPrice = buyerOffer?.unitPrice ?? null;
+  const merchantPrice = merchantOffer?.unitPrice ?? null;
+  const buyerTrend = priceTrend(buyerPrice, previousBuyerOffer?.unitPrice ?? null);
+  const merchantTrend = priceTrend(merchantPrice, previousMerchantOffer?.unitPrice ?? null);
+  const gap = buyerPrice !== null && merchantPrice !== null ? Math.abs(merchantPrice - buyerPrice) : null;
+  const quantity = merchantOffer?.quantity ?? buyerOffer?.quantity ?? null;
+  const delivery = merchantOffer?.deliveryDays ?? buyerOffer?.deliveryDays ?? null;
+
+  return (
+    <div className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-lg font-medium text-black dark:text-zinc-50">AI-to-AI Negotiation</h2>
+        <div className="flex items-center gap-2">
+          {status && (
+            <span
+              className={`rounded-full px-3 py-1 text-xs font-medium ${negotiationStatusBadgeClass(status)}`}
+            >
+              {negotiationStatusLabel(status)}
+            </span>
+          )}
+          <span className="text-xs text-zinc-500 dark:text-zinc-500">
+            Round {round} / {maxRounds ?? "—"}
+          </span>
+        </div>
+      </div>
+
+      {/* Price convergence: both agents' current offers, moving toward each other. */}
+      <div className="flex items-center justify-center gap-3 rounded-lg bg-black/[.03] px-4 py-4 dark:bg-white/[.04] sm:gap-6">
+        <PriceStat label="Buyer offer" price={buyerPrice} trend={buyerTrend} tone="blue" />
+        <div className="flex flex-col items-center gap-1 text-zinc-400 dark:text-zinc-600">
+          <span aria-hidden className="text-lg leading-none">
+            {gap === 0 ? "✓" : "↔"}
+          </span>
+          <span className="whitespace-nowrap text-[11px]">
+            {gap === null ? "—" : gap === 0 ? "matched" : `gap ${formatInr(gap)}`}
+          </span>
+        </div>
+        <PriceStat label="Merchant offer" price={merchantPrice} trend={merchantTrend} tone="amber" />
+      </div>
+
+      <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-2">
+        <div>
+          <p className="text-xs text-zinc-500 dark:text-zinc-500">Quantity being negotiated</p>
+          <p className="font-medium text-zinc-900 dark:text-zinc-100">{quantity ?? "—"}</p>
+        </div>
+        <div>
+          <p className="text-xs text-zinc-500 dark:text-zinc-500">Delivery being negotiated</p>
+          <p className="font-medium text-zinc-900 dark:text-zinc-100">
+            {delivery !== null ? `${delivery} day(s)` : "—"}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PriceStat({
+  label,
+  price,
+  trend,
+  tone,
+}: {
+  label: string;
+  price: number | null;
+  trend: "up" | "down" | null;
+  tone: "blue" | "amber";
+}) {
+  const toneClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+  return (
+    <div className="text-center">
+      <p className={`text-xs font-medium ${toneClass}`}>{label}</p>
+      <p className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+        {price !== null ? formatInr(price) : "—"}
+      </p>
+      {trend && (
+        <p className="text-[11px] text-zinc-500 dark:text-zinc-500">
+          {trend === "up" ? "▲ increased" : "▼ decreased"}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function MessageBubble({
+  side,
+  msg,
+}: {
+  side: "buyer" | "merchant";
+  msg: NegotiationMessageDTO | null;
+}) {
+  const isBuyer = side === "buyer";
+  const label = isBuyer ? "Buyer Agent" : "Merchant Agent";
+  const alignClass = isBuyer ? "" : "sm:ml-12";
+  const accentClass = isBuyer
+    ? "border-blue-200 dark:border-blue-900/40"
+    : "border-amber-200 dark:border-amber-900/40";
+
   if (!msg) {
     return (
-      <div className="flex flex-col gap-2 rounded-md bg-black/[.03] p-3 opacity-40 dark:bg-white/[.04]">
+      <div className={`rounded-xl border border-dashed p-4 opacity-40 ${accentClass} ${alignClass}`}>
         <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
           {label}
         </span>
@@ -353,8 +533,8 @@ function MessageCard({ label, msg }: { label: string; msg: NegotiationMessageDTO
   }
 
   return (
-    <div className="flex flex-col gap-2 rounded-md bg-black/[.03] p-3 dark:bg-white/[.04]">
-      <div className="flex items-center justify-between">
+    <div className={`rounded-xl border bg-black/[.02] p-4 dark:bg-white/[.03] ${accentClass} ${alignClass}`}>
+      <div className="mb-2 flex items-center justify-between gap-2">
         <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
           {label}
         </span>
@@ -364,19 +544,19 @@ function MessageCard({ label, msg }: { label: string; msg: NegotiationMessageDTO
           {negotiationMessageTypeLabel(msg.type)}
         </span>
       </div>
-      <p className="text-sm text-zinc-800 dark:text-zinc-200">{msg.message}</p>
-      <dl className="grid grid-cols-3 gap-2 text-xs text-zinc-600 dark:text-zinc-400">
-        <div>
-          <dt className="text-zinc-400 dark:text-zinc-600">Qty</dt>
+      <p className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">{msg.message}</p>
+      <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-zinc-600 dark:text-zinc-400">
+        <div className="flex gap-1">
+          <dt className="text-zinc-400 dark:text-zinc-600">Qty:</dt>
           <dd>{msg.quantity ?? "—"}</dd>
         </div>
-        <div>
-          <dt className="text-zinc-400 dark:text-zinc-600">Unit price</dt>
+        <div className="flex gap-1">
+          <dt className="text-zinc-400 dark:text-zinc-600">Unit price:</dt>
           <dd>{msg.unitPrice !== null ? formatInr(msg.unitPrice) : "—"}</dd>
         </div>
-        <div>
-          <dt className="text-zinc-400 dark:text-zinc-600">Delivery</dt>
-          <dd>{msg.deliveryDays !== null ? `${msg.deliveryDays}d` : "—"}</dd>
+        <div className="flex gap-1">
+          <dt className="text-zinc-400 dark:text-zinc-600">Delivery:</dt>
+          <dd>{msg.deliveryDays !== null ? `${msg.deliveryDays} day(s)` : "—"}</dd>
         </div>
       </dl>
     </div>
@@ -387,18 +567,31 @@ function OutcomeCard({
   status,
   agreement,
   lastTurn,
+  productName,
 }: {
   status: NegotiationStatus;
   agreement: NegotiationAgreementDTO | null;
   lastTurn: TranscriptTurn | undefined;
+  productName: string | null;
 }) {
   if (status === "AGREED" && agreement) {
     return (
-      <div className="flex flex-col gap-3 rounded-lg border border-green-200 bg-green-50 p-4 dark:border-green-900/50 dark:bg-green-950/30">
-        <h3 className="text-base font-semibold text-green-900 dark:text-green-200">
-          Agreement reached
-        </h3>
-        <dl className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+      <div className="flex flex-col gap-4 rounded-xl border-2 border-green-300 bg-green-50 p-5 dark:border-green-800 dark:bg-green-950/30">
+        <div>
+          <h3 className="text-lg font-bold tracking-tight text-green-900 dark:text-green-200">
+            Agreement reached
+          </h3>
+          <p className="text-sm text-green-800/80 dark:text-green-300/80">
+            Buyer and Merchant Agents reached an agreement.
+          </p>
+        </div>
+        <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
+          <div>
+            <dt className="text-green-700/70 dark:text-green-400/70">Product</dt>
+            <dd className="font-medium text-green-900 dark:text-green-200">
+              {productName ?? agreement.sku}
+            </dd>
+          </div>
           <div>
             <dt className="text-green-700/70 dark:text-green-400/70">Quantity</dt>
             <dd className="font-medium text-green-900 dark:text-green-200">
@@ -406,7 +599,7 @@ function OutcomeCard({
             </dd>
           </div>
           <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Unit price</dt>
+            <dt className="text-green-700/70 dark:text-green-400/70">Final unit price</dt>
             <dd className="font-medium text-green-900 dark:text-green-200">
               {formatInr(agreement.unitPrice)}
             </dd>
@@ -436,12 +629,16 @@ function OutcomeCard({
     );
   }
 
+  const explanation =
+    status === "REJECTED" || status === "EXPIRED" ? negotiationFailureExplanation(status) : null;
+
   return (
-    <div className="flex flex-col gap-2 rounded-lg border border-red-200 bg-red-50 p-4 dark:border-red-900/50 dark:bg-red-950/30">
-      <h3 className="text-base font-semibold text-red-900 dark:text-red-200">
-        Negotiation failed — {negotiationStatusLabel(status).toLowerCase()}
+    <div className="flex flex-col gap-2 rounded-xl border-2 border-red-300 bg-red-50 p-5 dark:border-red-900 dark:bg-red-950/30">
+      <h3 className="text-lg font-bold tracking-tight text-red-900 dark:text-red-200">
+        Negotiation failed — {negotiationStatusLabel(status)}
       </h3>
-      <p className="text-sm text-red-800 dark:text-red-300">
+      {explanation && <p className="text-sm text-red-800 dark:text-red-300">{explanation}</p>}
+      <p className="text-sm text-red-800/80 dark:text-red-300/80">
         {lastTurn?.merchant?.message ?? "The negotiation ended without an agreement."}
       </p>
     </div>

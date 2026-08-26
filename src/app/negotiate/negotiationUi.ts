@@ -1,7 +1,7 @@
 // Pure helper functions extracted out of NegotiationDemo.tsx so the
-// non-trivial logic (form validation, status display) is unit-testable
-// without a browser/DOM test environment. The component itself stays
-// thin and presentational.
+// non-trivial logic (form validation, status/label/copy display) is
+// unit-testable without a browser/DOM test environment. The component
+// itself stays thin and presentational.
 
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
@@ -51,6 +51,26 @@ export function parseBuyerRequestForm(
   return { sku: values.sku, quantity, maxUnitPrice, deliveryDeadlineDays };
 }
 
+/** Shared INR currency formatter for every price shown on the negotiate page. */
+export function formatInr(amount: number): string {
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 0,
+  }).format(amount);
+}
+
+/**
+ * The maximum this order could ever cost — quantity × the buyer's own
+ * ceiling price, purely a client-side preview of what's about to be
+ * requested. Never sent to the API and never confused with a
+ * negotiation result: the actual agreed total (if any) always comes
+ * from NegotiationAgreementDTO.totalAmount, a real server-computed value.
+ */
+export function computeMaxOrderValue(quantity: number, maxUnitPrice: number): number {
+  return quantity * maxUnitPrice;
+}
+
 const STATUS_LABELS: Record<NegotiationStatus, string> = {
   OPEN: "Open",
   COUNTERED: "In progress",
@@ -75,32 +95,46 @@ export function negotiationStatusBadgeClass(status: NegotiationStatus): string {
   return STATUS_BADGE_CLASSES[status];
 }
 
+/**
+ * Why a closed negotiation didn't reach AGREED — a REJECTED vs EXPIRED
+ * distinction the UI can show without leaning on the (private-safe, but
+ * still just one specific merchant message) text of the closing turn.
+ * Never mentions minPrice or any other private constraint.
+ */
+export function negotiationFailureExplanation(status: "REJECTED" | "EXPIRED"): string {
+  return status === "EXPIRED"
+    ? "The maximum number of negotiation rounds was reached before both sides could agree on terms."
+    : "The negotiation could not find terms that satisfied both sides' requirements.";
+}
+
 // ---------------------------------------------------------------------------
-// Turn staging labels — these are plain UI status text shown while a turn
-// is in flight (or between the buyer/merchant halves of an already-fetched
-// turn being revealed with a short delay). They are NOT hidden
-// chain-of-thought: the negotiation turn is computed server-side by the
-// real deterministic engine + agents before any of this text is shown; the
-// label is chosen from the already-known result to pace how it's revealed.
+// Turn staging sentences — plain UI status text shown while a turn is in
+// flight (or between the buyer/merchant halves of an already-fetched turn
+// being revealed with a short delay). This is NOT hidden chain-of-thought:
+// the negotiation turn is computed server-side by the real deterministic
+// engine + agents before any of this text is shown; the sentence is
+// chosen from the already-known result only to pace how it's revealed.
 // ---------------------------------------------------------------------------
 
 /** What to show while the Buyer Agent's turn is in flight, before its message is revealed. */
 export function buyerThinkingLabel(turnNumber: number): string {
-  return turnNumber <= 1 ? "Evaluating request…" : "Considering offer…";
+  return turnNumber <= 1
+    ? "Buyer Agent is evaluating the request…"
+    : "Buyer Agent is considering the merchant's offer…";
 }
 
 /** What to show while the Merchant Agent's response is being revealed, based on what it already decided. */
 export function merchantThinkingLabel(messageType: NegotiationMessageType): string {
   switch (messageType) {
     case "accept":
-      return "Accepting offer…";
+      return "Merchant Agent is accepting the offer…";
     case "reject":
-      return "Rejecting offer…";
+      return "Merchant Agent is rejecting the offer…";
     case "counter_offer":
-      return "Preparing counter-offer…";
+      return "Merchant Agent is preparing a counter-offer…";
     case "offer":
     case "request":
-      return "Checking constraints…";
+      return "Merchant Agent is considering the offer…";
   }
 }
 

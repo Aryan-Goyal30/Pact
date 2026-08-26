@@ -1,14 +1,7 @@
 import Link from "next/link";
 import { getPublicManifest } from "@/lib/manifest";
 import { NegotiationDemo } from "./NegotiationDemo";
-
-function formatInr(amount: number) {
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(amount);
-}
+import { formatInr } from "./negotiationUi";
 
 // Server Component: fetches the same PUBLIC manifest a real external
 // buyer agent would read from GET /api/manifest (never the private
@@ -20,7 +13,7 @@ export default async function NegotiatePage() {
 
   return (
     <div className="flex flex-1 flex-col gap-8 bg-zinc-50 px-6 py-10 dark:bg-black sm:px-10">
-      <div className="mx-auto flex w-full max-w-4xl flex-col gap-8">
+      <div className="mx-auto flex w-full max-w-5xl flex-col gap-8">
         <header className="flex flex-col gap-2">
           <div className="flex items-center justify-between gap-4">
             <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">

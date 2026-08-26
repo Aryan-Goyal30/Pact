@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
 import {
   buyerThinkingLabel,
+  computeMaxOrderValue,
+  formatInr,
   merchantThinkingLabel,
+  negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
   negotiationMessageTypeLabel,
   negotiationStatusBadgeClass,
@@ -100,5 +103,32 @@ describe("negotiationMessageTypeLabel / negotiationMessageTypeBadgeClass", () =>
     const reject = negotiationMessageTypeBadgeClass("reject");
     const counter = negotiationMessageTypeBadgeClass("counter_offer");
     expect(new Set([accept, reject, counter]).size).toBe(3);
+  });
+});
+
+describe("formatInr", () => {
+  it("formats a whole-rupee amount with no decimal places", () => {
+    expect(formatInr(45000)).toContain("45,000");
+  });
+});
+
+describe("computeMaxOrderValue", () => {
+  it("multiplies quantity by the maximum unit price, never confusing the two", () => {
+    expect(computeMaxOrderValue(200, 45000)).toBe(9000000);
+    expect(computeMaxOrderValue(1, 45000)).toBe(45000);
+  });
+});
+
+describe("negotiationFailureExplanation", () => {
+  it("gives a distinct explanation for REJECTED vs EXPIRED", () => {
+    const rejected = negotiationFailureExplanation("REJECTED");
+    const expired = negotiationFailureExplanation("EXPIRED");
+    expect(rejected).not.toBe(expired);
+    expect(expired).toMatch(/maximum number of.*rounds/i);
+  });
+
+  it("never mentions minPrice or any private constraint", () => {
+    expect(negotiationFailureExplanation("REJECTED")).not.toMatch(/minprice|floor|reservation/i);
+    expect(negotiationFailureExplanation("EXPIRED")).not.toMatch(/minprice|floor|reservation/i);
   });
 });
