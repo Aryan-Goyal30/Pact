@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
+import type { PublicManifestProduct } from "@/types/manifest";
 import {
   buyerThinkingLabel,
   computeMaxOrderValue,
   formatInr,
+  getScenarioPresets,
   merchantThinkingLabel,
   negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
@@ -19,6 +21,8 @@ const validForm: BuyerRequestFormValues = {
   quantity: "200",
   maxUnitPrice: "45000",
   deliveryDeadlineDays: "10",
+  urgency: "medium",
+  deliveryFlexible: false,
 };
 
 describe("parseBuyerRequestForm", () => {
@@ -29,7 +33,14 @@ describe("parseBuyerRequestForm", () => {
       quantity: 200,
       maxUnitPrice: 45000,
       deliveryDeadlineDays: 10,
+      urgency: "medium",
+      deliveryFlexible: false,
     });
+  });
+
+  it("carries urgency and deliveryFlexible through unchanged", () => {
+    const result = parseBuyerRequestForm({ ...validForm, urgency: "high", deliveryFlexible: true });
+    expect(result).toMatchObject({ urgency: "high", deliveryFlexible: true });
   });
 
   it("rejects an empty SKU", () => {
@@ -116,6 +127,71 @@ describe("computeMaxOrderValue", () => {
   it("multiplies quantity by the maximum unit price, never confusing the two", () => {
     expect(computeMaxOrderValue(200, 45000)).toBe(9000000);
     expect(computeMaxOrderValue(1, 45000)).toBe(45000);
+  });
+});
+
+describe("getScenarioPresets", () => {
+  const products: PublicManifestProduct[] = [
+    {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop.",
+      listedPrice: 48000,
+      availableQuantity: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    },
+    {
+      sku: "MONITOR-24-FHD",
+      name: "24-inch Full HD Monitor",
+      description: "Standard office monitor.",
+      listedPrice: 9500,
+      availableQuantity: 250,
+      standardDeliveryDays: 4,
+      maxDeliveryDays: 10,
+      negotiable: true,
+    },
+  ];
+
+  it("returns a distinct, non-empty preset for each major scenario", () => {
+    const presets = getScenarioPresets(products);
+    expect(presets.length).toBeGreaterThanOrEqual(6);
+    const ids = presets.map((p) => p.id);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicate ids
+  });
+
+  it("every preset's form values parse successfully", () => {
+    for (const preset of getScenarioPresets(products)) {
+      const parsed = parseBuyerRequestForm(preset.values);
+      expect(typeof parsed).not.toBe("string");
+    }
+  });
+
+  it("the walk-away preset's budget is genuinely below what the balanced preset asks", () => {
+    const presets = getScenarioPresets(products);
+    const walkAway = presets.find((p) => p.id === "walk-away");
+    const balanced = presets.find((p) => p.id === "balanced");
+    expect(walkAway).toBeDefined();
+    expect(balanced).toBeDefined();
+    expect(Number(walkAway!.values.maxUnitPrice)).toBeLessThan(Number(balanced!.values.maxUnitPrice));
+  });
+
+  it("the flexible-delivery preset actually sets deliveryFlexible and real deadline slack", () => {
+    const preset = getScenarioPresets(products).find((p) => p.id === "flexible-delivery");
+    expect(preset).toBeDefined();
+    expect(preset!.values.deliveryFlexible).toBe(true);
+  });
+
+  it("never references a product SKU absent from the given catalog", () => {
+    const laptopOnly = products.filter((p) => p.sku === "LAPTOP-14-I5");
+    const presets = getScenarioPresets(laptopOnly);
+    expect(presets.every((p) => p.sku === "LAPTOP-14-I5")).toBe(true);
+    expect(presets.some((p) => p.sku === "MONITOR-24-FHD")).toBe(false);
+  });
+
+  it("returns nothing when the catalog is empty", () => {
+    expect(getScenarioPresets([])).toEqual([]);
   });
 });
 

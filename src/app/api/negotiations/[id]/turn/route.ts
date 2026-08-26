@@ -11,7 +11,12 @@ import {
   getAgreementBySessionId,
 } from "@/lib/negotiation/agreementRepository";
 import { toMessageDTO } from "@/lib/negotiation/negotiationRunResponse";
-import type { NegotiationTurnResponse, PersistedAgreementDTO } from "@/types/negotiation";
+import { computeLeverage } from "@/lib/rules/leverage";
+import type {
+  LeverageScoreDTO,
+  NegotiationTurnResponse,
+  PersistedAgreementDTO,
+} from "@/types/negotiation";
 
 function jsonResponse(body: unknown, status: number) {
   return new Response(JSON.stringify(body), {
@@ -38,6 +43,10 @@ function toAgreementDTO(persisted: {
     totalAmount: persisted.totalAmount,
     status: persisted.status,
   };
+}
+
+function toLeverageDTO(score: { buyerLeverage: number; merchantLeverage: number; reasons: string[] }): LeverageScoreDTO {
+  return { buyer: score.buyerLeverage, merchant: score.merchantLeverage, reasons: score.reasons };
 }
 
 const TERMINAL_STATUSES = ["AGREED", "REJECTED", "EXPIRED"];
@@ -68,11 +77,21 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       // session being AGREED, fall through to the generic 409 below rather
       // than fabricate a response.
       if (loaded.state.status === "AGREED") {
-        const [agreement, lastTurn] = await Promise.all([
+        const [agreement, lastTurn, item] = await Promise.all([
           getAgreementBySessionId(id),
           loadLatestTurn(id, loaded.sku),
+          findCatalogItemBySku(loaded.sku),
         ]);
         if (agreement && lastTurn) {
+          const leverage: LeverageScoreDTO = item
+            ? toLeverageDTO(
+                computeLeverage({
+                  item,
+                  buyerConstraints: loaded.buyerConstraints,
+                  currentMerchantUnitPrice: agreement.unitPrice,
+                }),
+              )
+            : { buyer: 50, merchant: 50, reasons: [] };
           const response: NegotiationTurnResponse = {
             sessionId: id,
             turn: lastTurn.turnNumber,
@@ -82,6 +101,7 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
             round: loaded.state.round,
             maxRounds: loaded.state.maxRounds,
             agreement: toAgreementDTO(agreement),
+            leverage,
           };
           return jsonResponse(response, 200);
         }
@@ -151,6 +171,7 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       round: turn.state.round,
       maxRounds: turn.state.maxRounds,
       agreement,
+      leverage: toLeverageDTO(turn.leverage),
     };
     return jsonResponse(response, 200);
   } catch (error) {

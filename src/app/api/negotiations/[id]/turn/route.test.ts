@@ -93,6 +93,24 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
     ).toBe(1);
   });
 
+  // Leverage-visualization milestone: every turn response carries a live,
+  // server-computed leverage score (never from the LLM) — this proves the
+  // real API data path, not just the pure computeLeverage() unit tests.
+  it("every turn response includes a valid 0-100 leverage score, and the AGREED replay recomputes it consistently", async () => {
+    const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
+
+    const first = await callTurn(sessionId);
+    expect(first.body.leverage.buyer + first.body.leverage.merchant).toBe(100);
+    expect(first.body.leverage.buyer).toBeGreaterThanOrEqual(0);
+    expect(first.body.leverage.buyer).toBeLessThanOrEqual(100);
+
+    const closing = await callTurn(sessionId); // AGREED
+    expect(closing.body.leverage.buyer + closing.body.leverage.merchant).toBe(100);
+
+    const replay = await callTurn(sessionId);
+    expect(replay.body.leverage).toEqual(closing.body.leverage);
+  });
+
   it("B, C, D, E: repeating the POST after AGREED replays the same Agreement without a new turn, LLM call, Agreement, or AuditLog", async () => {
     const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
 

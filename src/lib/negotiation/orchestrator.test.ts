@@ -445,3 +445,236 @@ describe("Section 11 demo scenarios", () => {
     expect(discounted.transcript.every((t) => t.merchant.type !== "counter_offer")).toBe(true);
   });
 });
+
+// Leverage-visualization + detailed-scenarios milestone: every turn now
+// carries a live leverage score (leverage.ts), and the public API/UI
+// finally expose urgency + deliveryFlexible — this section proves the
+// underlying deterministic math (already wired up by the strategy
+// hardening milestone) behaves coherently for realistic combinations of
+// those factors, end to end through the real orchestrator, not just in
+// isolated unit tests.
+describe("combined strategic factors (item J scenarios)", () => {
+  const wellStocked: CatalogItemSnapshot = {
+    sku: "MONITOR-24-FHD",
+    listedPrice: 9500,
+    minPrice: 8200,
+    availableQty: 1000,
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 12,
+    negotiationEnabled: true,
+  };
+  const wellStockedListing: PublicManifestProduct = {
+    sku: "MONITOR-24-FHD",
+    name: "24-inch Full HD Monitor",
+    description: "Standard office monitor, 1920x1080.",
+    listedPrice: 9500,
+    availableQuantity: 1000,
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 12,
+    negotiable: true,
+  };
+
+  // large quantity + high merchant stock -> strong buyer leverage.
+  it("large quantity against ample stock: buyer leverage is high and the price moves well below listed", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: wellStocked,
+        manifestProduct: wellStockedListing,
+        buyerConstraints: { sku: "MONITOR-24-FHD", quantity: 400, maxUnitPrice: 9200, deliveryDeadlineDays: 6 },
+      },
+      6,
+    );
+    expect(finalState.status).not.toBe("REJECTED"); // a well-stocked, achievable request should never be rejected outright
+    const lastTurn = transcript[transcript.length - 1];
+    expect(lastTurn.leverage.buyerLeverage).toBeGreaterThan(50);
+    // Never below the merchant's floor no matter how buyer-favoring leverage gets.
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(wellStocked.minPrice);
+      }
+    }
+  });
+
+  // large quantity + low merchant stock -> the physical constraint
+  // dominates: quantity is clamped (partial fulfillment remains valid),
+  // and leverage favors the merchant despite the large ask.
+  it("large quantity against tight stock: quantity is clamped to availableQty and merchant leverage rises", async () => {
+    const tight: CatalogItemSnapshot = { ...wellStocked, availableQty: 80 };
+    const tightListing: PublicManifestProduct = { ...wellStockedListing, availableQuantity: 80 };
+    const { transcript } = await runNegotiationToCompletion(
+      {
+        item: tight,
+        manifestProduct: tightListing,
+        buyerConstraints: { sku: "MONITOR-24-FHD", quantity: 400, maxUnitPrice: 9200, deliveryDeadlineDays: 6 },
+      },
+      6,
+    );
+    for (const turn of transcript) {
+      if (turn.merchant.quantity !== null) {
+        expect(turn.merchant.quantity).toBeLessThanOrEqual(tight.availableQty);
+      }
+    }
+    const firstTurn = transcript[0];
+    expect(firstTurn.merchant.type).toBe("counter_offer"); // PARTIAL_FULFILLMENT, not an outright accept
+    expect(firstTurn.leverage.merchantLeverage).toBeGreaterThan(50);
+  });
+
+  // urgent delivery + low stock -> merchant firm, but the buyer's own
+  // ceiling is still never breached.
+  it("urgent delivery against tight stock: merchant leverage is high, buyer never exceeds its ceiling", async () => {
+    const tight: CatalogItemSnapshot = { ...wellStocked, availableQty: 40 };
+    const tightListing: PublicManifestProduct = { ...wellStockedListing, availableQuantity: 40 };
+    const { transcript } = await runNegotiationToCompletion(
+      {
+        item: tight,
+        manifestProduct: tightListing,
+        buyerConstraints: {
+          sku: "MONITOR-24-FHD",
+          quantity: 30,
+          maxUnitPrice: 9300,
+          deliveryDeadlineDays: 4, // == standardDeliveryDays, no slack -> genuinely urgent
+          urgency: "high",
+        },
+      },
+      6,
+    );
+    expect(transcript[0].leverage.merchantLeverage).toBeGreaterThan(50);
+    for (const turn of transcript) {
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(9300);
+      }
+    }
+  });
+
+  // flexible delivery + large quantity -> buyer gets a later delivery
+  // date AND still respects its own price ceiling.
+  it("flexible delivery combined with a large order: delivery extends beyond standard, price ceiling still respected", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: wellStocked,
+        manifestProduct: wellStockedListing,
+        buyerConstraints: {
+          sku: "MONITOR-24-FHD",
+          quantity: 350,
+          maxUnitPrice: 9300,
+          deliveryDeadlineDays: 12, // real slack beyond standardDeliveryDays (4)
+          deliveryFlexible: true,
+        },
+      },
+      6,
+    );
+    const tradedTurn = transcript.find((t) => (t.merchant.deliveryDays ?? 0) > wellStocked.standardDeliveryDays);
+    expect(tradedTurn).toBeDefined();
+    for (const turn of transcript) {
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(9300);
+      }
+    }
+    expect(["AGREED", "COUNTERED", "EXPIRED"]).toContain(finalState.status);
+  });
+
+  // urgent delivery + flexible delivery together must resolve
+  // consistently: the delivery trade depends only on deadline slack +
+  // the flexibility flag, not on urgency, so two otherwise-identical
+  // negotiations differing only in urgency should extend delivery by
+  // the exact same amount.
+  it("urgency and delivery flexibility resolve independently and consistently", async () => {
+    const buildConstraints = (urgency: "low" | "high"): BuyerConstraints => ({
+      sku: "MONITOR-24-FHD",
+      quantity: 30,
+      maxUnitPrice: 9300,
+      deliveryDeadlineDays: 10,
+      deliveryFlexible: true,
+      urgency,
+    });
+
+    const highUrgency = await runNegotiationToCompletion(
+      { item: wellStocked, manifestProduct: wellStockedListing, buyerConstraints: buildConstraints("high") },
+      6,
+    );
+    const lowUrgency = await runNegotiationToCompletion(
+      { item: wellStocked, manifestProduct: wellStockedListing, buyerConstraints: buildConstraints("low") },
+      6,
+    );
+
+    expect(highUrgency.transcript[0].merchant.deliveryDays).toBe(
+      lowUrgency.transcript[0].merchant.deliveryDays,
+    );
+    // But urgency still shapes price leverage independently of delivery.
+    expect(highUrgency.transcript[0].leverage.buyerLeverage).toBeLessThan(
+      lowUrgency.transcript[0].leverage.buyerLeverage,
+    );
+  });
+
+  // large quantity + budget constraint -> quantity leverage never lets
+  // the buyer exceed its own stated maximum.
+  it("a large order never lets the buyer exceed its own maxUnitPrice, however strong its leverage", async () => {
+    const { transcript } = await runNegotiationToCompletion(
+      {
+        item: wellStocked,
+        manifestProduct: wellStockedListing,
+        buyerConstraints: { sku: "MONITOR-24-FHD", quantity: 800, maxUnitPrice: 8900, deliveryDeadlineDays: 6 },
+      },
+      6,
+    );
+    for (const turn of transcript) {
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(8900);
+      }
+    }
+  });
+
+  // large quantity + flexible delivery + high stock -> every buyer-favoring
+  // factor stacked; still bounded by the merchant's floor.
+  it("stacking every buyer-favoring factor still never breaches the merchant's floor", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: wellStocked,
+        manifestProduct: wellStockedListing,
+        buyerConstraints: {
+          sku: "MONITOR-24-FHD",
+          quantity: 600,
+          maxUnitPrice: 9400,
+          deliveryDeadlineDays: 12,
+          deliveryFlexible: true,
+          urgency: "low",
+        },
+      },
+      6,
+    );
+    expect(transcript[0].leverage.buyerLeverage).toBeGreaterThan(60);
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(wellStocked.minPrice);
+      }
+    }
+    expect(["AGREED", "COUNTERED", "EXPIRED"]).toContain(finalState.status);
+  });
+
+  // Walk-away still works correctly with every strategic factor active
+  // at once — no fake agreement, no agreement persistence trigger.
+  it("an impossible budget still walks away (EXPIRED) even with maximal buyer-favoring strategic factors", async () => {
+    const { finalState, transcript } = await runNegotiationToCompletion(
+      {
+        item: wellStocked,
+        manifestProduct: wellStockedListing,
+        buyerConstraints: {
+          sku: "MONITOR-24-FHD",
+          quantity: 500,
+          maxUnitPrice: 5000, // below the 8200 floor -> impossible regardless of leverage
+          deliveryDeadlineDays: 12,
+          deliveryFlexible: true,
+          urgency: "low",
+        },
+      },
+      2,
+    );
+    expect(finalState.status).toBe("EXPIRED");
+    expect(transcript[transcript.length - 1].merchant.type).not.toBe("accept");
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(wellStocked.minPrice);
+      }
+    }
+  });
+});

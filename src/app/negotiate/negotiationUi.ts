@@ -5,12 +5,17 @@
 
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
+import type { PublicManifestProduct } from "@/types/manifest";
+
+export type UrgencyFormValue = "low" | "medium" | "high";
 
 export interface BuyerRequestFormValues {
   sku: string;
   quantity: string;
   maxUnitPrice: string;
   deliveryDeadlineDays: string;
+  urgency: UrgencyFormValue;
+  deliveryFlexible: boolean;
 }
 
 export interface ParsedBuyerRequest {
@@ -18,6 +23,8 @@ export interface ParsedBuyerRequest {
   quantity: number;
   maxUnitPrice: number;
   deliveryDeadlineDays: number;
+  urgency: UrgencyFormValue;
+  deliveryFlexible: boolean;
 }
 
 /**
@@ -48,7 +55,126 @@ export function parseBuyerRequestForm(
     return "Delivery deadline must be a positive number of days.";
   }
 
-  return { sku: values.sku, quantity, maxUnitPrice, deliveryDeadlineDays };
+  return {
+    sku: values.sku,
+    quantity,
+    maxUnitPrice,
+    deliveryDeadlineDays,
+    urgency: values.urgency,
+    deliveryFlexible: values.deliveryFlexible,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Scenario presets — pure form prefills, nothing more. Each one just
+// fills the same fields a person could type in by hand; the actual
+// scenario behavior (bulk leverage, scarcity, urgency, flexibility,
+// walk-away) comes entirely from the real deterministic engine once
+// submitted — see negotiationStrategy.ts / leverage.ts / orchestrator.ts
+// and their tests for where that behavior is proven. This exists only
+// to make the different situations quick to demonstrate without typing
+// numbers by hand each time.
+// ---------------------------------------------------------------------------
+
+export interface ScenarioPreset {
+  id: string;
+  label: string;
+  description: string;
+  sku: string;
+  values: BuyerRequestFormValues;
+}
+
+const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
+  {
+    id: "balanced",
+    label: "Balanced negotiation",
+    description: "Neither side has a dominant advantage — a gradual, ordinary back-and-forth.",
+    sku: "LAPTOP-14-I5",
+    values: {
+      sku: "LAPTOP-14-I5",
+      quantity: "50",
+      maxUnitPrice: "46000",
+      deliveryDeadlineDays: "7",
+      urgency: "medium",
+      deliveryFlexible: false,
+    },
+  },
+  {
+    id: "bulk-buyer",
+    label: "Bulk buyer",
+    description: "A large order against ample stock — buyer leverage should be strong.",
+    sku: "MONITOR-24-FHD",
+    values: {
+      sku: "MONITOR-24-FHD",
+      quantity: "200",
+      maxUnitPrice: "9000",
+      deliveryDeadlineDays: "8",
+      urgency: "medium",
+      deliveryFlexible: false,
+    },
+  },
+  {
+    id: "low-stock",
+    label: "Low-stock merchant",
+    description: "The order exceeds available stock — expect partial fulfillment and merchant leverage.",
+    sku: "LAPTOP-14-I5",
+    values: {
+      sku: "LAPTOP-14-I5",
+      quantity: "150",
+      maxUnitPrice: "47000",
+      deliveryDeadlineDays: "10",
+      urgency: "medium",
+      deliveryFlexible: false,
+    },
+  },
+  {
+    id: "urgent-delivery",
+    label: "Urgent delivery",
+    description: "No slack on delivery — the merchant can hold a firmer price.",
+    sku: "LAPTOP-14-I5",
+    values: {
+      sku: "LAPTOP-14-I5",
+      quantity: "20",
+      maxUnitPrice: "47500",
+      deliveryDeadlineDays: "5",
+      urgency: "high",
+      deliveryFlexible: false,
+    },
+  },
+  {
+    id: "flexible-delivery",
+    label: "Flexible delivery",
+    description: "The buyer trades a later delivery date for a better price.",
+    sku: "LAPTOP-14-I5",
+    values: {
+      sku: "LAPTOP-14-I5",
+      quantity: "20",
+      maxUnitPrice: "46000",
+      deliveryDeadlineDays: "12",
+      urgency: "low",
+      deliveryFlexible: true,
+    },
+  },
+  {
+    id: "walk-away",
+    label: "Impossible budget",
+    description: "The buyer's ceiling is below the merchant's floor — expect no agreement.",
+    sku: "LAPTOP-14-I5",
+    values: {
+      sku: "LAPTOP-14-I5",
+      quantity: "10",
+      maxUnitPrice: "40000",
+      deliveryDeadlineDays: "10",
+      urgency: "medium",
+      deliveryFlexible: false,
+    },
+  },
+];
+
+/** Only returns presets whose product SKU actually exists in the current catalog — never references a product the manifest doesn't have. */
+export function getScenarioPresets(products: PublicManifestProduct[]): ScenarioPreset[] {
+  const available = new Set(products.map((p) => p.sku));
+  return SCENARIO_PRESET_DEFINITIONS.filter((preset) => available.has(preset.sku));
 }
 
 /** Shared INR currency formatter for every price shown on the negotiate page. */

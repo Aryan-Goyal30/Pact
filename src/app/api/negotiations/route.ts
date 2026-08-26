@@ -11,11 +11,13 @@ function jsonResponse(body: unknown, status: number) {
   });
 }
 
+const VALID_URGENCY_LEVELS = ["low", "medium", "high"] as const;
+
 function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | null {
   if (typeof body !== "object" || body === null) {
     return null;
   }
-  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds } =
+  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds, urgency, deliveryFlexible } =
     body as Record<string, unknown>;
 
   if (typeof sku !== "string" || sku.trim().length === 0) {
@@ -37,8 +39,25 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
   if (maxRounds !== undefined && (typeof maxRounds !== "number" || maxRounds <= 0)) {
     return null;
   }
+  if (
+    urgency !== undefined &&
+    !VALID_URGENCY_LEVELS.includes(urgency as (typeof VALID_URGENCY_LEVELS)[number])
+  ) {
+    return null;
+  }
+  if (deliveryFlexible !== undefined && typeof deliveryFlexible !== "boolean") {
+    return null;
+  }
 
-  return { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds };
+  return {
+    sku,
+    quantity,
+    maxUnitPrice,
+    deliveryDeadlineDays,
+    maxRounds,
+    urgency: urgency as NegotiationSessionCreateRequest["urgency"],
+    deliveryFlexible,
+  };
 }
 
 // POST /api/negotiations — creates a negotiation session and returns its
@@ -89,6 +108,8 @@ export async function POST(request: Request) {
         quantity: createRequest.quantity,
         maxUnitPrice: createRequest.maxUnitPrice,
         deliveryDeadlineDays: createRequest.deliveryDeadlineDays,
+        urgency: createRequest.urgency,
+        deliveryFlexible: createRequest.deliveryFlexible,
       },
       maxRounds,
     );

@@ -37,6 +37,7 @@ import {
 import { runBuyerAgent, type BuyerAction } from "@/lib/agents/buyerAgent";
 import { runMerchantAgent } from "@/lib/agents/merchantAgent";
 import type { StructuredNegotiationMessage } from "@/lib/negotiation/protocol";
+import { computeLeverage, type LeverageScore } from "@/lib/rules/leverage";
 
 export interface NegotiationContext {
   item: CatalogItemSnapshot;
@@ -50,7 +51,12 @@ export interface NegotiationTurnResult {
   merchant: StructuredNegotiationMessage;
   /** Feed this into the next call's `previousMerchantResult`; null once the negotiation has closed. */
   nextMerchantResult: NegotiationResult | null;
+  /** Live buyer-vs-merchant leverage score for this turn — see leverage.ts. Recomputed fresh every turn from the same deterministic factors driving the price/quantity/delivery math; never derived from or shown to the LLM. */
+  leverage: LeverageScore;
 }
+
+/** The turn result shape before its leverage score is attached — see attachLeverage. */
+type NegotiationTurnResultCore = Omit<NegotiationTurnResult, "leverage">;
 
 const TERMINAL_STATUSES: NegotiationStatus[] = ["AGREED", "REJECTED", "EXPIRED"];
 
@@ -87,7 +93,7 @@ function closeNegotiation(
   accepted: boolean,
   rejectionReasons: string[],
   acceptMessage = "Accepted.",
-): NegotiationTurnResult {
+): NegotiationTurnResultCore {
   return {
     state: accepted ? acceptNegotiation(state) : rejectNegotiation(state),
     buyer: buyerMessage,
@@ -121,6 +127,20 @@ export async function runNegotiationTurn(
     );
   }
 
+  // Attaches this turn's live leverage score, computed fresh from the
+  // same deterministic factors (stock, quantity, urgency, delivery
+  // flexibility, and this turn's own price position) driving the real
+  // negotiation math — see leverage.ts. Wraps every return path below so
+  // no branch can forget it.
+  function finish(core: NegotiationTurnResultCore): NegotiationTurnResult {
+    const leverage = computeLeverage({
+      item: context.item,
+      buyerConstraints: context.buyerConstraints,
+      currentMerchantUnitPrice: core.merchant.unitPrice,
+    });
+    return { ...core, leverage };
+  }
+
   const buyerResponse = await runBuyerAgent(
     context.buyerConstraints,
     context.manifestProduct,
@@ -140,19 +160,21 @@ export async function runNegotiationTurn(
       unitPrice: buyerResponse.action.unitPrice,
       deliveryDays: buyerResponse.action.deliveryDays,
     });
-    return closeNegotiation(
-      state,
-      buyerMessage,
-      buyerResponse.action,
-      agreementCheck.outcome === "ACCEPTED",
-      agreementCheck.reasons,
+    return finish(
+      closeNegotiation(
+        state,
+        buyerMessage,
+        buyerResponse.action,
+        agreementCheck.outcome === "ACCEPTED",
+        agreementCheck.reasons,
+      ),
     );
   }
 
   // The buyer deterministically decided the merchant already rejected —
   // nothing left to negotiate.
   if (buyerResponse.action.type === "reject") {
-    return {
+    return finish({
       state: rejectNegotiation(state),
       buyer: buyerMessage,
       merchant: {
@@ -165,7 +187,7 @@ export async function runNegotiationTurn(
         message: "Negotiation closed without an agreement.",
       },
       nextMerchantResult: null,
-    };
+    });
   }
 
   // Buyer sent a genuine ask ("request" or "counter_offer"). The
@@ -214,19 +236,21 @@ export async function runNegotiationTurn(
       deliveryDays: merchantResult.deliveryDays as number,
     };
     const agreementCheck = validateProposedAgreement(context.item, terms);
-    return closeNegotiation(
-      state,
-      buyerMessage,
-      terms,
-      agreementCheck.outcome === "ACCEPTED",
-      agreementCheck.reasons,
-      merchantAgentResponse.message,
+    return finish(
+      closeNegotiation(
+        state,
+        buyerMessage,
+        terms,
+        agreementCheck.outcome === "ACCEPTED",
+        agreementCheck.reasons,
+        merchantAgentResponse.message,
+      ),
     );
   }
 
   const nextState = advanceNegotiationState(state, merchantResult.outcome);
 
-  return {
+  return finish({
     state: nextState,
     buyer: buyerMessage,
     merchant: {
@@ -239,7 +263,7 @@ export async function runNegotiationTurn(
       message: merchantAgentResponse.message,
     },
     nextMerchantResult: nextState.status === "COUNTERED" ? merchantResult : null,
-  };
+  });
 }
 
 export interface NegotiationRunResult {

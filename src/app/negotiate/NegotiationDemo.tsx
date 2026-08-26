@@ -3,6 +3,7 @@
 import { useState, type FormEvent } from "react";
 import type { PublicManifestProduct } from "@/types/manifest";
 import type {
+  LeverageScoreDTO,
   NegotiationMessageDTO,
   NegotiationSessionResponse,
   NegotiationTurnResponse,
@@ -13,6 +14,7 @@ import {
   buyerThinkingLabel,
   computeMaxOrderValue,
   formatInr,
+  getScenarioPresets,
   merchantThinkingLabel,
   negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
@@ -41,6 +43,7 @@ interface TranscriptTurn {
   turn: number;
   buyer: NegotiationMessageDTO | null;
   merchant: NegotiationMessageDTO | null;
+  leverage: LeverageScoreDTO | null;
 }
 
 interface NegotiationDemoProps {
@@ -66,7 +69,10 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     quantity: "200",
     maxUnitPrice: "45000",
     deliveryDeadlineDays: "10",
+    urgency: "medium",
+    deliveryFlexible: false,
   });
+  const presets = getScenarioPresets(products);
   const [formError, setFormError] = useState<string | null>(null);
   const [apiError, setApiError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
@@ -140,16 +146,25 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
 
         // Reveal the buyer's move first.
         await delay(REVEAL_DELAY_MS);
-        setTranscript((prev) => [...prev, { turn: turn.turn, buyer: turn.buyer, merchant: null }]);
+        setTranscript((prev) => [
+          ...prev,
+          { turn: turn.turn, buyer: turn.buyer, merchant: null, leverage: null },
+        ]);
 
         // Then show the merchant "thinking" before revealing its response
         // — the response itself is already known; this only paces its
-        // reveal so the transcript doesn't dump instantly.
+        // reveal so the transcript doesn't dump instantly. The leverage
+        // score is revealed alongside it, for the same reason: it's
+        // already been computed server-side from this turn's real
+        // structured result (leverage.ts), not something the UI derives
+        // on its own.
         setThinking({ agent: "merchant", label: merchantThinkingLabel(turn.merchant.type) });
         await delay(THINKING_DELAY_MS);
 
         setTranscript((prev) =>
-          prev.map((t) => (t.turn === turn.turn ? { ...t, merchant: turn.merchant } : t)),
+          prev.map((t) =>
+            t.turn === turn.turn ? { ...t, merchant: turn.merchant, leverage: turn.leverage } : t,
+          ),
         );
         setRound(turn.round);
         setStatus(turn.status);
@@ -192,11 +207,28 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
           </p>
         </div>
 
+        {presets.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {presets.map((preset) => (
+              <button
+                key={preset.id}
+                type="button"
+                disabled={running}
+                title={preset.description}
+                onClick={() => setForm(preset.values)}
+                className="rounded-full border border-black/[.12] px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        )}
+
         <form
           onSubmit={handleSubmit}
           className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]"
         >
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <label className="flex flex-col gap-1.5 text-sm">
               <span className="font-medium text-zinc-700 dark:text-zinc-300">Product</span>
               <select
@@ -251,6 +283,35 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
                 onChange={(e) => setForm({ ...form, deliveryDeadlineDays: e.target.value })}
                 className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
               />
+            </label>
+
+            <label className="flex flex-col gap-1.5 text-sm">
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">Buyer urgency</span>
+              <select
+                value={form.urgency}
+                disabled={running}
+                onChange={(e) =>
+                  setForm({ ...form, urgency: e.target.value as BuyerRequestFormValues["urgency"] })
+                }
+                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+              >
+                <option value="low">Low — can wait</option>
+                <option value="medium">Medium</option>
+                <option value="high">High — needs it fast</option>
+              </select>
+            </label>
+
+            <label className="flex items-center gap-2 self-end pb-2 text-sm">
+              <input
+                type="checkbox"
+                disabled={running}
+                checked={form.deliveryFlexible}
+                onChange={(e) => setForm({ ...form, deliveryFlexible: e.target.checked })}
+                className="h-4 w-4 rounded border-black/[.25] disabled:opacity-50 dark:border-white/[.3]"
+              />
+              <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                Flexible on delivery (trade for a better price)
+              </span>
             </label>
           </div>
 
@@ -322,6 +383,9 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
             merchantOffer={latestMerchantOffer}
             previousBuyerOffer={previousTurn?.buyer ?? null}
             previousMerchantOffer={previousTurn?.merchant ?? null}
+            leverageHistory={transcript
+              .filter((t): t is TranscriptTurn & { leverage: LeverageScoreDTO } => t.leverage !== null)
+              .map((t) => ({ turn: t.turn, leverage: t.leverage }))}
           />
 
           <ol className="flex flex-col gap-4">
@@ -416,6 +480,7 @@ function NegotiationStateHeader({
   merchantOffer,
   previousBuyerOffer,
   previousMerchantOffer,
+  leverageHistory,
 }: {
   status: NegotiationStatus | null;
   round: number;
@@ -424,6 +489,7 @@ function NegotiationStateHeader({
   merchantOffer: NegotiationMessageDTO | null;
   previousBuyerOffer: NegotiationMessageDTO | null;
   previousMerchantOffer: NegotiationMessageDTO | null;
+  leverageHistory: { turn: number; leverage: LeverageScoreDTO }[];
 }) {
   const buyerPrice = buyerOffer?.unitPrice ?? null;
   const merchantPrice = merchantOffer?.unitPrice ?? null;
@@ -476,6 +542,74 @@ function NegotiationStateHeader({
             {delivery !== null ? `${delivery} day(s)` : "—"}
           </p>
         </div>
+      </div>
+
+      {leverageHistory.length > 0 && <LeverageGraph history={leverageHistory} />}
+    </div>
+  );
+}
+
+/**
+ * Live buyer-vs-merchant leverage visualization. Every number here comes
+ * straight from the server's LeverageScoreDTO (see leverage.ts /
+ * orchestrator.ts) — computed entirely from deterministic strategic
+ * factors (stock, quantity, urgency, delivery flexibility, price
+ * position). Nothing on this graph is generated by Gemini, and nothing
+ * here can influence the real negotiation — it only visualizes state the
+ * deterministic engine already decided.
+ */
+function LeverageGraph({ history }: { history: { turn: number; leverage: LeverageScoreDTO }[] }) {
+  const latest = history[history.length - 1].leverage;
+
+  return (
+    <div className="flex flex-col gap-3 rounded-lg border border-black/[.08] bg-black/[.02] px-4 py-4 dark:border-white/[.1] dark:bg-white/[.03]">
+      <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+        Negotiation leverage
+      </p>
+
+      <LeverageBar label="Buyer leverage" percent={latest.buyer} tone="blue" />
+      <LeverageBar label="Merchant leverage" percent={latest.merchant} tone="amber" />
+
+      {latest.reasons.length > 0 && (
+        <p className="text-xs text-zinc-600 dark:text-zinc-400">{latest.reasons[0]}</p>
+      )}
+
+      {history.length > 1 && (
+        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-black/[.06] pt-2 text-[11px] text-zinc-500 dark:border-white/[.08] dark:text-zinc-500">
+          {history.map((h) => (
+            <span key={h.turn}>
+              Round {h.turn} → Buyer {h.leverage.buyer} / Merchant {h.leverage.merchant}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LeverageBar({
+  label,
+  percent,
+  tone,
+}: {
+  label: string;
+  percent: number;
+  tone: "blue" | "amber";
+}) {
+  const barClass = tone === "blue" ? "bg-blue-500 dark:bg-blue-500" : "bg-amber-500 dark:bg-amber-500";
+  const textClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center justify-between text-xs">
+        <span className={`font-medium ${textClass}`}>{label}</span>
+        <span className={`font-medium ${textClass}`}>{percent}%</span>
+      </div>
+      <div className="h-2 w-full overflow-hidden rounded-full bg-black/[.08] dark:bg-white/[.1]">
+        <div
+          className={`h-full rounded-full transition-all duration-500 ${barClass}`}
+          style={{ width: `${percent}%` }}
+        />
       </div>
     </div>
   );

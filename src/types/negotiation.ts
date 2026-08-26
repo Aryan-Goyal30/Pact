@@ -68,6 +68,23 @@ export interface NegotiationSessionCreateRequest {
   deliveryDeadlineDays: number;
   /** Optional override of the default round bound. */
   maxRounds?: number;
+  /** "low" | "medium" | "high" — see BuyerConstraints.urgency (buyerRules.ts). Defaults to "medium" when omitted. */
+  urgency?: "low" | "medium" | "high";
+  /** Whether the buyer will trade a later delivery date for a price concession — see BuyerConstraints.deliveryFlexible. Defaults to false when omitted. */
+  deliveryFlexible?: boolean;
+}
+
+/**
+ * The live buyer-vs-merchant leverage score for one turn — see
+ * src/lib/rules/leverage.ts. Purely derived from deterministic
+ * strategic factors (stock, quantity, urgency, delivery flexibility,
+ * price position); never from the LLM. Safe to send to the browser —
+ * carries no price bounds or private catalog data.
+ */
+export interface LeverageScoreDTO {
+  buyer: number;
+  merchant: number;
+  reasons: string[];
 }
 
 export interface NegotiationSessionResponse {
@@ -113,4 +130,6 @@ export interface NegotiationTurnResponse {
   maxRounds: number;
   /** Present only when this turn just closed the negotiation as AGREED — the real persisted Agreement, not a structural preview. */
   agreement: PersistedAgreementDTO | null;
+  /** Live leverage score for this turn — see LeverageScoreDTO. */
+  leverage: LeverageScoreDTO;
 }
