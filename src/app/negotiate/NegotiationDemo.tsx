@@ -3,10 +3,10 @@
 import { useState, type FormEvent } from "react";
 import type { PublicManifestProduct } from "@/types/manifest";
 import type {
-  NegotiationAgreementDTO,
   NegotiationMessageDTO,
   NegotiationSessionResponse,
   NegotiationTurnResponse,
+  PersistedAgreementDTO,
 } from "@/types/negotiation";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import {
@@ -79,7 +79,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   const [thinking, setThinking] = useState<{ agent: "buyer" | "merchant"; label: string } | null>(
     null,
   );
-  const [agreement, setAgreement] = useState<NegotiationAgreementDTO | null>(null);
+  const [agreement, setAgreement] = useState<PersistedAgreementDTO | null>(null);
 
   const selectedProduct = products.find((p) => p.sku === form.sku) ?? null;
   const parsedQuantity = Number(form.quantity);
@@ -570,7 +570,7 @@ function OutcomeCard({
   productName,
 }: {
   status: NegotiationStatus;
-  agreement: NegotiationAgreementDTO | null;
+  agreement: PersistedAgreementDTO | null;
   lastTurn: TranscriptTurn | undefined;
   productName: string | null;
 }) {
@@ -582,7 +582,8 @@ function OutcomeCard({
             Agreement reached
           </h3>
           <p className="text-sm text-green-800/80 dark:text-green-300/80">
-            Buyer and Merchant Agents reached an agreement.
+            Buyer and Merchant Agents reached an agreement. It has been recorded as a
+            durable agreement record.
           </p>
         </div>
         <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
@@ -617,13 +618,21 @@ function OutcomeCard({
             </dd>
           </div>
         </dl>
+        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-green-200 pt-3 text-xs text-green-700/80 dark:border-green-900/50 dark:text-green-400/70">
+          <span>
+            Agreement ID: <span className="font-mono">{agreement.id}</span>
+          </span>
+          <span>
+            Status: <span className="font-medium">{agreement.status}</span>
+          </span>
+        </div>
         <button
           type="button"
           disabled
-          title="Payment is not implemented yet"
+          title="Payment integration is the next phase — not implemented yet"
           className="flex h-11 w-fit items-center justify-center rounded-full bg-zinc-400 px-6 text-sm font-medium text-white opacity-60 dark:bg-zinc-700"
         >
-          Proceed to Payment
+          Proceed to Payment (coming in a later phase)
         </button>
       </div>
     );

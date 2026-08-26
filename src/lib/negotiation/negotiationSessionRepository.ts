@@ -13,6 +13,11 @@ import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import type { NegotiationResult } from "@/lib/rules/negotiationEngine";
 import type { NegotiationState, NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { NegotiationTurnResult } from "@/lib/negotiation/orchestrator";
+import type {
+  NegotiationMessageType,
+  NegotiationParticipant,
+} from "@/lib/negotiation/protocol";
+import type { NegotiationMessageDTO } from "@/types/negotiation";
 
 /** Creates a new OPEN session and returns its id. Executes no turns. */
 export async function createNegotiationSession(
@@ -119,4 +124,51 @@ export async function persistNegotiationTurn(
   ]);
 
   return { turnNumber };
+}
+
+export interface LoadedTurnMessages {
+  turnNumber: number;
+  buyer: NegotiationMessageDTO;
+  merchant: NegotiationMessageDTO;
+}
+
+/**
+ * Re-reads the most recently persisted turn's buyer/merchant messages
+ * without running a new negotiation turn — used to replay the response
+ * of an already-terminal session (e.g. a repeated POST .../turn after
+ * AGREED) purely from what's already on disk. Returns null if the
+ * session has no messages yet.
+ */
+export async function loadLatestTurn(
+  sessionId: string,
+  sku: string,
+): Promise<LoadedTurnMessages | null> {
+  const latest = await prisma.negotiationMessage.findFirst({
+    where: { sessionId },
+    orderBy: { round: "desc" },
+  });
+  if (!latest) {
+    return null;
+  }
+
+  const rows = await prisma.negotiationMessage.findMany({
+    where: { sessionId, round: latest.round },
+  });
+  const buyerRow = rows.find((row) => row.sender === "buyer");
+  const merchantRow = rows.find((row) => row.sender === "merchant");
+  if (!buyerRow || !merchantRow) {
+    return null;
+  }
+
+  const toDTO = (row: typeof buyerRow): NegotiationMessageDTO => ({
+    sender: row.sender as NegotiationParticipant,
+    type: row.type as NegotiationMessageType,
+    sku,
+    quantity: row.quantity,
+    unitPrice: row.pricePerUnit,
+    deliveryDays: row.deliveryDays,
+    message: row.messageText,
+  });
+
+  return { turnNumber: latest.round, buyer: toDTO(buyerRow), merchant: toDTO(merchantRow) };
 }

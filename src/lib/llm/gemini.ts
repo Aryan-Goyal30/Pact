@@ -16,7 +16,7 @@ import { GoogleGenAI } from "@google/genai";
 import type { AgentMessageInput, LlmProvider } from "@/lib/llm/provider";
 import { LlmUnavailableError } from "@/lib/llm/errors";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-3.6-flash";
 
 /**
  * Thrown when GEMINI_API_KEY is not set. Extends the provider-agnostic

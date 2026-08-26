@@ -2,17 +2,42 @@ import { findCatalogItemBySku } from "@/lib/rules/catalogRepository";
 import { getPublicManifest } from "@/lib/manifest";
 import { runNegotiationTurn } from "@/lib/negotiation/orchestrator";
 import {
+  loadLatestTurn,
   loadNegotiationSession,
   persistNegotiationTurn,
 } from "@/lib/negotiation/negotiationSessionRepository";
-import { toAgreement, toMessageDTO } from "@/lib/negotiation/negotiationRunResponse";
-import type { NegotiationTurnResponse } from "@/types/negotiation";
+import {
+  ensureAgreementForSession,
+  getAgreementBySessionId,
+} from "@/lib/negotiation/agreementRepository";
+import { toMessageDTO } from "@/lib/negotiation/negotiationRunResponse";
+import type { NegotiationTurnResponse, PersistedAgreementDTO } from "@/types/negotiation";
 
 function jsonResponse(body: unknown, status: number) {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function toAgreementDTO(persisted: {
+  id: string;
+  sku: string;
+  quantity: number;
+  unitPrice: number;
+  deliveryDays: number;
+  totalAmount: number;
+  status: string;
+}): PersistedAgreementDTO {
+  return {
+    id: persisted.id,
+    sku: persisted.sku,
+    quantity: persisted.quantity,
+    unitPrice: persisted.unitPrice,
+    deliveryDays: persisted.deliveryDays,
+    totalAmount: persisted.totalAmount,
+    status: persisted.status,
+  };
 }
 
 const TERMINAL_STATUSES = ["AGREED", "REJECTED", "EXPIRED"];
@@ -34,6 +59,34 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
     }
 
     if (TERMINAL_STATUSES.includes(loaded.state.status)) {
+      // A repeated POST against an already-AGREED session is a safe,
+      // idempotent replay of the same completed negotiation — not an
+      // error. Serve it entirely from what's already persisted: no new
+      // orchestrator turn, no LLM call, and no write (getAgreementBySessionId
+      // only reads; ensureAgreementForSession is never called here). If the
+      // Agreement or its closing turn is somehow missing despite the
+      // session being AGREED, fall through to the generic 409 below rather
+      // than fabricate a response.
+      if (loaded.state.status === "AGREED") {
+        const [agreement, lastTurn] = await Promise.all([
+          getAgreementBySessionId(id),
+          loadLatestTurn(id, loaded.sku),
+        ]);
+        if (agreement && lastTurn) {
+          const response: NegotiationTurnResponse = {
+            sessionId: id,
+            turn: lastTurn.turnNumber,
+            buyer: lastTurn.buyer,
+            merchant: lastTurn.merchant,
+            status: loaded.state.status,
+            round: loaded.state.round,
+            maxRounds: loaded.state.maxRounds,
+            agreement: toAgreementDTO(agreement),
+          };
+          return jsonResponse(response, 200);
+        }
+      }
+
       return jsonResponse(
         {
           error: `Negotiation session "${id}" already closed (${loaded.state.status}) and cannot continue.`,
@@ -66,6 +119,29 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
 
     const { turnNumber } = await persistNegotiationTurn(id, turn);
 
+    // Only ever create an Agreement from the deterministic engine's own
+    // AGREED terms (turn.merchant.quantity/unitPrice/deliveryDays) —
+    // never from turn.merchant.message, which is LLM-phrased text and
+    // is not treated as authoritative data anywhere in this codebase.
+    // ensureAgreementForSession is idempotent (Agreement.sessionId is a
+    // unique column), so even if this turn were somehow re-entered for
+    // an already-AGREED session, no duplicate row would result.
+    let agreement: PersistedAgreementDTO | null = null;
+    if (
+      turn.state.status === "AGREED" &&
+      turn.merchant.quantity !== null &&
+      turn.merchant.unitPrice !== null &&
+      turn.merchant.deliveryDays !== null
+    ) {
+      const { agreement: persisted } = await ensureAgreementForSession(id, {
+        sku: loaded.sku,
+        quantity: turn.merchant.quantity,
+        unitPrice: turn.merchant.unitPrice,
+        deliveryDays: turn.merchant.deliveryDays,
+      });
+      agreement = toAgreementDTO(persisted);
+    }
+
     const response: NegotiationTurnResponse = {
       sessionId: id,
       turn: turnNumber,
@@ -74,7 +150,7 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       status: turn.state.status,
       round: turn.state.round,
       maxRounds: turn.state.maxRounds,
-      agreement: toAgreement(loaded.sku, turn.state.status, turn),
+      agreement,
     };
     return jsonResponse(response, 200);
   } catch (error) {
