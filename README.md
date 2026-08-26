@@ -24,12 +24,61 @@ delivery constraints, negotiation round limits, agreement validity, payment
 state, and recovery state. An LLM-proposed action that violates a rule is
 rejected before it becomes a real negotiation event.
 
-## Current status: Phase 2 — AI-readable manifest + rule-engine foundation
+## Current status: AI-to-AI negotiation demo UI
 
-Phase 1 set up the application skeleton. Phase 2 adds the public,
-AI-readable commerce layer and the deterministic rules the future
-negotiation agents will run on. No agents, no LLM calls, no Razorpay
-integration, and no negotiation loop exist yet — those are later phases.
+The full stack now works end to end: a Buyer Agent and a Merchant Agent
+negotiate through a bounded, deterministic orchestrator, and that
+negotiation is demonstrable through a web UI at `/negotiate`. Razorpay,
+payments, recovery, authentication, and deployment are not implemented
+yet.
+
+### `/negotiate` — the negotiation demo
+
+Shows the merchant/catalog (from the public manifest), a buyer request
+form (product, quantity, max unit price, delivery deadline — defaults to
+the seeded 200-laptop scenario), and the resulting turn-by-turn
+transcript and final outcome (agreement details + a disabled "Proceed to
+Payment" placeholder, or a rejection/expiry explanation). The page is a
+thin Server Component (`src/app/negotiate/page.tsx`) fetching the public
+manifest, plus a Client Component
+([`NegotiationDemo.tsx`](src/app/negotiate/NegotiationDemo.tsx)) that
+POSTs to `/api/negotiations` and renders whatever it returns — it never
+computes a price, quantity, delivery day, or outcome itself.
+
+### `POST /api/negotiations`
+
+Runs a full bounded negotiation
+([`runNegotiationToCompletion`](src/lib/negotiation/orchestrator.ts)) for
+one buyer request and returns the transcript, final status
+(`AGREED`/`REJECTED`/`EXPIRED`), and — when agreed — a computed agreement
+summary. The response is built by
+[`buildNegotiationRunResponse`](src/lib/negotiation/negotiationRunResponse.ts),
+which whitelists fields the same way the public manifest does, so
+`CatalogItem.minPrice` (used server-side by the rule engine) can never
+reach the browser. This is the multi-round counterpart to the existing
+single-shot `POST /api/negotiate`, which is unchanged.
+
+### Buyer Agent, Merchant Agent, and the negotiation engine
+
+- [`src/lib/rules/negotiationEngine.ts`](src/lib/rules/negotiationEngine.ts) —
+  deterministic evaluation, price-floor enforcement, and the merchant's
+  round-aware concession strategy (`computeMerchantConcessionPrice`):
+  minPrice is a floor, not a target, so the merchant concedes gradually
+  across rounds instead of caving as soon as an offer clears the floor.
+- [`src/lib/rules/buyerRules.ts`](src/lib/rules/buyerRules.ts) — the
+  buyer's own hard constraints (never exceed its max price/deadline).
+- [`src/lib/agents/buyerAgent.ts`](src/lib/agents/buyerAgent.ts) /
+  [`merchantAgent.ts`](src/lib/agents/merchantAgent.ts) — each agent
+  decides its action deterministically first; an LLM (behind the
+  provider-agnostic [`LlmProvider`](src/lib/llm/provider.ts) interface)
+  only phrases that decision. If no `ANTHROPIC_API_KEY` is configured,
+  both agents fall back to a plain-English caption built from the same
+  real structured data instead of failing the negotiation.
+- [`src/lib/negotiation/orchestrator.ts`](src/lib/negotiation/orchestrator.ts) —
+  sequences one buyer→merchant turn at a time, bounded by
+  [`negotiationState.ts`](src/lib/rules/negotiationState.ts)'s round
+  limit; a negotiation only closes when the buyer explicitly accepts a
+  specific offer.
 
 ### `GET /api/manifest`
 
@@ -78,16 +127,35 @@ prisma/
 src/
   app/
     page.tsx           Landing page
-    dashboard/         Read-only merchant dashboard (merchant info + catalog)
-    api/manifest/       GET /api/manifest — AI-readable public manifest
+    dashboard/         Read-only merchant dashboard (merchant info + catalog, incl. minPrice)
+    negotiate/         The negotiation demo UI (page.tsx + NegotiationDemo.tsx client component)
+    api/
+      manifest/         GET /api/manifest — AI-readable public manifest
+      negotiate/         POST /api/negotiate — single-shot Merchant Agent call
+      negotiations/      POST /api/negotiations — full bounded negotiation run
   lib/
     prisma.ts           Prisma client singleton (SQLite driver adapter)
     manifest.ts         Builds the public manifest DTO
+    llm/
+      provider.ts        Provider-agnostic LlmProvider interface
+      claude.ts           Anthropic-backed implementation (only file importing the SDK)
+      errors.ts           LlmUnavailableError (shared, avoids a provider/claude import cycle)
+    agents/
+      buyerAgent.ts        Deterministic action + LLM-phrased buyer message
+      merchantAgent.ts     Deterministic decision + LLM-phrased merchant message
+    negotiation/
+      orchestrator.ts      Bounded buyer<->merchant turn sequencing
+      protocol.ts           Shared StructuredNegotiationMessage type
+      negotiationRunResponse.ts  Browser-safe DTO builder for /api/negotiations
     rules/
-      catalogRules.ts    Deterministic fulfillment rules (pure, unit-tested)
+      catalogRules.ts       Deterministic fulfillment rules (pure, unit-tested)
       catalogRepository.ts  DB lookup (findCatalogItemBySku)
+      negotiationEngine.ts  Negotiation evaluation + merchant concession strategy
+      negotiationState.ts   Bounded round/status state machine
+      buyerRules.ts          Buyer's own hard constraints
   types/
     manifest.ts          Public manifest response types
+    negotiation.ts        Public /api/negotiations response types
   generated/prisma/    Generated Prisma client (gitignored, not committed)
 ```
 
@@ -130,8 +198,12 @@ yet.
    cp .env.example .env
    ```
 
-   `DATABASE_URL` is all that's needed for Phase 1. The `ANTHROPIC_API_KEY`
-   and `RAZORPAY_KEY_*` placeholders are for later phases.
+   `DATABASE_URL` is all that's required to run anything, including the
+   negotiation demo — without `ANTHROPIC_API_KEY`, agent messages fall
+   back to a deterministic plain-English caption instead of LLM prose;
+   the negotiation itself (prices, quantities, delivery, outcome) is
+   identical either way. Set `ANTHROPIC_API_KEY` to see real
+   LLM-phrased messages. `RAZORPAY_KEY_*` is for a later phase.
 
 3. Apply the database schema and seed demo data:
 
@@ -146,8 +218,10 @@ yet.
    npm run dev
    ```
 
-   Open [http://localhost:3000](http://localhost:3000) and click through to
-   `/dashboard` to see the seeded merchant and catalog.
+   Open [http://localhost:3000](http://localhost:3000) — `/negotiate` runs
+   the AI-to-AI negotiation demo (defaults to the seeded 200-laptop
+   scenario), `/dashboard` shows the merchant's own view including the
+   private `minPrice`.
 
 ## Useful commands
 

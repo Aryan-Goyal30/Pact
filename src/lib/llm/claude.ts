@@ -13,14 +13,17 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { AgentMessageInput, LlmProvider } from "@/lib/llm/provider";
+import { LlmUnavailableError } from "@/lib/llm/errors";
 
 /**
  * Thrown when ANTHROPIC_API_KEY is not set. A dedicated error type so
  * callers (and the API route) can recognize this specific, expected
  * failure mode and respond with a clear message instead of letting the
- * SDK fail deeper in the call with a less obvious error.
+ * SDK fail deeper in the call with a less obvious error. Extends the
+ * provider-agnostic LlmUnavailableError so agent code can catch the
+ * general case without depending on this Claude-specific class.
  */
-export class MissingApiKeyError extends Error {
+export class MissingApiKeyError extends LlmUnavailableError {
   constructor() {
     super(
       "ANTHROPIC_API_KEY is not set. Add it to your .env (see .env.example) to enable agent responses.",

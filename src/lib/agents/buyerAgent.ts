@@ -31,7 +31,7 @@ import {
   type BuyerConstraints,
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
-import { getLlmProvider } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 export type BuyerAction =
   | ({ type: "request" } & ProposedAgreement)
@@ -114,6 +114,25 @@ function buildResponseToMerchantOffer(
 }
 
 /**
+ * Deterministic, non-LLM caption used only when no LLM provider is
+ * configured (LlmUnavailableError). Built entirely from the
+ * already-decided `action`, so it never fabricates a number or a
+ * decision — it's a plain-English rendering of real data.
+ */
+function buildFallbackBuyerMessage(action: BuyerAction): string {
+  switch (action.type) {
+    case "request":
+      return `I would like ${action.quantity} unit(s) of ${action.sku}, at up to ${action.unitPrice} each, delivered within ${action.deliveryDays} day(s).`;
+    case "counter_offer":
+      return `I can go up to ${action.unitPrice} per unit for ${action.quantity} unit(s), delivered within ${action.deliveryDays} day(s).`;
+    case "accept":
+      return `I accept: ${action.quantity} unit(s) at ${action.unitPrice} each, delivered in ${action.deliveryDays} day(s).`;
+    case "reject":
+      return "I'm unable to proceed with this offer.";
+  }
+}
+
+/**
  * Runs the Buyer Agent for one turn. `merchantResult` is null for the
  * buyer's opening move (no merchant response exists yet); otherwise the
  * buyer deterministically decides to accept/reject/counter by checking
@@ -130,22 +149,33 @@ export async function runBuyerAgent(
       ? { action: buildOpeningRequest(constraints), validation: null }
       : buildResponseToMerchantOffer(constraints, merchantResult);
 
-  const message = await getLlmProvider().generateAgentMessage({
-    systemPrompt: BUYER_SYSTEM_PROMPT,
-    context: {
-      buyerConstraints: {
-        sku: constraints.sku,
-        quantity: constraints.quantity,
-        maxUnitPrice: constraints.maxUnitPrice,
-        deliveryDeadlineDays: constraints.deliveryDeadlineDays,
-        buyerContext: constraints.buyerContext,
+  let message: string;
+  try {
+    message = await getLlmProvider().generateAgentMessage({
+      systemPrompt: BUYER_SYSTEM_PROMPT,
+      context: {
+        buyerConstraints: {
+          sku: constraints.sku,
+          quantity: constraints.quantity,
+          maxUnitPrice: constraints.maxUnitPrice,
+          deliveryDeadlineDays: constraints.deliveryDeadlineDays,
+          buyerContext: constraints.buyerContext,
+        },
+        merchantListing: manifestProduct,
+        action,
+        validation,
       },
-      merchantListing: manifestProduct,
-      action,
-      validation,
-    },
-    instruction: "Write the buyer's message to the merchant for this action.",
-  });
+      instruction: "Write the buyer's message to the merchant for this action.",
+    });
+  } catch (error) {
+    if (!(error instanceof LlmUnavailableError)) {
+      throw error;
+    }
+    // No LLM provider is configured — fall back to a deterministic
+    // caption instead of failing the whole negotiation turn. `action`
+    // itself is completely unaffected; only the phrasing differs.
+    message = buildFallbackBuyerMessage(action);
+  }
 
   return { action, validation, message };
 }

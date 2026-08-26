@@ -3,11 +3,18 @@ import type { NegotiationResult } from "@/lib/rules/negotiationEngine";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import type { PublicManifestProduct } from "@/types/manifest";
 import { runBuyerAgent } from "./buyerAgent";
-import { getLlmProvider } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
-vi.mock("@/lib/llm/provider", () => ({
-  getLlmProvider: vi.fn(),
-}));
+// LlmUnavailableError is kept real (via importOriginal) so the
+// fallback-message tests below can throw something buyerAgent.ts's
+// `instanceof` check actually recognizes.
+vi.mock("@/lib/llm/provider", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/llm/provider")>();
+  return {
+    ...actual,
+    getLlmProvider: vi.fn(),
+  };
+});
 
 const mockedGetLlmProvider = vi.mocked(getLlmProvider);
 const mockedGenerateAgentMessage = vi.fn();
@@ -158,5 +165,33 @@ describe("runBuyerAgent", () => {
     // 44000 is the seeded LAPTOP-14-I5 private floor from prisma/seed.ts —
     // it must never appear anywhere the Buyer Agent's LLM call can see it.
     expect(serialized).not.toContain("44000");
+  });
+
+  describe("when no LLM provider is configured", () => {
+    it("falls back to a deterministic, non-empty message instead of throwing", async () => {
+      mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+      const response = await runBuyerAgent(constraints, manifestProduct, null);
+
+      expect(response.message.length).toBeGreaterThan(0);
+      expect(response.message).toContain("200"); // the real, unfabricated quantity
+      expect(response.message).toContain("45000");
+      // The action itself is completely unaffected by the fallback.
+      expect(response.action).toEqual({
+        type: "request",
+        sku: "LAPTOP-14-I5",
+        quantity: 200,
+        unitPrice: 45000,
+        deliveryDays: 10,
+      });
+    });
+
+    it("still propagates a non-key-related error instead of masking it", async () => {
+      mockedGenerateAgentMessage.mockRejectedValue(new Error("network exploded"));
+
+      await expect(runBuyerAgent(constraints, manifestProduct, null)).rejects.toThrow(
+        "network exploded",
+      );
+    });
   });
 });

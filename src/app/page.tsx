@@ -12,12 +12,20 @@ export default function Home() {
           negotiates with a merchant agent inside explicit business rules,
           reaches a bounded agreement, and settles it through Razorpay.
         </p>
-        <Link
-          href="/dashboard"
-          className="flex h-12 items-center justify-center rounded-full bg-foreground px-6 text-base font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
-        >
-          Open merchant dashboard
-        </Link>
+        <div className="flex flex-col gap-3 sm:flex-row">
+          <Link
+            href="/negotiate"
+            className="flex h-12 items-center justify-center rounded-full bg-foreground px-6 text-base font-medium text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc]"
+          >
+            Try the negotiation demo
+          </Link>
+          <Link
+            href="/dashboard"
+            className="flex h-12 items-center justify-center rounded-full border border-black/[.15] px-6 text-base font-medium text-zinc-900 transition-colors hover:bg-black/[.04] dark:border-white/[.2] dark:text-zinc-100 dark:hover:bg-white/[.06]"
+          >
+            Open merchant dashboard
+          </Link>
+        </div>
       </div>
     </div>
   );

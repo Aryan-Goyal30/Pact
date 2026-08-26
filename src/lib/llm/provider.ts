@@ -11,6 +11,9 @@
 // place to derive new prices, quantities, or delivery terms.
 
 import { claudeProvider } from "@/lib/llm/claude";
+import { LlmUnavailableError } from "@/lib/llm/errors";
+
+export { LlmUnavailableError };
 
 export interface AgentMessageInput {
   /** Persona rules the model must follow (what it can/can't say, whose voice to speak in). */

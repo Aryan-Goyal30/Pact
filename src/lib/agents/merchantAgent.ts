@@ -16,7 +16,7 @@ import {
   type NegotiationRequest,
   type NegotiationResult,
 } from "@/lib/rules/negotiationEngine";
-import { getLlmProvider } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 export interface MerchantAgentOffer {
   sku: string;
@@ -116,6 +116,30 @@ function applyMerchantConcession(
   return { ...decision, unitPrice: concededPrice, reasons };
 }
 
+/**
+ * Deterministic, non-LLM caption used only when no LLM provider is
+ * configured (LlmUnavailableError) — e.g. running the demo UI without
+ * ANTHROPIC_API_KEY set. Built entirely from the already-decided
+ * `decision`, so it never fabricates a price, quantity, delivery day,
+ * or outcome; it's a plain-English rendering of real data instead of
+ * LLM prose.
+ */
+function buildFallbackMerchantMessage(decision: NegotiationResult): string {
+  if (decision.outcome === "REJECTED") {
+    return `We are unable to fulfill this request. ${decision.reasons.join(" ")}`.trim();
+  }
+
+  const parts = [
+    `We can offer ${decision.offeredQuantity} unit(s)`,
+    decision.requestedQuantity !== decision.offeredQuantity
+      ? `(of the ${decision.requestedQuantity} requested)`
+      : null,
+    `at ${decision.unitPrice} per unit, delivered in ${decision.deliveryDays} day(s).`,
+  ].filter(Boolean);
+
+  return parts.join(" ");
+}
+
 function toOffer(result: NegotiationResult): MerchantAgentOffer | null {
   if (
     result.offeredQuantity === null ||
@@ -156,11 +180,24 @@ export async function runMerchantAgent(
   if (item && concessionContext) {
     decision = applyMerchantConcession(item, request, decision, concessionContext);
   }
-  const message = await getLlmProvider().generateAgentMessage({
-    systemPrompt: MERCHANT_SYSTEM_PROMPT,
-    context: toPublicContext(decision),
-    instruction: "Write the merchant's message to the buyer explaining this negotiation result.",
-  });
+
+  let message: string;
+  try {
+    message = await getLlmProvider().generateAgentMessage({
+      systemPrompt: MERCHANT_SYSTEM_PROMPT,
+      context: toPublicContext(decision),
+      instruction: "Write the merchant's message to the buyer explaining this negotiation result.",
+    });
+  } catch (error) {
+    if (!(error instanceof LlmUnavailableError)) {
+      throw error;
+    }
+    // No LLM provider is configured — fall back to a deterministic
+    // caption instead of failing the whole negotiation turn. The
+    // decision itself (every number and the outcome) is completely
+    // unaffected; only the phrasing differs.
+    message = buildFallbackMerchantMessage(decision);
+  }
 
   return {
     decision,

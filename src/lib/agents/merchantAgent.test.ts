@@ -1,15 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 import { runMerchantAgent } from "./merchantAgent";
-import { getLlmProvider } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 // The LLM is mocked at the provider boundary for every test in this
 // file — no test here makes a real Anthropic API call or spends
 // credits. See claude.test.ts for the one test that exercises the real
-// (unmocked) missing-API-key path.
-vi.mock("@/lib/llm/provider", () => ({
-  getLlmProvider: vi.fn(),
-}));
+// (unmocked) missing-API-key path. LlmUnavailableError itself is kept
+// real (via importOriginal) so the fallback-message tests below can
+// throw something merchantAgent.ts's `instanceof` check actually
+// recognizes.
+vi.mock("@/lib/llm/provider", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/llm/provider")>();
+  return {
+    ...actual,
+    getLlmProvider: vi.fn(),
+  };
+});
 
 const mockedGetLlmProvider = vi.mocked(getLlmProvider);
 const mockedGenerateAgentMessage = vi.fn();
@@ -182,6 +189,46 @@ describe("runMerchantAgent", () => {
       );
       expect(response.decision.reasons.join(" ")).toContain("45750");
       expect(response.decision.reasons.join(" ")).not.toContain("46500");
+    });
+  });
+
+  describe("when no LLM provider is configured", () => {
+    it("falls back to a deterministic, non-empty message instead of throwing", async () => {
+      mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+      const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10 });
+
+      expect(response.message.length).toBeGreaterThan(0);
+      expect(response.message).toContain("48000"); // the real, unfabricated listed price
+      // The decision itself is completely unaffected by the fallback.
+      expect(response.decision.outcome).toBe("EXACT_MATCH");
+      expect(response.offer).toEqual({
+        sku: item.sku,
+        quantity: 10,
+        unitPrice: 48000,
+        deliveryDays: 5,
+      });
+    });
+
+    it("includes the real rejection reasons in the fallback message, not fabricated ones", async () => {
+      mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+      const response = await runMerchantAgent(item, {
+        sku: item.sku,
+        quantity: 10,
+        deliveryDeadlineDays: 1,
+      });
+
+      expect(response.decision.outcome).toBe("REJECTED");
+      expect(response.message).toMatch(/faster than the merchant's standard/i);
+    });
+
+    it("still propagates a non-key-related error instead of masking it", async () => {
+      mockedGenerateAgentMessage.mockRejectedValue(new Error("network exploded"));
+
+      await expect(runMerchantAgent(item, { sku: item.sku, quantity: 10 })).rejects.toThrow(
+        "network exploded",
+      );
     });
   });
 });

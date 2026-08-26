@@ -14,10 +14,16 @@ import { getLlmProvider } from "@/lib/llm/provider";
 // agent, merchant agent, deterministic engine, state machine) runs for
 // real, so these tests genuinely exercise the orchestrator wiring, not
 // a stub of it. Message text content is irrelevant to these tests, so a
-// single fixed string is enough.
-vi.mock("@/lib/llm/provider", () => ({
-  getLlmProvider: vi.fn(),
-}));
+// single fixed string is enough. LlmUnavailableError is kept real (via
+// importOriginal) since buyerAgent.ts/merchantAgent.ts's `instanceof`
+// checks against it must keep working even when this module is mocked.
+vi.mock("@/lib/llm/provider", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/llm/provider")>();
+  return {
+    ...actual,
+    getLlmProvider: vi.fn(),
+  };
+});
 
 const mockedGetLlmProvider = vi.mocked(getLlmProvider);
 
