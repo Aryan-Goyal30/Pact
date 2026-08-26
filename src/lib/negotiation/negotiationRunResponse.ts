@@ -21,7 +21,8 @@ import type {
   NegotiationTurnDTO,
 } from "@/types/negotiation";
 
-function toMessageDTO(message: StructuredNegotiationMessage): NegotiationMessageDTO {
+/** Exported for reuse by the turn-based response builder (negotiationTurnResponse.ts). */
+export function toMessageDTO(message: StructuredNegotiationMessage): NegotiationMessageDTO {
   return {
     sender: message.sender,
     type: message.type,
@@ -33,16 +34,17 @@ function toMessageDTO(message: StructuredNegotiationMessage): NegotiationMessage
   };
 }
 
-function toAgreement(
+/** Exported for reuse by the turn-based response builder (negotiationTurnResponse.ts). */
+export function toAgreement(
   sku: string,
-  finalState: NegotiationState,
-  lastTurn: NegotiationTurnResult | undefined,
+  status: NegotiationState["status"],
+  closingTurn: NegotiationTurnResult | undefined,
 ): NegotiationAgreementDTO | null {
-  if (finalState.status !== "AGREED" || !lastTurn) {
+  if (status !== "AGREED" || !closingTurn) {
     return null;
   }
 
-  const { quantity, unitPrice, deliveryDays } = lastTurn.merchant;
+  const { quantity, unitPrice, deliveryDays } = closingTurn.merchant;
   if (quantity === null || unitPrice === null || deliveryDays === null) {
     return null;
   }
@@ -74,6 +76,6 @@ export function buildNegotiationRunResponse(
     rounds: finalState.round,
     maxRounds: finalState.maxRounds,
     transcript: turns,
-    agreement: toAgreement(sku, finalState, transcript[transcript.length - 1]),
+    agreement: toAgreement(sku, finalState.status, transcript[transcript.length - 1]),
   };
 }

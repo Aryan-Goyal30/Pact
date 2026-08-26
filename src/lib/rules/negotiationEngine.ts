@@ -141,12 +141,12 @@ export function computeMerchantConcessionPrice(
   const roundsLeft = Math.max(1, context.maxRounds - context.round + 1);
 
   if (roundsLeft <= 2) {
-    return clamp(buyerMaxUnitPrice, item.minPrice, item.listedPrice);
+    return clamp(Math.round(buyerMaxUnitPrice), item.minPrice, item.listedPrice);
   }
 
   const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
   const conceded = anchor - (anchor - buyerMaxUnitPrice) / 2;
-  return clamp(conceded, item.minPrice, item.listedPrice);
+  return clamp(Math.round(conceded), item.minPrice, item.listedPrice);
 }
 
 type PriceResolution =

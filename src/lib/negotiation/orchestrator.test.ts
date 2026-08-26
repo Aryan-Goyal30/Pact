@@ -87,12 +87,15 @@ describe("runNegotiationTurn", () => {
     const state = createNegotiationState(4);
     const turn = await runNegotiationTurn(demoContext(), state, null);
 
-    // Round 1 of the demo scenario: buyer asks for 200, merchant can
-    // only supply 100 — this is the deterministic PARTIAL_FULFILLMENT
-    // counter computed by evaluateNegotiationRequest/computeCounterOfferPrice.
+    // Round 1 of the demo scenario: buyer opens near its target (not its
+    // maxUnitPrice — see buyerRules.resolveBuyerTarget) at 200 units;
+    // merchant can only supply 100 — this is the deterministic
+    // PARTIAL_FULFILLMENT counter computed by
+    // evaluateNegotiationRequest + computeMerchantConcessionPrice.
+    expect(turn.buyer.unitPrice).toBe(42750); // round(45000 * 0.95)
     expect(turn.merchant.type).toBe("counter_offer");
     expect(turn.merchant.quantity).toBe(100);
-    expect(turn.merchant.unitPrice).toBe(46500);
+    expect(turn.merchant.unitPrice).toBe(45375);
     expect(turn.merchant.deliveryDays).toBe(5);
     expect(turn.merchant.message).toBe("mocked agent message");
   });
@@ -146,33 +149,44 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
     }
   });
 
-  // 1, 3, 6. Correction: the merchant must not cave to 45000 the first
-  // time it's technically above the floor — it should gradually concede
-  // (round 2), only settling once it has no better valid counter left
-  // to make (round 3), with the buyer then explicitly accepting
-  // (round 4). This pins the exact turn-by-turn trace so a regression
-  // back to "accept as soon as it clears the floor" would fail loudly.
-  it("gradually concedes across rounds instead of accepting 45000 the first time it clears the floor", async () => {
+  // 1, 3, 6. Phase 5B: both sides genuinely move. The buyer opens near
+  // its target (not its ceiling), the merchant concedes gradually from
+  // its listed price, and the buyer accepts as soon as a merchant offer
+  // actually clears its own ceiling — not at some earlier hard-coded
+  // number. This pins the exact turn-by-turn trace so a regression back
+  // to either side's old rigid behavior fails loudly.
+  it("has both sides genuinely move — buyer opens below its ceiling, merchant concedes gradually, buyer accepts once satisfied", async () => {
     const { transcript, finalState } = await runNegotiationToCompletion(demoContext(), 4);
 
+    // Buyer: target (42750) on the opening ask, then a progressive
+    // counter, never touching its true ceiling (45000) until it has to.
+    expect(transcript.map((t) => t.buyer.unitPrice)).toEqual([42750, 44063, 44719]);
+    // Merchant: gradual concession from its listed-price anchor, closing
+    // the moment the buyer's own ceiling is actually met.
     expect(transcript.map((t) => t.merchant.type)).toEqual([
-      "counter_offer",
       "counter_offer",
       "counter_offer",
       "accept",
     ]);
-    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([46500, 45750, 45000, 45000]);
-    // Every merchant counter strictly decreases toward (never below) the
-    // buyer's ceiling — genuine gradual concession, not a static repeat.
+    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([45375, 44719, 44719]);
+
+    // Every merchant counter strictly decreases — genuine gradual
+    // concession, not a static repeat.
     expect(transcript[1].merchant.unitPrice!).toBeLessThan(transcript[0].merchant.unitPrice!);
-    expect(transcript[2].merchant.unitPrice!).toBeLessThan(transcript[1].merchant.unitPrice!);
-    // 5. The buyer never proposes or accepts above its own ceiling, on any turn.
+    // The buyer never proposes or accepts above its own ceiling on any turn.
     for (const turn of transcript) {
       if (turn.buyer.unitPrice !== null) {
         expect(turn.buyer.unitPrice).toBeLessThanOrEqual(demoBuyerConstraints.maxUnitPrice);
       }
     }
+    // The agreed price sits strictly between the merchant's private
+    // floor (44000, never itself asserted equal here) and the buyer's
+    // ceiling (45000) — a genuine negotiated middle ground, not either
+    // side's opening number.
     expect(finalState.status).toBe("AGREED");
+    const agreedPrice = transcript[transcript.length - 1].merchant.unitPrice!;
+    expect(agreedPrice).toBeGreaterThan(44000);
+    expect(agreedPrice).toBeLessThan(45000);
   });
 });
 
@@ -257,5 +271,131 @@ describe("runNegotiationToCompletion — bounded rounds when no agreement is pos
     // 2 COUNTERED rounds + 1 final EXPIRED attempt.
     expect(transcript.length).toBe(3);
     expect(transcript[transcript.length - 1].state.status).toBe("EXPIRED");
+  });
+});
+
+// Section 11's named demo scenarios, each as its own dedicated test.
+describe("Section 11 demo scenarios", () => {
+  // A. Buyer maximum below merchant floor -> no agreement, ever, at any price.
+  it("A: never agrees when the buyer's ceiling is below the merchant's private floor", async () => {
+    const context: NegotiationContext = {
+      item: laptop, // floor 44000
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 10,
+        maxUnitPrice: 42000, // below the 44000 floor
+        deliveryDeadlineDays: 10,
+      },
+    };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(context, 4);
+
+    expect(finalState.status).not.toBe("AGREED");
+    expect(["REJECTED", "EXPIRED"]).toContain(finalState.status);
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(44000);
+      }
+      // The buyer never breaks its own ceiling to force a deal through.
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(42000);
+      }
+    }
+  });
+
+  // C. High buyer ceiling -> merchant must not charge above listed price
+  // just because the buyer could afford more.
+  it("C: never charges above listed price even when the buyer's ceiling is far higher", async () => {
+    const context: NegotiationContext = {
+      item: laptop, // listed 48000
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 10,
+        maxUnitPrice: 90000, // far above listed price
+        deliveryDeadlineDays: 10,
+      },
+    };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(context, 4);
+
+    expect(finalState.status).toBe("AGREED");
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeLessThanOrEqual(48000);
+      }
+    }
+    const agreement = transcript[transcript.length - 1];
+    expect(agreement.merchant.unitPrice).toBe(48000);
+    // The merchant closes this immediately by explicitly accepting —
+    // there's nothing left to negotiate once the buyer's ask already
+    // clears the listed price.
+    expect(agreement.merchant.type).toBe("accept");
+    expect(transcript.length).toBe(1);
+  });
+
+  // D. Impossible delivery -> rejected deterministically, no negotiation.
+  it("D: rejects deterministically when the buyer's delivery deadline is impossible", async () => {
+    const context: NegotiationContext = {
+      item: laptop, // standard delivery 5 days
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 10,
+        maxUnitPrice: 45000,
+        deliveryDeadlineDays: 1, // faster than the merchant can ever do
+      },
+    };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(context, 4);
+
+    expect(finalState.status).toBe("REJECTED");
+    expect(transcript).toHaveLength(1);
+    expect(transcript[0].merchant.type).toBe("reject");
+  });
+
+  // F. Non-negotiable product -> existing Phase 3 rules still apply: only
+  // the exact listed terms are fulfillable, no counters.
+  it("F: a non-negotiable item only ever fulfills the exact listed terms", async () => {
+    const nonNegotiable: CatalogItemSnapshot = { ...laptop, negotiationEnabled: false };
+    const nonNegotiableListing: PublicManifestProduct = {
+      ...laptopManifestListing,
+      negotiable: false,
+    };
+
+    // A request within stock at listed price and standard delivery: fine.
+    const exact = await runNegotiationToCompletion(
+      {
+        item: nonNegotiable,
+        manifestProduct: nonNegotiableListing,
+        buyerConstraints: {
+          sku: "LAPTOP-14-I5",
+          quantity: 10,
+          maxUnitPrice: 48000,
+          deliveryDeadlineDays: 5,
+        },
+      },
+      4,
+    );
+    expect(exact.finalState.status).toBe("AGREED");
+    expect(exact.transcript[exact.transcript.length - 1].merchant.unitPrice).toBe(48000);
+
+    // Any request for a discount is rejected outright — no counter-offer.
+    const discounted = await runNegotiationToCompletion(
+      {
+        item: nonNegotiable,
+        manifestProduct: nonNegotiableListing,
+        buyerConstraints: {
+          sku: "LAPTOP-14-I5",
+          quantity: 10,
+          maxUnitPrice: 45000,
+          deliveryDeadlineDays: 5,
+        },
+      },
+      4,
+    );
+    expect(discounted.finalState.status).toBe("REJECTED");
+    expect(discounted.transcript.every((t) => t.merchant.type !== "counter_offer")).toBe(true);
   });
 });

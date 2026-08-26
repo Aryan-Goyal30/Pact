@@ -54,3 +54,44 @@ export interface NegotiationRunResponse {
   /** Present only when finalStatus is "AGREED". */
   agreement: NegotiationAgreementDTO | null;
 }
+
+// ---------------------------------------------------------------------------
+// Turn-based flow (Phase 5B) — POST /api/negotiations (create a session)
+// and POST /api/negotiations/:id/turn (advance it by exactly one turn).
+// ---------------------------------------------------------------------------
+
+/** Body for POST /api/negotiations. */
+export interface NegotiationSessionCreateRequest {
+  sku: string;
+  quantity: number;
+  maxUnitPrice: number;
+  deliveryDeadlineDays: number;
+  /** Optional override of the default round bound. */
+  maxRounds?: number;
+}
+
+export interface NegotiationSessionResponse {
+  sessionId: string;
+  sku: string;
+  status: NegotiationStatus;
+  round: number;
+  maxRounds: number;
+  buyerConstraints: {
+    quantity: number;
+    maxUnitPrice: number;
+    deliveryDeadlineDays: number;
+  };
+}
+
+/** Response for POST /api/negotiations/:id/turn. */
+export interface NegotiationTurnResponse {
+  sessionId: string;
+  turn: number;
+  buyer: NegotiationMessageDTO;
+  merchant: NegotiationMessageDTO;
+  status: NegotiationStatus;
+  round: number;
+  maxRounds: number;
+  /** Present only when this turn just closed the negotiation as AGREED. */
+  agreement: NegotiationAgreementDTO | null;
+}

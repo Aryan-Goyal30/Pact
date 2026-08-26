@@ -86,6 +86,7 @@ function closeNegotiation(
   terms: { sku: string; quantity: number; unitPrice: number; deliveryDays: number },
   accepted: boolean,
   rejectionReasons: string[],
+  acceptMessage = "Accepted.",
 ): NegotiationTurnResult {
   return {
     state: accepted ? acceptNegotiation(state) : rejectNegotiation(state),
@@ -97,7 +98,7 @@ function closeNegotiation(
       quantity: accepted ? terms.quantity : null,
       unitPrice: accepted ? terms.unitPrice : null,
       deliveryDays: accepted ? terms.deliveryDays : null,
-      message: accepted ? "Accepted." : rejectionReasons.join(" ") || "Rejected.",
+      message: accepted ? acceptMessage : rejectionReasons.join(" ") || "Rejected.",
     },
     nextMerchantResult: null,
   };
@@ -124,6 +125,7 @@ export async function runNegotiationTurn(
     context.buyerConstraints,
     context.manifestProduct,
     previousMerchantResult,
+    { round: state.round + 1, maxRounds: state.maxRounds },
   );
   const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
 
@@ -192,6 +194,35 @@ export async function runNegotiationTurn(
     },
   );
   const merchantResult = merchantAgentResponse.decision;
+
+  // EXACT_MATCH means the buyer's current ask already fully satisfies
+  // the merchant — full quantity, standard delivery, and a price at or
+  // above listed — with no concession needed at all (this is also what
+  // stops the merchant from ever charging above its own listed price
+  // just because a buyer's ceiling happens to be much higher: the
+  // engine's price resolution already caps at listedPrice, so there is
+  // nothing left to negotiate). Rather than present that as a
+  // wishy-washy "offer" awaiting further confirmation, the merchant
+  // accepts outright — this is its ACCEPT action, symmetric to the
+  // buyer's.
+  if (merchantResult.outcome === "EXACT_MATCH") {
+    const terms = {
+      sku: merchantResult.sku,
+      quantity: merchantResult.offeredQuantity as number,
+      unitPrice: merchantResult.unitPrice as number,
+      deliveryDays: merchantResult.deliveryDays as number,
+    };
+    const agreementCheck = validateProposedAgreement(context.item, terms);
+    return closeNegotiation(
+      state,
+      buyerMessage,
+      terms,
+      agreementCheck.outcome === "ACCEPTED",
+      agreementCheck.reasons,
+      merchantAgentResponse.message,
+    );
+  }
+
   const nextState = advanceNegotiationState(state, merchantResult.outcome);
 
   return {

@@ -55,16 +55,28 @@ model CatalogItem {
   agreements          Agreement[]
 }
 
-// One buyer-initiated negotiation thread. Created when a buyer agent
-// sends a structured requirement; closes as "agreed", "rejected", or
-// "expired" (round limit reached without agreement).
+// One buyer-initiated negotiation thread, executed one turn at a time
+// via POST /api/negotiations (create) + POST /api/negotiations/:id/turn
+// (advance). status/roundCount/maxRounds mirror
+// src/lib/rules/negotiationState.ts's NegotiationState exactly (status
+// uses that module's own strings: OPEN | COUNTERED | AGREED | REJECTED
+// | EXPIRED) so a session can be loaded back into that state machine
+// with no translation. sku + buyerRequestRaw (JSON-encoded
+// BuyerConstraints) are what's needed to reconstruct the
+// NegotiationContext the orchestrator requires; pendingMerchantResultRaw
+// (JSON-encoded NegotiationResult) is the merchant's last offer the
+// buyer must respond to on the next turn — null before any merchant
+// response, or once the negotiation has closed.
 model NegotiationSession {
-  id              String   @id @default(cuid())
-  status          String   @default("open") // open | agreed | rejected | expired
-  buyerRequestRaw String
-  roundCount      Int      @default(0)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id                       String   @id @default(cuid())
+  status                   String   @default("OPEN")
+  sku                      String
+  buyerRequestRaw          String
+  roundCount               Int      @default(0)
+  maxRounds                Int      @default(4)
+  pendingMerchantResultRaw String?
+  createdAt                DateTime @default(now())
+  updatedAt                DateTime @updatedAt
 
   messages  NegotiationMessage[]
   agreement Agreement?

@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { ProposedAgreement } from "./negotiationEngine";
 import {
+  computeBuyerConcessionPrice,
   isDeliveryAcceptable,
   isPriceAcceptable,
   isQuantityAcceptable,
   isSkuMatch,
+  resolveBuyerTarget,
   toNegotiationRequest,
   validateMerchantProposal,
+  type BuyerConcessionContext,
   type BuyerConstraints,
 } from "./buyerRules";
 
@@ -110,5 +113,81 @@ describe("validateMerchantProposal", () => {
     });
     expect(result.outcome).toBe("UNACCEPTABLE");
     expect(result.reasons.join(" ")).toMatch(/exceeds the buyer's maximum/i);
+  });
+});
+
+describe("resolveBuyerTarget", () => {
+  it("derives a target below maxUnitPrice when none is given explicitly", () => {
+    const target = resolveBuyerTarget(constraints);
+    expect(target).toBeLessThan(constraints.maxUnitPrice);
+    expect(target).toBeGreaterThan(0);
+  });
+
+  it("uses an explicit targetUnitPrice when supplied, clamped to maxUnitPrice", () => {
+    expect(resolveBuyerTarget({ ...constraints, targetUnitPrice: 43000 })).toBe(43000);
+    // A target above the ceiling makes no sense — clamp it down.
+    expect(resolveBuyerTarget({ ...constraints, targetUnitPrice: 999999 })).toBe(
+      constraints.maxUnitPrice,
+    );
+  });
+});
+
+describe("computeBuyerConcessionPrice", () => {
+  const roundContext = (round: number, maxRounds = 4): BuyerConcessionContext => ({
+    round,
+    maxRounds,
+  });
+
+  // 1. Buyer can make progressive concessions.
+  it("moves partway from its target toward the merchant's current offer on a middle round", () => {
+    const target = resolveBuyerTarget(constraints);
+    const price = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+    expect(price).toBeGreaterThan(target);
+    expect(price).toBeLessThan(45375);
+    expect(price).toBeLessThanOrEqual(constraints.maxUnitPrice);
+  });
+
+  it("moves further (or holds) as the merchant's offer improves, rather than repeating the same number", () => {
+    const first = computeBuyerConcessionPrice(constraints, 46500, roundContext(2));
+    const second = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+    expect(second).not.toBe(first);
+  });
+
+  // 2. Buyer never exceeds its maximum.
+  it("never exceeds maxUnitPrice, even on the final round or against a very high merchant offer", () => {
+    expect(computeBuyerConcessionPrice(constraints, 100000, roundContext(2))).toBeLessThanOrEqual(
+      constraints.maxUnitPrice,
+    );
+    expect(computeBuyerConcessionPrice(constraints, 100000, roundContext(4))).toBeLessThanOrEqual(
+      constraints.maxUnitPrice,
+    );
+  });
+
+  it("goes to its true ceiling on the final rounds rather than losing a still-worthwhile deal", () => {
+    expect(computeBuyerConcessionPrice(constraints, 45375, roundContext(3))).toBe(
+      constraints.maxUnitPrice,
+    );
+    expect(computeBuyerConcessionPrice(constraints, 45375, roundContext(4))).toBe(
+      constraints.maxUnitPrice,
+    );
+  });
+
+  it("never goes below its own target", () => {
+    const target = resolveBuyerTarget(constraints);
+    const price = computeBuyerConcessionPrice(constraints, target - 5000, roundContext(2));
+    expect(price).toBeGreaterThanOrEqual(target);
+  });
+
+  it("is general across different price ranges, not tuned to the laptop scenario", () => {
+    const monitorConstraints: BuyerConstraints = {
+      sku: "MONITOR-24-FHD",
+      quantity: 50,
+      maxUnitPrice: 8800,
+      deliveryDeadlineDays: 8,
+    };
+    const target = resolveBuyerTarget(monitorConstraints);
+    const price = computeBuyerConcessionPrice(monitorConstraints, 9150, roundContext(2));
+    expect(price).toBeGreaterThan(target);
+    expect(price).toBeLessThanOrEqual(monitorConstraints.maxUnitPrice);
   });
 });

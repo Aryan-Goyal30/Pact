@@ -27,7 +27,10 @@
 import type { PublicManifestProduct } from "@/types/manifest";
 import type { NegotiationResult, ProposedAgreement } from "@/lib/rules/negotiationEngine";
 import {
+  computeBuyerConcessionPrice,
+  resolveBuyerTarget,
   validateMerchantProposal,
+  type BuyerConcessionContext,
   type BuyerConstraints,
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
@@ -57,12 +60,28 @@ Your only job is to phrase that action as a short, professional message to the m
 - Do not claim a deal is done unless the action type is "accept".
 - Never mention a number, product, or constraint that wasn't given to you.`;
 
-function buildOpeningRequest(constraints: BuyerConstraints): BuyerAction {
+/**
+ * Opens near the buyer's aspirational target rather than immediately
+ * revealing its hard ceiling — only when a round context is supplied
+ * AND the item actually supports negotiation. Without a round context
+ * (e.g. an existing single-shot caller that predates this option), the
+ * opening ask is the buyer's maxUnitPrice, exactly as before. On a
+ * non-negotiable item there is nothing to gain by opening low — the
+ * merchant only ever fulfills the exact listed price on those, so
+ * lowballing would just get a real buyer wrongly rejected instead of
+ * matched — so the buyer states its true ceiling there too.
+ */
+function buildOpeningRequest(
+  constraints: BuyerConstraints,
+  manifestProduct: PublicManifestProduct,
+  concessionContext?: BuyerConcessionContext,
+): BuyerAction {
+  const aimForTarget = Boolean(concessionContext) && manifestProduct.negotiable;
   return {
     type: "request",
     sku: constraints.sku,
     quantity: constraints.quantity,
-    unitPrice: constraints.maxUnitPrice,
+    unitPrice: aimForTarget ? resolveBuyerTarget(constraints) : constraints.maxUnitPrice,
     deliveryDays: constraints.deliveryDeadlineDays,
   };
 }
@@ -70,6 +89,7 @@ function buildOpeningRequest(constraints: BuyerConstraints): BuyerAction {
 function buildResponseToMerchantOffer(
   constraints: BuyerConstraints,
   merchantResult: NegotiationResult,
+  concessionContext?: BuyerConcessionContext,
 ): { action: BuyerAction; validation: BuyerValidationResult } {
   if (
     merchantResult.outcome === "REJECTED" ||
@@ -96,17 +116,21 @@ function buildResponseToMerchantOffer(
     return { action: { type: "accept", ...proposal }, validation };
   }
 
-  // Not acceptable yet. Hold at the buyer's own price ceiling — it's a
-  // hard constraint the buyer cannot exceed (see buyerRules.ts) — while
-  // adopting whatever quantity/delivery the merchant already offered,
-  // since there's no reason to keep re-asking for terms the merchant
-  // has already granted.
+  // Not acceptable yet. Adopt whatever quantity/delivery the merchant
+  // already offered — no reason to keep re-asking for terms it has
+  // already granted — and move the price gradually toward (but never
+  // past) the buyer's ceiling. With a round context, that movement is
+  // the progressive computeBuyerConcessionPrice strategy; without one
+  // (a caller that predates this option), it holds flat at
+  // maxUnitPrice, exactly as before.
   return {
     action: {
       type: "counter_offer",
       sku: constraints.sku,
       quantity: proposal.quantity,
-      unitPrice: constraints.maxUnitPrice,
+      unitPrice: concessionContext
+        ? computeBuyerConcessionPrice(constraints, proposal.unitPrice, concessionContext)
+        : constraints.maxUnitPrice,
       deliveryDays: proposal.deliveryDays,
     },
     validation,
@@ -143,21 +167,26 @@ export async function runBuyerAgent(
   constraints: BuyerConstraints,
   manifestProduct: PublicManifestProduct,
   merchantResult: NegotiationResult | null,
+  concessionContext?: BuyerConcessionContext,
 ): Promise<BuyerAgentResponse> {
   const { action, validation } =
     merchantResult === null
-      ? { action: buildOpeningRequest(constraints), validation: null }
-      : buildResponseToMerchantOffer(constraints, merchantResult);
+      ? { action: buildOpeningRequest(constraints, manifestProduct, concessionContext), validation: null }
+      : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext);
 
   let message: string;
   try {
     message = await getLlmProvider().generateAgentMessage({
       systemPrompt: BUYER_SYSTEM_PROMPT,
       context: {
+        // targetUnitPrice is the buyer's OWN aspiration, not private
+        // merchant data — safe to share, and helps the LLM phrase a
+        // natural-sounding counter instead of a bare number.
         buyerConstraints: {
           sku: constraints.sku,
           quantity: constraints.quantity,
           maxUnitPrice: constraints.maxUnitPrice,
+          targetUnitPrice: resolveBuyerTarget(constraints),
           deliveryDeadlineDays: constraints.deliveryDeadlineDays,
           buyerContext: constraints.buyerContext,
         },

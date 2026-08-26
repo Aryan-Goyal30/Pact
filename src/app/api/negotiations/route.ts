@@ -1,8 +1,8 @@
 import { findCatalogItemBySku } from "@/lib/rules/catalogRepository";
 import { getPublicManifest } from "@/lib/manifest";
-import { runNegotiationToCompletion } from "@/lib/negotiation/orchestrator";
-import { buildNegotiationRunResponse } from "@/lib/negotiation/negotiationRunResponse";
-import type { NegotiationRunRequest } from "@/types/negotiation";
+import { createNegotiationSession } from "@/lib/negotiation/negotiationSessionRepository";
+import { DEFAULT_MAX_ROUNDS } from "@/lib/rules/negotiationState";
+import type { NegotiationSessionCreateRequest, NegotiationSessionResponse } from "@/types/negotiation";
 
 function jsonResponse(body: unknown, status: number) {
   return new Response(JSON.stringify(body), {
@@ -11,11 +11,12 @@ function jsonResponse(body: unknown, status: number) {
   });
 }
 
-function parseRunRequest(body: unknown): NegotiationRunRequest | null {
+function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | null {
   if (typeof body !== "object" || body === null) {
     return null;
   }
-  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays } = body as Record<string, unknown>;
+  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds } =
+    body as Record<string, unknown>;
 
   if (typeof sku !== "string" || sku.trim().length === 0) {
     return null;
@@ -33,21 +34,18 @@ function parseRunRequest(body: unknown): NegotiationRunRequest | null {
   ) {
     return null;
   }
+  if (maxRounds !== undefined && (typeof maxRounds !== "number" || maxRounds <= 0)) {
+    return null;
+  }
 
-  return { sku, quantity, maxUnitPrice, deliveryDeadlineDays };
+  return { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds };
 }
 
-// POST /api/negotiations — runs the FULL bounded Buyer Agent <-> Merchant
-// Agent negotiation (src/lib/negotiation/orchestrator.ts) for one buyer
-// request and returns the resulting transcript, final status, and (when
-// AGREED) agreement summary. This is the multi-round counterpart to the
-// existing single-shot POST /api/negotiate — that route is untouched.
-//
-// The response is built exclusively by buildNegotiationRunResponse,
-// which explicitly whitelists fields from the orchestrator's output.
-// CatalogItemSnapshot (which carries minPrice) is only ever used
-// server-side, inside the orchestrator/rule engine — it never appears
-// in anything returned from this handler.
+// POST /api/negotiations — creates a negotiation session and returns its
+// initial (OPEN, round 0) state. Does NOT execute any turn — the caller
+// drives the negotiation forward one exchange at a time via
+// POST /api/negotiations/:id/turn. This is the turn-based counterpart
+// to the single-shot POST /api/negotiate, which is untouched.
 export async function POST(request: Request) {
   let body: unknown;
   try {
@@ -56,12 +54,12 @@ export async function POST(request: Request) {
     return jsonResponse({ error: "Request body must be valid JSON." }, 400);
   }
 
-  const runRequest = parseRunRequest(body);
-  if (!runRequest) {
+  const createRequest = parseCreateRequest(body);
+  if (!createRequest) {
     return jsonResponse(
       {
         error:
-          "Invalid request body. Expected { sku: string, quantity: number, maxUnitPrice: number, deliveryDeadlineDays: number }, all positive.",
+          "Invalid request body. Expected { sku: string, quantity: number, maxUnitPrice: number, deliveryDeadlineDays: number, maxRounds?: number }, all positive.",
       },
       400,
     );
@@ -69,39 +67,47 @@ export async function POST(request: Request) {
 
   try {
     const [item, manifest] = await Promise.all([
-      findCatalogItemBySku(runRequest.sku),
+      findCatalogItemBySku(createRequest.sku),
       getPublicManifest(),
     ]);
 
     if (!item) {
-      return jsonResponse({ error: `No catalog item found for SKU "${runRequest.sku}".` }, 404);
+      return jsonResponse({ error: `No catalog item found for SKU "${createRequest.sku}".` }, 404);
     }
-
-    const manifestProduct = manifest.products.find((product) => product.sku === runRequest.sku);
-    if (!manifestProduct) {
+    if (!manifest.products.some((product) => product.sku === createRequest.sku)) {
       return jsonResponse(
-        { error: `SKU "${runRequest.sku}" is not present in the public manifest.` },
+        { error: `SKU "${createRequest.sku}" is not present in the public manifest.` },
         404,
       );
     }
 
-    const { transcript, finalState } = await runNegotiationToCompletion({
-      item,
-      manifestProduct,
-      buyerConstraints: {
-        sku: runRequest.sku,
-        quantity: runRequest.quantity,
-        maxUnitPrice: runRequest.maxUnitPrice,
-        deliveryDeadlineDays: runRequest.deliveryDeadlineDays,
+    const maxRounds = createRequest.maxRounds ?? DEFAULT_MAX_ROUNDS;
+    const session = await createNegotiationSession(
+      createRequest.sku,
+      {
+        sku: createRequest.sku,
+        quantity: createRequest.quantity,
+        maxUnitPrice: createRequest.maxUnitPrice,
+        deliveryDeadlineDays: createRequest.deliveryDeadlineDays,
       },
-    });
-
-    return jsonResponse(
-      buildNegotiationRunResponse(runRequest.sku, transcript, finalState),
-      200,
+      maxRounds,
     );
+
+    const response: NegotiationSessionResponse = {
+      sessionId: session.id,
+      sku: createRequest.sku,
+      status: "OPEN",
+      round: 0,
+      maxRounds,
+      buyerConstraints: {
+        quantity: createRequest.quantity,
+        maxUnitPrice: createRequest.maxUnitPrice,
+        deliveryDeadlineDays: createRequest.deliveryDeadlineDays,
+      },
+    };
+    return jsonResponse(response, 201);
   } catch (error) {
-    console.error("Negotiation run failed:", error);
-    return jsonResponse({ error: "Negotiation is unavailable." }, 500);
+    console.error("Failed to create negotiation session:", error);
+    return jsonResponse({ error: "Could not start negotiation." }, 500);
   }
 }

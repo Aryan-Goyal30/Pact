@@ -24,61 +24,85 @@ delivery constraints, negotiation round limits, agreement validity, payment
 state, and recovery state. An LLM-proposed action that violates a rule is
 rejected before it becomes a real negotiation event.
 
-## Current status: AI-to-AI negotiation demo UI
+## Current status: live, turn-based AI-to-AI negotiation
 
-The full stack now works end to end: a Buyer Agent and a Merchant Agent
-negotiate through a bounded, deterministic orchestrator, and that
-negotiation is demonstrable through a web UI at `/negotiate`. Razorpay,
-payments, recovery, authentication, and deployment are not implemented
-yet.
+The full stack works end to end: a Buyer Agent and a Merchant Agent with
+genuinely different, progressively-conceding pricing strategies negotiate
+through a bounded orchestrator, one real HTTP turn at a time, demonstrable
+through a web UI at `/negotiate`. Razorpay, payments, recovery,
+authentication, and deployment are not implemented yet.
 
-### `/negotiate` — the negotiation demo
+### `/negotiate` — the live negotiation demo
 
 Shows the merchant/catalog (from the public manifest), a buyer request
 form (product, quantity, max unit price, delivery deadline — defaults to
-the seeded 200-laptop scenario), and the resulting turn-by-turn
-transcript and final outcome (agreement details + a disabled "Proceed to
-Payment" placeholder, or a rejection/expiry explanation). The page is a
-thin Server Component (`src/app/negotiate/page.tsx`) fetching the public
-manifest, plus a Client Component
+the seeded 200-laptop scenario), and the negotiation transcript appearing
+turn by turn as it actually happens (not calculated up front and dumped
+on screen) — round counter, current offers, and a final agreement card
+(with a disabled "Proceed to Payment" placeholder) or failure reason. The
+page is a thin Server Component (`src/app/negotiate/page.tsx`) fetching
+the public manifest, plus a Client Component
 ([`NegotiationDemo.tsx`](src/app/negotiate/NegotiationDemo.tsx)) that
-POSTs to `/api/negotiations` and renders whatever it returns — it never
-computes a price, quantity, delivery day, or outcome itself.
+drives the turn-based API below and renders whatever it returns — it
+never computes a price, quantity, delivery day, or outcome itself.
 
-### `POST /api/negotiations`
+### Turn-based negotiation API
 
-Runs a full bounded negotiation
-([`runNegotiationToCompletion`](src/lib/negotiation/orchestrator.ts)) for
-one buyer request and returns the transcript, final status
-(`AGREED`/`REJECTED`/`EXPIRED`), and — when agreed — a computed agreement
-summary. The response is built by
-[`buildNegotiationRunResponse`](src/lib/negotiation/negotiationRunResponse.ts),
-which whitelists fields the same way the public manifest does, so
-`CatalogItem.minPrice` (used server-side by the rule engine) can never
-reach the browser. This is the multi-round counterpart to the existing
-single-shot `POST /api/negotiate`, which is unchanged.
+- **`POST /api/negotiations`** — creates a negotiation session (reusing
+  the `NegotiationSession`/`NegotiationMessage` tables Phase 1 already
+  defined for this) and returns its initial `OPEN` state. Executes no
+  turn.
+- **`POST /api/negotiations/:id/turn`** — advances one persisted session
+  by exactly one buyer→merchant exchange via
+  [`runNegotiationTurn`](src/lib/negotiation/orchestrator.ts), persists
+  it, and returns that turn's structured messages + updated status. Call
+  repeatedly until `status` is `AGREED`/`REJECTED`/`EXPIRED`.
+
+Both routes build their responses through
+[`negotiationRunResponse.ts`](src/lib/negotiation/negotiationRunResponse.ts)'s
+whitelisting DTO helpers (the same pattern `manifest.ts` uses), so
+`CatalogItem.minPrice` — used server-side by the rule engine via
+[`negotiationSessionRepository.ts`](src/lib/negotiation/negotiationSessionRepository.ts) —
+can never reach the browser. The older single-shot
+`POST /api/negotiate` (one Merchant Agent call, no session) is unchanged
+and still works.
 
 ### Buyer Agent, Merchant Agent, and the negotiation engine
 
+Both sides have genuinely different objectives and move progressively —
+neither reveals or holds at its hard limit from turn one:
+
 - [`src/lib/rules/negotiationEngine.ts`](src/lib/rules/negotiationEngine.ts) —
-  deterministic evaluation, price-floor enforcement, and the merchant's
-  round-aware concession strategy (`computeMerchantConcessionPrice`):
-  minPrice is a floor, not a target, so the merchant concedes gradually
-  across rounds instead of caving as soon as an offer clears the floor.
+  deterministic evaluation and the merchant's round-aware concession
+  strategy (`computeMerchantConcessionPrice`): `minPrice` is a floor, not
+  a target, so the merchant concedes gradually from its listed price
+  instead of caving as soon as an offer clears the floor — and accepts
+  outright (never above listed price) the moment a buyer's offer already
+  fully satisfies it.
 - [`src/lib/rules/buyerRules.ts`](src/lib/rules/buyerRules.ts) — the
-  buyer's own hard constraints (never exceed its max price/deadline).
+  buyer's hard ceiling (`computeBuyerConcessionPrice`) plus an
+  aspirational target it opens near instead of immediately revealing its
+  maximum, moving toward the merchant's live offer each round.
 - [`src/lib/agents/buyerAgent.ts`](src/lib/agents/buyerAgent.ts) /
   [`merchantAgent.ts`](src/lib/agents/merchantAgent.ts) — each agent
   decides its action deterministically first; an LLM (behind the
   provider-agnostic [`LlmProvider`](src/lib/llm/provider.ts) interface)
-  only phrases that decision. If no `ANTHROPIC_API_KEY` is configured,
-  both agents fall back to a plain-English caption built from the same
-  real structured data instead of failing the negotiation.
+  only phrases that decision. If no API key is configured for the
+  selected provider, both agents fall back to a plain-English caption
+  built from the same real structured data instead of failing the
+  negotiation.
 - [`src/lib/negotiation/orchestrator.ts`](src/lib/negotiation/orchestrator.ts) —
   sequences one buyer→merchant turn at a time, bounded by
   [`negotiationState.ts`](src/lib/rules/negotiationState.ts)'s round
-  limit; a negotiation only closes when the buyer explicitly accepts a
-  specific offer.
+  limit; a negotiation only closes when a side explicitly accepts.
+
+### LLM provider
+
+`src/lib/llm/provider.ts` selects a provider via `LLM_PROVIDER` (`claude`
+— default, or `gemini`); `claude.ts` and `gemini.ts` (`gemini-2.5-flash`,
+via `@google/genai`) each implement the same `LlmProvider` interface and
+are the only files importing their respective SDKs. Neither provider (nor
+the buyer's LLM context in general) ever receives `minPrice`.
 
 ### `GET /api/manifest`
 
@@ -128,34 +152,40 @@ src/
   app/
     page.tsx           Landing page
     dashboard/         Read-only merchant dashboard (merchant info + catalog, incl. minPrice)
-    negotiate/         The negotiation demo UI (page.tsx + NegotiationDemo.tsx client component)
+    negotiate/         The live negotiation demo UI
+      page.tsx            Server Component: catalog section
+      NegotiationDemo.tsx  Client Component: form + turn-by-turn transcript
+      negotiationUi.ts     Pure form-validation / status-label / badge helpers (unit-tested)
     api/
-      manifest/         GET /api/manifest — AI-readable public manifest
-      negotiate/         POST /api/negotiate — single-shot Merchant Agent call
-      negotiations/      POST /api/negotiations — full bounded negotiation run
+      manifest/                  GET /api/manifest — AI-readable public manifest
+      negotiate/                  POST /api/negotiate — single-shot Merchant Agent call
+      negotiations/                POST /api/negotiations — create a negotiation session
+      negotiations/[id]/turn/      POST /api/negotiations/:id/turn — advance one turn
   lib/
     prisma.ts           Prisma client singleton (SQLite driver adapter)
     manifest.ts         Builds the public manifest DTO
     llm/
-      provider.ts        Provider-agnostic LlmProvider interface
-      claude.ts           Anthropic-backed implementation (only file importing the SDK)
-      errors.ts           LlmUnavailableError (shared, avoids a provider/claude import cycle)
+      provider.ts        Provider-agnostic LlmProvider interface + LLM_PROVIDER selection
+      claude.ts           Anthropic implementation (only file importing that SDK)
+      gemini.ts           Gemini implementation (only file importing that SDK)
+      errors.ts           LlmUnavailableError (shared, avoids provider/claude/gemini import cycles)
     agents/
       buyerAgent.ts        Deterministic action + LLM-phrased buyer message
       merchantAgent.ts     Deterministic decision + LLM-phrased merchant message
     negotiation/
-      orchestrator.ts      Bounded buyer<->merchant turn sequencing
-      protocol.ts           Shared StructuredNegotiationMessage type
-      negotiationRunResponse.ts  Browser-safe DTO builder for /api/negotiations
+      orchestrator.ts               Bounded buyer<->merchant turn sequencing
+      protocol.ts                    Shared StructuredNegotiationMessage type
+      negotiationRunResponse.ts      Browser-safe DTO helpers (shared by both API routes)
+      negotiationSessionRepository.ts  DB persistence for turn-based sessions
     rules/
       catalogRules.ts       Deterministic fulfillment rules (pure, unit-tested)
       catalogRepository.ts  DB lookup (findCatalogItemBySku)
       negotiationEngine.ts  Negotiation evaluation + merchant concession strategy
       negotiationState.ts   Bounded round/status state machine
-      buyerRules.ts          Buyer's own hard constraints
+      buyerRules.ts          Buyer's own hard constraints + concession strategy
   types/
     manifest.ts          Public manifest response types
-    negotiation.ts        Public /api/negotiations response types
+    negotiation.ts        Public negotiation API request/response types
   generated/prisma/    Generated Prisma client (gitignored, not committed)
 ```
 
@@ -168,10 +198,15 @@ Defined in [`prisma/schema.prisma`](prisma/schema.prisma):
 - **CatalogItem** — product with a public `listedPrice` and a private
   `minPrice` (the merchant's price floor — never to be exposed to a buyer
   agent, only used internally by the future rule engine)
-- **NegotiationSession** — one buyer-initiated negotiation thread
-- **NegotiationMessage** — one turn in a session (request / offer /
-  counter-offer / accept / reject), with an `isValid` flag recording whether
-  the rule engine accepted it
+- **NegotiationSession** — one buyer-initiated negotiation thread,
+  advanced one turn per `POST /api/negotiations/:id/turn` call; `sku` +
+  `buyerRequestRaw` (JSON) reconstruct the negotiation context,
+  `pendingMerchantResultRaw` (JSON) carries the merchant's outstanding
+  offer between requests, and `status`/`roundCount`/`maxRounds` mirror
+  `negotiationState.ts`'s state machine exactly
+- **NegotiationMessage** — one side's message within a turn (request /
+  offer / counter-offer / accept / reject), with an `isValid` flag
+  recording whether the rule engine accepted it
 - **Agreement** — the bounded terms both agents settled on; payment can only
   ever be created from a valid Agreement
 - **PaymentAttempt** — one Razorpay payment try per agreement, with an
@@ -199,11 +234,13 @@ yet.
    ```
 
    `DATABASE_URL` is all that's required to run anything, including the
-   negotiation demo — without `ANTHROPIC_API_KEY`, agent messages fall
-   back to a deterministic plain-English caption instead of LLM prose;
-   the negotiation itself (prices, quantities, delivery, outcome) is
-   identical either way. Set `ANTHROPIC_API_KEY` to see real
-   LLM-phrased messages. `RAZORPAY_KEY_*` is for a later phase.
+   negotiation demo — without an API key for the selected provider,
+   agent messages fall back to a deterministic plain-English caption
+   instead of LLM prose; the negotiation itself (prices, quantities,
+   delivery, outcome) is identical either way. Set `LLM_PROVIDER=claude`
+   (default) with `ANTHROPIC_API_KEY`, or `LLM_PROVIDER=gemini` with
+   `GEMINI_API_KEY`, to see real LLM-phrased messages. `RAZORPAY_KEY_*`
+   is for a later phase.
 
 3. Apply the database schema and seed demo data:
 

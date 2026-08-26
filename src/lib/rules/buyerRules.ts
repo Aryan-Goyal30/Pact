@@ -21,6 +21,13 @@ export interface BuyerConstraints {
   maxUnitPrice: number;
   deliveryDeadlineDays: number;
   buyerContext?: string;
+  /**
+   * The buyer's aspirational opening price — what it would like to pay,
+   * distinct from maxUnitPrice (the hard ceiling it will never exceed).
+   * Optional: when omitted, resolveBuyerTarget() derives one so a
+   * caller only has to supply a ceiling, same as before.
+   */
+  targetUnitPrice?: number;
 }
 
 /** Converts buyer constraints into the structured request the merchant engine expects. */
@@ -103,4 +110,84 @@ export function validateMerchantProposal(
   return reasons.length > 0
     ? { outcome: "UNACCEPTABLE", reasons }
     : { outcome: "ACCEPTABLE", reasons: [] };
+}
+
+// ---------------------------------------------------------------------------
+// Buyer concession strategy — Phase 5B.
+//
+// Symmetric to negotiationEngine.ts's computeMerchantConcessionPrice: the
+// buyer does not simply reveal and hold at maxUnitPrice from round one.
+// It opens near a lower, aspirational target and only moves toward its
+// true ceiling gradually, and only as far as it has to.
+// ---------------------------------------------------------------------------
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+/** How far below its hard ceiling the buyer's opening aspiration starts, when no explicit targetUnitPrice is given. */
+export const DEFAULT_BUYER_TARGET_DISCOUNT = 0.05;
+
+/**
+ * Resolves the buyer's aspirational target price: the explicit
+ * `targetUnitPrice` if the caller supplied one, otherwise a price a
+ * fixed 5% below maxUnitPrice. This never depends on any merchant data
+ * (listed price, floor, etc.) — it's purely a function of the buyer's
+ * own stated ceiling, so it works the same way for any product.
+ */
+export function resolveBuyerTarget(constraints: BuyerConstraints): number {
+  if (constraints.targetUnitPrice !== undefined) {
+    return clamp(constraints.targetUnitPrice, 0, constraints.maxUnitPrice);
+  }
+  return Math.round(constraints.maxUnitPrice * (1 - DEFAULT_BUYER_TARGET_DISCOUNT));
+}
+
+/** Round context an orchestrator supplies to computeBuyerConcessionPrice. */
+export interface BuyerConcessionContext {
+  /** Which buyer response this is, 1-indexed — the opening request is round 1. */
+  round: number;
+  maxRounds: number;
+}
+
+/**
+ * Round-aware buyer concession strategy.
+ *
+ * maxUnitPrice is a hard ceiling, never a target — the buyer tries to
+ * hold as close to its own target as it can, and only surrenders ground
+ * gradually:
+ *
+ *  - Each round (until the last two), it moves half the remaining gap
+ *    between its own target and the merchant's CURRENT offer — the same
+ *    "split the remaining difference" shape as the merchant's strategy,
+ *    just aimed the opposite direction. Because it re-anchors on the
+ *    merchant's live offer every round rather than blindly repeating a
+ *    fixed number, the buyer's own offer changes as the merchant's does
+ *    — including moving back down if the merchant's offer improves a
+ *    lot in one round, which is the economically rational reaction.
+ *  - On the final two rounds, it goes all the way to its true ceiling
+ *    rather than lose a deal that's still worth having over the last
+ *    sliver of leverage — symmetric to the merchant settling at the
+ *    buyer's ceiling on its own final rounds.
+ *  - The result is always clamped to [target, maxUnitPrice], so it can
+ *    never exceed the buyer's hard ceiling no matter what the merchant
+ *    is asking or how many rounds have passed.
+ *
+ * This function only computes a NUMBER; it never decides whether to
+ * accept, reject, or counter — buyerAgent.ts's validateMerchantProposal
+ * check does that, same as before this function existed.
+ */
+export function computeBuyerConcessionPrice(
+  constraints: BuyerConstraints,
+  merchantOfferUnitPrice: number,
+  context: BuyerConcessionContext,
+): number {
+  const target = resolveBuyerTarget(constraints);
+  const roundsLeft = Math.max(1, context.maxRounds - context.round + 1);
+
+  if (roundsLeft <= 2) {
+    return constraints.maxUnitPrice;
+  }
+
+  const conceded = target + (merchantOfferUnitPrice - target) / 2;
+  return clamp(Math.round(conceded), target, constraints.maxUnitPrice);
 }
