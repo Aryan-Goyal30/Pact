@@ -12,6 +12,11 @@ import {
   checkQuantityAvailable,
   type CatalogItemSnapshot,
 } from "@/lib/rules/catalogRules";
+import {
+  hasQuantityLeverage,
+  resolveMerchantConcessionSpeedFactor,
+  LARGE_ORDER_MERCHANT_DISCOUNT,
+} from "@/lib/rules/negotiationStrategy";
 
 /** A buyer agent's normalized, structured request for one SKU. */
 export interface NegotiationRequest {
@@ -28,6 +33,16 @@ export interface NegotiationRequest {
    * field to make a decision.
    */
   buyerContext?: string;
+  /**
+   * Whether the buyer is willing to accept a later delivery date (up to
+   * the merchant's maxDeliveryDays, never past deliveryDeadlineDays) in
+   * exchange for a price concession — see
+   * negotiationStrategy.resolveDeliveryTrade. Only read by the
+   * round-aware concession layer (applyMerchantConcession in
+   * merchantAgent.ts); evaluateNegotiationRequest itself always offers
+   * standardDeliveryDays regardless of this flag, unaffected.
+   */
+  deliveryFlexible?: boolean;
 }
 
 export type NegotiationOutcome =
@@ -102,6 +117,10 @@ export interface MerchantConcessionContext {
   maxRounds: number;
   /** The merchant's own previously quoted unit price for this SKU, if any. Undefined for the opening counter. */
   previousOfferUnitPrice?: number;
+  /** The buyer's requested quantity this round — enables the large-order quantity discount (negotiationStrategy.hasQuantityLeverage). Omitted by callers that predate this option, which leaves the discount inactive, exactly as before. */
+  requestedQuantity?: number;
+  /** A rupee amount to additionally subtract for a delivery-for-price trade (negotiationStrategy.resolveDeliveryTrade), still subject to the final minPrice clamp below. Omitted by callers that predate this option. */
+  deliveryTradeDiscount?: number;
 }
 
 /**
@@ -132,6 +151,21 @@ export interface MerchantConcessionContext {
  * orchestrator's own accept/reject logic (an offer at the buyer's
  * ceiling still has to be explicitly accepted, same as any other
  * counter-offer).
+ *
+ * Beyond the base "split the remaining difference" step, three optional
+ * strategic overlays apply (negotiationStrategy.ts):
+ *  - a stock-pressure speed factor, always derived from item.availableQty
+ *    alone (ample stock concedes faster, scarce stock holds firmer) —
+ *    always active, but a documented no-op for every catalog fixture
+ *    this codebase currently uses (see negotiationStrategy.ts's
+ *    calibration note);
+ *  - a large-order quantity discount, only when context.requestedQuantity
+ *    is supplied and crosses the leverage threshold;
+ *  - a delivery-for-price trade discount, only when
+ *    context.deliveryTradeDiscount is supplied.
+ * All three are inert unless the caller opts in, and the final clamp to
+ * [minPrice, listedPrice] still applies no matter what they compute —
+ * they can shift the number, never the hard floor/ceiling.
  */
 export function computeMerchantConcessionPrice(
   item: CatalogItemSnapshot,
@@ -145,7 +179,17 @@ export function computeMerchantConcessionPrice(
   }
 
   const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
-  const conceded = anchor - (anchor - buyerMaxUnitPrice) / 2;
+  const speedFactor = resolveMerchantConcessionSpeedFactor(item);
+  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * speedFactor;
+
+  if (context.requestedQuantity !== undefined && hasQuantityLeverage(context.requestedQuantity)) {
+    conceded -= (item.listedPrice - item.minPrice) * LARGE_ORDER_MERCHANT_DISCOUNT;
+  }
+
+  if (context.deliveryTradeDiscount) {
+    conceded -= context.deliveryTradeDiscount;
+  }
+
   return clamp(Math.round(conceded), item.minPrice, item.listedPrice);
 }
 

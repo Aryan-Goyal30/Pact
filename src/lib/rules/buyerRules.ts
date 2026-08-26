@@ -7,6 +7,12 @@
 // only phrases whatever these functions already decided.
 
 import type { NegotiationRequest, ProposedAgreement } from "@/lib/rules/negotiationEngine";
+import {
+  hasQuantityLeverage,
+  resolveUrgencyConcessionFactor,
+  LARGE_ORDER_TARGET_DISCOUNT,
+  type UrgencyLevel,
+} from "@/lib/rules/negotiationStrategy";
 
 /**
  * The buyer's own hard constraints for one SKU. Mirrors
@@ -28,6 +34,21 @@ export interface BuyerConstraints {
    * caller only has to supply a ceiling, same as before.
    */
   targetUnitPrice?: number;
+  /**
+   * How eager the buyer is to close quickly. "medium" (the default when
+   * omitted) reproduces the exact concession behavior this field
+   * predates — see negotiationStrategy.resolveUrgencyConcessionFactor.
+   * High urgency makes the buyer less aggressive on price (moves toward
+   * its ceiling faster); low urgency allows stronger bargaining.
+   */
+  urgency?: UrgencyLevel;
+  /**
+   * Whether the buyer will accept a later delivery date in exchange for
+   * a price concession — see negotiationStrategy.resolveDeliveryTrade.
+   * Only meaningful to the merchant's round-aware concession logic;
+   * omitted (false) reproduces existing behavior exactly.
+   */
+  deliveryFlexible?: boolean;
 }
 
 /** Converts buyer constraints into the structured request the merchant engine expects. */
@@ -38,6 +59,7 @@ export function toNegotiationRequest(constraints: BuyerConstraints): Negotiation
     maxUnitPrice: constraints.maxUnitPrice,
     deliveryDeadlineDays: constraints.deliveryDeadlineDays,
     buyerContext: constraints.buyerContext,
+    deliveryFlexible: constraints.deliveryFlexible,
   };
 }
 
@@ -134,12 +156,23 @@ export const DEFAULT_BUYER_TARGET_DISCOUNT = 0.05;
  * fixed 5% below maxUnitPrice. This never depends on any merchant data
  * (listed price, floor, etc.) — it's purely a function of the buyer's
  * own stated ceiling, so it works the same way for any product.
+ *
+ * A large order (negotiationStrategy.hasQuantityLeverage) pulls the
+ * target further down — bulk buyers open asking for a deeper discount —
+ * still clamped to [0, maxUnitPrice]. Below the leverage threshold
+ * (every existing fixture in this codebase, including the 200-unit demo
+ * scenario) this is a no-op.
  */
 export function resolveBuyerTarget(constraints: BuyerConstraints): number {
-  if (constraints.targetUnitPrice !== undefined) {
-    return clamp(constraints.targetUnitPrice, 0, constraints.maxUnitPrice);
+  const base =
+    constraints.targetUnitPrice !== undefined
+      ? clamp(constraints.targetUnitPrice, 0, constraints.maxUnitPrice)
+      : Math.round(constraints.maxUnitPrice * (1 - DEFAULT_BUYER_TARGET_DISCOUNT));
+
+  if (!hasQuantityLeverage(constraints.quantity)) {
+    return base;
   }
-  return Math.round(constraints.maxUnitPrice * (1 - DEFAULT_BUYER_TARGET_DISCOUNT));
+  return clamp(Math.round(base * (1 - LARGE_ORDER_TARGET_DISCOUNT)), 0, constraints.maxUnitPrice);
 }
 
 /** Round context an orchestrator supplies to computeBuyerConcessionPrice. */
@@ -175,6 +208,11 @@ export interface BuyerConcessionContext {
  * This function only computes a NUMBER; it never decides whether to
  * accept, reject, or counter — buyerAgent.ts's validateMerchantProposal
  * check does that, same as before this function existed.
+ *
+ * The step size is additionally scaled by constraints.urgency
+ * (negotiationStrategy.resolveUrgencyConcessionFactor) — "medium", the
+ * default when urgency is unset, reproduces a multiplier of exactly 1,
+ * i.e. today's plain halving formula, unchanged.
  */
 export function computeBuyerConcessionPrice(
   constraints: BuyerConstraints,
@@ -188,6 +226,7 @@ export function computeBuyerConcessionPrice(
     return constraints.maxUnitPrice;
   }
 
-  const conceded = target + (merchantOfferUnitPrice - target) / 2;
+  const urgencyFactor = resolveUrgencyConcessionFactor(constraints.urgency);
+  const conceded = target + ((merchantOfferUnitPrice - target) / 2) * urgencyFactor;
   return clamp(Math.round(conceded), target, constraints.maxUnitPrice);
 }

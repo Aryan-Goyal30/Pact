@@ -34,6 +34,8 @@ import {
   type BuyerConstraints,
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
+import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
+import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 export type BuyerAction =
@@ -47,6 +49,8 @@ export interface BuyerAgentResponse {
   /** null only for the opening request, where there is no merchant offer yet to validate. */
   validation: BuyerValidationResult | null;
   message: string;
+  /** Which strategic factors (urgency, quantity leverage, remaining rounds) shaped this action — see negotiationStrategy.explainBuyerFactors. Empty when none applied (e.g. an outright accept/reject, or no round context). */
+  strategicReasons: string[];
 }
 
 const BUYER_SYSTEM_PROMPT = `You are PACT's Buyer Agent, communicating with a merchant's AI agent on behalf of the buyer.
@@ -57,6 +61,7 @@ Your only job is to phrase that action as a short, professional message to the m
 - Speak in first person as the buyer (e.g. "I need...", "I can accept...", "That's above my budget...").
 - Be concise: 1-3 sentences, plain text only (no markdown, no JSON).
 - State only the quantity, unit price, and delivery days EXACTLY as given — never invent, round, or change any number.
+- Render every number exactly as given, in full — never truncate, abbreviate, or drop a digit (e.g. write 45375 in full, never 4537 or 45).
 - Do not claim a deal is done unless the action type is "accept".
 - Never mention a number, product, or constraint that wasn't given to you.`;
 
@@ -174,28 +179,64 @@ export async function runBuyerAgent(
       ? { action: buildOpeningRequest(constraints, manifestProduct, concessionContext), validation: null }
       : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext);
 
+  const roundsLeft = concessionContext
+    ? Math.max(1, concessionContext.maxRounds - concessionContext.round + 1)
+    : Number.POSITIVE_INFINITY;
+  const strategicReasons =
+    action.type === "request" || action.type === "counter_offer"
+      ? explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft)
+      : [];
+
+  // The block the LLM must treat as immutable fact — every number here
+  // is what checkAgentMessageIntegrity requires the final message to
+  // state verbatim (or, for numbers merely present elsewhere in the
+  // wider context below, permits it to state).
+  const authoritativeFacts = {
+    side: "BUYER" as const,
+    action: action.type,
+    sku: action.sku,
+    quantity: action.quantity,
+    unitPrice: action.unitPrice,
+    deliveryDays: action.deliveryDays,
+    previousMerchantOfferUnitPrice: merchantResult?.unitPrice ?? null,
+    strategicReasons,
+  };
+  const context = {
+    authoritativeFacts,
+    // targetUnitPrice is the buyer's OWN aspiration, not private
+    // merchant data — safe to share, and helps the LLM phrase a
+    // natural-sounding counter instead of a bare number.
+    buyerConstraints: {
+      sku: constraints.sku,
+      quantity: constraints.quantity,
+      maxUnitPrice: constraints.maxUnitPrice,
+      targetUnitPrice: resolveBuyerTarget(constraints),
+      deliveryDeadlineDays: constraints.deliveryDeadlineDays,
+      buyerContext: constraints.buyerContext,
+    },
+    merchantListing: manifestProduct,
+    action,
+    validation,
+  };
+
+  const requiredNumbers =
+    action.type === "reject" ? [] : [action.quantity, action.unitPrice, action.deliveryDays];
+
   let message: string;
   try {
-    message = await getLlmProvider().generateAgentMessage({
+    const generated = await getLlmProvider().generateAgentMessage({
       systemPrompt: BUYER_SYSTEM_PROMPT,
-      context: {
-        // targetUnitPrice is the buyer's OWN aspiration, not private
-        // merchant data — safe to share, and helps the LLM phrase a
-        // natural-sounding counter instead of a bare number.
-        buyerConstraints: {
-          sku: constraints.sku,
-          quantity: constraints.quantity,
-          maxUnitPrice: constraints.maxUnitPrice,
-          targetUnitPrice: resolveBuyerTarget(constraints),
-          deliveryDeadlineDays: constraints.deliveryDeadlineDays,
-          buyerContext: constraints.buyerContext,
-        },
-        merchantListing: manifestProduct,
-        action,
-        validation,
-      },
-      instruction: "Write the buyer's message to the merchant for this action.",
+      context,
+      instruction:
+        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative.",
     });
+    const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
+    if (check.valid) {
+      message = generated;
+    } else {
+      console.warn(`Buyer Agent LLM message failed integrity check, falling back: ${check.reason}`);
+      message = buildFallbackBuyerMessage(action);
+    }
   } catch (error) {
     if (!(error instanceof LlmUnavailableError)) {
       throw error;
@@ -206,5 +247,5 @@ export async function runBuyerAgent(
     message = buildFallbackBuyerMessage(action);
   }
 
-  return { action, validation, message };
+  return { action, validation, message, strategicReasons };
 }

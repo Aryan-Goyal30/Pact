@@ -186,6 +186,7 @@ export async function runNegotiationTurn(
       quantity: buyerResponse.action.quantity,
       maxUnitPrice: buyerResponse.action.unitPrice,
       deliveryDeadlineDays: buyerResponse.action.deliveryDays,
+      deliveryFlexible: context.buyerConstraints.deliveryFlexible,
     },
     {
       round: state.round + 1,

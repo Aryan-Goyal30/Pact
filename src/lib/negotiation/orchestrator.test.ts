@@ -84,6 +84,18 @@ describe("runNegotiationTurn", () => {
 
   // 4. Structured negotiation messages contain authoritative fields.
   it("populates structured fields straight from the deterministic engine, regardless of the mocked message text", async () => {
+    // Overrides the describe-level default mock for this test only: that
+    // default ("mocked agent message") carries no numbers at all, so
+    // messageIntegrity.ts's required-number check would reject it for
+    // the merchant's counter-offer (which must state quantity/price/
+    // delivery) and silently substitute the deterministic fallback —
+    // this test needs to see its own literal mocked text come through,
+    // so its mock states the round's real numbers instead.
+    const roundOneMerchantMessage = "mocked agent message covering 100 units at 45375 per unit for 5 days";
+    mockedGetLlmProvider.mockReturnValue({
+      generateAgentMessage: vi.fn().mockResolvedValue(roundOneMerchantMessage),
+    });
+
     const state = createNegotiationState(4);
     const turn = await runNegotiationTurn(demoContext(), state, null);
 
@@ -97,7 +109,7 @@ describe("runNegotiationTurn", () => {
     expect(turn.merchant.quantity).toBe(100);
     expect(turn.merchant.unitPrice).toBe(45375);
     expect(turn.merchant.deliveryDays).toBe(5);
-    expect(turn.merchant.message).toBe("mocked agent message");
+    expect(turn.merchant.message).toBe(roundOneMerchantMessage);
   });
 
   // 8. Terminal negotiation state cannot continue.
@@ -271,6 +283,40 @@ describe("runNegotiationToCompletion — bounded rounds when no agreement is pos
     // 2 COUNTERED rounds + 1 final EXPIRED attempt.
     expect(transcript.length).toBe(3);
     expect(transcript[transcript.length - 1].state.status).toBe("EXPIRED");
+  });
+});
+
+// 11. Agents can walk away when constraints cannot be satisfied, even
+// with the new strategic factors (urgency, quantity leverage) active —
+// they can shift *where* the merchant/buyer land, never *whether* the
+// floor/ceiling constraints are honored.
+describe("runNegotiationToCompletion — walk away with strategic factors active", () => {
+  it("still EXPIREs when the buyer's ceiling is below the floor, even with high urgency and a large order", async () => {
+    const context: NegotiationContext = {
+      item: laptop, // floor 44000
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 500, // crosses the large-order leverage threshold
+        maxUnitPrice: 30000, // below the floor — no deal is possible
+        deliveryDeadlineDays: 10,
+        urgency: "high",
+      },
+    };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(context, 2);
+
+    expect(finalState.status).toBe("EXPIRED");
+    for (const turn of transcript) {
+      // The floor is never breached, no matter how the strategic factors shift the number.
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(44000);
+      }
+      // The buyer's high urgency never pushes it past its own hard ceiling.
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.unitPrice).toBeLessThanOrEqual(30000);
+      }
+    }
   });
 });
 

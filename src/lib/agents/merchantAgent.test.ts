@@ -59,9 +59,16 @@ describe("runMerchantAgent", () => {
   });
 
   // 2. A partial-fulfillment result produces a counter-offer message.
+  //
+  // The mocked message states every required value (quantity, unit
+  // price, delivery days) verbatim — checkAgentMessageIntegrity
+  // (messageIntegrity.ts) requires this of every accepted message, so a
+  // mock that omitted the price/delivery (as this fixture originally
+  // did, before the message-integrity hardening) would now be silently
+  // replaced by the deterministic fallback instead of being returned as-is.
   it("produces a partial-fulfillment offer and passes it to the LLM for phrasing", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
-      "We only have 100 units available, offered at an adjusted price.",
+      "We only have 100 units available, offered at 46500 per unit, delivered in 5 days.",
     );
 
     const response = await runMerchantAgent(item, {
@@ -79,7 +86,7 @@ describe("runMerchantAgent", () => {
       deliveryDays: 5,
     });
     expect(response.message).toBe(
-      "We only have 100 units available, offered at an adjusted price.",
+      "We only have 100 units available, offered at 46500 per unit, delivered in 5 days.",
     );
   });
 
@@ -180,6 +187,36 @@ describe("runMerchantAgent", () => {
       expect(response.decision.unitPrice).toBe(item.minPrice);
     });
 
+    // 5, 9. Strategic factors (stock pressure, delivery trade) are
+    // recorded as human-readable reasons alongside the structured price.
+    it("records a strategic reason when a delivery-for-price trade is applied", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        {
+          sku: item.sku,
+          quantity: 10,
+          maxUnitPrice: 45000,
+          deliveryDeadlineDays: 12,
+          deliveryFlexible: true,
+        },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 46500 },
+      );
+      expect(response.decision.deliveryDays).toBeGreaterThan(item.standardDeliveryDays);
+      expect(response.decision.reasons.some((r) => r.includes("delivery window"))).toBe(true);
+    });
+
+    it("records a strategic reason when high stock pressure increases the concession", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundantItem: CatalogItemSnapshot = { ...item, availableQty: 1000 };
+      const response = await runMerchantAgent(
+        abundantItem,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 46500 },
+      );
+      expect(response.decision.reasons.some((r) => r.includes("stock pressure"))).toBe(true);
+    });
+
     it("keeps the reasons text consistent with the overridden price, not the original one", async () => {
       mockedGenerateAgentMessage.mockResolvedValue("...");
       const response = await runMerchantAgent(
@@ -189,6 +226,61 @@ describe("runMerchantAgent", () => {
       );
       expect(response.decision.reasons.join(" ")).toContain("45750");
       expect(response.decision.reasons.join(" ")).not.toContain("46500");
+    });
+  });
+
+  // Message-integrity hardening: a malformed/conflicting LLM message
+  // must never reach the caller — the negotiation itself must not fail
+  // either way, only the prose falls back.
+  describe("message integrity", () => {
+    it("falls back to a deterministic message when the LLM truncates the price (45,375 -> 45,37)", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("Your price of 45,37 has been noted.");
+
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+        { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      );
+
+      expect(response.decision.unitPrice).toBe(45750); // structured value unaffected
+      expect(response.message).not.toContain("45,37 ");
+      expect(response.message).toContain("45750"); // the deterministic fallback states the real price in full
+    });
+
+    it("falls back to a deterministic message when the LLM invents a quantity", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("We can offer 10 units at 48000 each, delivered tomorrow.");
+
+      const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10 });
+
+      expect(response.decision.offeredQuantity).toBe(10); // coincidentally correct structurally
+      // But the message conflated quantity with an invented "delivered
+      // tomorrow" and a wrong price context — the LLM text is rejected
+      // wholesale because it contains no verifiable per-unit price at all.
+      expect(response.message).toBe(
+        "We can offer 10 unit(s) at 48000 per unit, delivered in 5 day(s).",
+      );
+    });
+
+    it("falls back to a deterministic message on garbled LLM output", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("*** a Sentence");
+
+      const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10 });
+
+      expect(response.decision.outcome).toBe("EXACT_MATCH"); // negotiation itself is unaffected
+      expect(response.message).not.toContain("***");
+      expect(response.message.length).toBeGreaterThan(0);
+    });
+
+    it("an acceptance (EXACT_MATCH) message references the actual accepted quantity/price/delivery", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue(
+        "We can fulfill your order in full: 10 units at 48000 per unit, delivered in 5 days.",
+      );
+
+      const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10 });
+
+      expect(response.message).toContain("10");
+      expect(response.message).toContain("48000");
+      expect(response.message).toContain("5");
     });
   });
 

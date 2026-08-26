@@ -167,6 +167,96 @@ describe("runBuyerAgent", () => {
     expect(serialized).not.toContain("44000");
   });
 
+  // 1, 2. Strategic urgency is recorded as a human-readable reason
+  // alongside the structured counter-offer.
+  it("records a strategic reason for low urgency", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "COUNTER_OFFER",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 200,
+      offeredQuantity: 200,
+      unitPrice: 46500,
+      deliveryDays: 5,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(
+      { ...constraints, urgency: "low" },
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 6 },
+    );
+
+    expect(response.strategicReasons.some((r) => r.toLowerCase().includes("urgency is low"))).toBe(
+      true,
+    );
+  });
+
+  // Message-integrity hardening: a malformed/conflicting LLM message
+  // must never reach the caller — the negotiation itself must not fail
+  // either way, only the prose falls back.
+  describe("message integrity", () => {
+    it("falls back to a deterministic message when the LLM truncates the price", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("I can offer 44,71 for this order.");
+      // Priced above the buyer's ceiling (45000) -> the buyer counters,
+      // holding at its own ceiling (constraints.quantity is 200, but it
+      // adopts the merchant's 100-unit/5-day terms — see
+      // buildResponseToMerchantOffer's counter_offer branch).
+      const merchantResult: NegotiationResult = {
+        outcome: "COUNTER_OFFER",
+        sku: "LAPTOP-14-I5",
+        requestedQuantity: 100,
+        offeredQuantity: 100,
+        unitPrice: 46500,
+        deliveryDays: 5,
+        reasons: [],
+      };
+
+      const response = await runBuyerAgent(constraints, manifestProduct, merchantResult);
+
+      expect(response.action.type).toBe("counter_offer");
+      expect(response.action.unitPrice).toBe(45000); // structured value unaffected
+      expect(response.message).not.toContain("44,71 ");
+      expect(response.message).toContain("45000"); // deterministic fallback states the real price in full
+    });
+
+    it("falls back to a deterministic message on garbled LLM output", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("*** a Sentence");
+
+      const response = await runBuyerAgent(constraints, manifestProduct, null);
+
+      expect(response.action.quantity).toBe(200); // negotiation itself is unaffected
+      expect(response.message).not.toContain("***");
+      expect(response.message.length).toBeGreaterThan(0);
+    });
+
+    it("falls back to a deterministic message when the LLM invents a quantity not in the context", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("I'll take 1000000 units at 99999 each.");
+      const merchantResult: NegotiationResult = {
+        outcome: "COUNTER_OFFER",
+        sku: "LAPTOP-14-I5",
+        requestedQuantity: 100,
+        offeredQuantity: 100,
+        unitPrice: 45000,
+        deliveryDays: 5,
+        reasons: [],
+      };
+
+      const response = await runBuyerAgent(constraints, manifestProduct, merchantResult);
+
+      // The merchant's price already meets the buyer's ceiling -> accept.
+      expect(response.action.type).toBe("accept");
+      expect(response.action.quantity).toBe(100);
+      expect(response.action.unitPrice).toBe(45000);
+      // An acceptance message must reference the actual accepted values, not the invented ones.
+      expect(response.message).toContain("100");
+      expect(response.message).toContain("45000");
+      expect(response.message).not.toContain("1000000");
+      expect(response.message).not.toContain("99999");
+    });
+  });
+
   describe("when no LLM provider is configured", () => {
     it("falls back to a deterministic, non-empty message instead of throwing", async () => {
       mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));

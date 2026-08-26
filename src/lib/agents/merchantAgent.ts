@@ -16,6 +16,12 @@ import {
   type NegotiationRequest,
   type NegotiationResult,
 } from "@/lib/rules/negotiationEngine";
+import {
+  explainMerchantFactors,
+  hasQuantityLeverage,
+  resolveDeliveryTrade,
+} from "@/lib/rules/negotiationStrategy";
+import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 export interface MerchantAgentOffer {
@@ -42,6 +48,7 @@ Your only job is to phrase that result as a short, professional message to the b
 - Speak in first person as the merchant (e.g. "We can offer...", "We're unable to...").
 - Be concise: 2-4 sentences, plain text only (no markdown, no JSON).
 - State only the outcome, quantity, unit price, delivery days, and reasons EXACTLY as given in the JSON. Never invent, round, or otherwise change any number, product name, policy, or reason that isn't present in the JSON.
+- Render every number exactly as given, in full — never truncate, abbreviate, or drop a digit (e.g. write 45375 in full, never 4537 or 45). Whenever an outcome carries a quantity, unit price, and delivery days, state all three.
 - Do not claim a deal is agreed or final unless the outcome is "EXACT_MATCH" — for "COUNTER_OFFER" or "PARTIAL_FULFILLMENT", present the terms as an offer awaiting the buyer's response, not a completed deal.
 - For "REJECTED", briefly explain why using only the given reasons, and do not propose alternative terms of your own.
 - Never offer to negotiate further or suggest numbers beyond what was given to you.`;
@@ -55,6 +62,19 @@ Your only job is to phrase that result as a short, professional message to the b
  */
 function toPublicContext(result: NegotiationResult): Record<string, unknown> {
   return {
+    // The block the LLM must treat as immutable fact — every number
+    // here is what checkAgentMessageIntegrity (messageIntegrity.ts)
+    // requires the final message to state verbatim.
+    authoritativeFacts: {
+      side: "MERCHANT" as const,
+      action: result.outcome,
+      sku: result.sku,
+      requestedQuantity: result.requestedQuantity,
+      quantity: result.offeredQuantity,
+      unitPrice: result.unitPrice,
+      deliveryDays: result.deliveryDays,
+      reasons: result.reasons,
+    },
     outcome: result.outcome,
     sku: result.sku,
     requestedQuantity: result.requestedQuantity,
@@ -66,15 +86,17 @@ function toPublicContext(result: NegotiationResult): Record<string, unknown> {
 }
 
 /**
- * Overrides a fresh NegotiationResult's price with the round-aware
- * concession strategy (computeMerchantConcessionPrice), when a round
- * context is supplied and a genuine price negotiation is actually in
- * play. This is what stops the merchant from treating "the buyer's ask
- * is at or above minPrice" as a reason to accept outright — minPrice is
- * a floor, not a target, so evaluateNegotiationRequest's single-shot
- * "meet in the middle once" price is replaced with a position that
- * still tries to hold closer to the listed price, conceding only
- * gradually across rounds.
+ * Overrides a fresh NegotiationResult's price (and, when a delivery
+ * trade applies, its delivery days) with the round-aware concession
+ * strategy (computeMerchantConcessionPrice), when a round context is
+ * supplied and a genuine price negotiation is actually in play. This is
+ * what stops the merchant from treating "the buyer's ask is at or above
+ * minPrice" as a reason to accept outright — minPrice is a floor, not a
+ * target, so evaluateNegotiationRequest's single-shot "meet in the
+ * middle once" price is replaced with a position that still tries to
+ * hold closer to the listed price, conceding only gradually across
+ * rounds, and now also folds in stock-pressure, quantity-leverage, and
+ * delivery-for-price strategic factors (negotiationStrategy.ts).
  *
  * A no-op (returns `decision` unchanged) whenever there's nothing to
  * override: no round context supplied (preserves every existing
@@ -98,12 +120,20 @@ function applyMerchantConcession(
     return decision;
   }
 
-  const concededPrice = computeMerchantConcessionPrice(
-    item,
-    request.maxUnitPrice,
-    concessionContext,
-  );
-  if (concededPrice === decision.unitPrice) {
+  const trade =
+    request.deliveryDeadlineDays !== undefined
+      ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
+      : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
+
+  const quantityLeveraged = hasQuantityLeverage(request.quantity);
+
+  const concededPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
+    ...concessionContext,
+    requestedQuantity: request.quantity,
+    deliveryTradeDiscount: trade.discount,
+  });
+
+  if (concededPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
     return decision;
   }
 
@@ -111,9 +141,10 @@ function applyMerchantConcession(
     .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
     .concat(
       `Countering with an adjusted unit price of ${concededPrice} instead of the listed ${item.listedPrice}.`,
+      ...explainMerchantFactors(item, quantityLeveraged, trade),
     );
 
-  return { ...decision, unitPrice: concededPrice, reasons };
+  return { ...decision, unitPrice: concededPrice, deliveryDays: trade.deliveryDays, reasons };
 }
 
 /**
@@ -181,13 +212,27 @@ export async function runMerchantAgent(
     decision = applyMerchantConcession(item, request, decision, concessionContext);
   }
 
+  const context = toPublicContext(decision);
+  const requiredNumbers =
+    decision.outcome === "REJECTED"
+      ? []
+      : [decision.offeredQuantity, decision.unitPrice, decision.deliveryDays];
+
   let message: string;
   try {
-    message = await getLlmProvider().generateAgentMessage({
+    const generated = await getLlmProvider().generateAgentMessage({
       systemPrompt: MERCHANT_SYSTEM_PROMPT,
-      context: toPublicContext(decision),
-      instruction: "Write the merchant's message to the buyer explaining this negotiation result.",
+      context,
+      instruction:
+        "Generate only the natural-language message explaining this already-decided negotiation result, from the merchant's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative.",
     });
+    const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
+    if (check.valid) {
+      message = generated;
+    } else {
+      console.warn(`Merchant Agent LLM message failed integrity check, falling back: ${check.reason}`);
+      message = buildFallbackMerchantMessage(decision);
+    }
   } catch (error) {
     if (!(error instanceof LlmUnavailableError)) {
       throw error;
