@@ -35,6 +35,11 @@ import {
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
 import { decideBuyerConcessionMove, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
+import { decideBuyerQuantityTrade, type BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
+import {
+  evaluateQuantitySufficiency,
+  type QuantitySufficiencyDecision,
+} from "@/lib/rules/buyerQuantitySufficiency";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
@@ -52,6 +57,26 @@ export interface BuyerAgentResponse {
   message: string;
   /** Which strategic factors (urgency, quantity leverage, remaining rounds) shaped this action — see negotiationStrategy.explainBuyerFactors. Empty when none applied (e.g. an outright accept/reject, or no round context). */
   strategicReasons: string[];
+  /**
+   * Milestone 5: whether this round's counter is a quantity-for-price
+   * trade (buyerQuantityTrade.ts) rather than a plain price move. Null
+   * whenever the trade decision was never consulted at all (the opening
+   * request, an outright accept/reject, or a caller without a round
+   * context) — distinct from "NO_TRADE", which means it WAS consulted
+   * and declined. Internal/testability signal only — not yet threaded
+   * into the public DTO (see the Milestone 5 design note).
+   */
+  tradeMove: BuyerTradeMove | null;
+  /**
+   * Milestone 6: the buyer's explicit, factor-based judgment of whether
+   * the offered QUANTITY is actually sufficient — a separate question
+   * from whether the offer is technically within hard constraints (see
+   * buildResponseToMerchantOffer). Null whenever it was never consulted
+   * (the offer wasn't hard-constraint-acceptable in the first place, the
+   * opening request, an outright reject, or a caller without a round
+   * context).
+   */
+  sufficiency: QuantitySufficiencyDecision | null;
 }
 
 /**
@@ -67,6 +92,26 @@ export interface BuyerStrategyContext {
   previousBuyerUnitPrice?: number | null;
   /** The buyer's live 0-100 leverage score (see leverage.ts), computed by the orchestrator from data buyerAgent.ts never itself has access to (item.minPrice) — only the aggregate public score crosses this boundary, the same one already sent to the browser. */
   leverageScore?: number;
+  /**
+   * Milestone 5: whether the buyer has already used its quantity-for-price
+   * bargaining chip earlier in this same negotiation — derived by the
+   * caller from actual negotiation history (see orchestrator.ts /
+   * negotiationSessionRepository.ts), never guessed here. Omitted (or
+   * false) means the chip is still available, exactly as if this option
+   * didn't exist — every caller that predates Milestone 5 behaves
+   * identically.
+   */
+  quantityTradeAlreadyUsed?: boolean;
+  /**
+   * Milestone 5: the buyer's own quantity from ONE ROUND BEFORE the
+   * merchant offer being reacted to now. Used only to raise the
+   * acceptance ceiling (validateMerchantProposal) when the merchant's
+   * offer mirrors a quantity the buyer itself already asked for via a
+   * trade — otherwise the buyer's own hard-coded original constraints.quantity
+   * ceiling would wrongly reject its own larger request being fulfilled.
+   * Omitted reproduces exactly today's ceiling (constraints.quantity).
+   */
+  previousBuyerQuantity?: number | null;
 }
 
 const BUYER_SYSTEM_PROMPT = `You are PACT's Buyer Agent, communicating with a merchant's AI agent on behalf of the buyer.
@@ -117,6 +162,8 @@ function buildResponseToMerchantOffer(
   validation: BuyerValidationResult;
   move: BuyerMove | null;
   moveReason: string | null;
+  tradeMove: BuyerTradeMove | null;
+  sufficiency: QuantitySufficiencyDecision | null;
 } {
   if (
     merchantResult.outcome === "REJECTED" ||
@@ -129,6 +176,8 @@ function buildResponseToMerchantOffer(
       validation: { outcome: "UNACCEPTABLE", reasons: merchantResult.reasons },
       move: null,
       moveReason: null,
+      tradeMove: null,
+      sufficiency: null,
     };
   }
 
@@ -139,21 +188,75 @@ function buildResponseToMerchantOffer(
     deliveryDays: merchantResult.deliveryDays,
   };
 
-  const validation = validateMerchantProposal(constraints, proposal);
+  // Milestone 5: once the buyer has asked for more than its original
+  // quantity (via a trade), the merchant's offer mirroring that larger
+  // ask must not be rejected as "too much" by the buyer's own
+  // constraints.quantity ceiling — see isQuantityAcceptable's doc comment.
+  const maxAcceptableQuantity = Math.max(
+    constraints.quantity,
+    strategyContext?.previousBuyerQuantity ?? 0,
+  );
+  const validation = validateMerchantProposal(constraints, proposal, maxAcceptableQuantity);
 
-  if (validation.outcome === "ACCEPTABLE") {
-    return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null };
+  // Milestone 6: technically satisfying every hard constraint
+  // (price/quantity-ceiling/delivery) is NOT the same as the quantity
+  // actually being enough — see buyerQuantitySufficiency.ts. This is a
+  // deliberately SEPARATE question from buyerQuantityTrade.ts below:
+  // that module asks "should I offer MORE than I need for a better
+  // price" (a proactive give); this asks "is what's on offer enough of
+  // what I actually need" (a reactive judgment about a shortfall). A
+  // single round is only ever one or the other, never both — sufficiency
+  // is only ever evaluated on the hard-constraint-ACCEPTABLE path, and
+  // the trade chip's own gate independently refuses to fire whenever the
+  // merchant is already short-supplying the original request, so the two
+  // paths cannot both engage in the same round.
+  //
+  // Only applies when a round context exists — a single-shot caller that
+  // predates Phase 5B's whole round-aware system (e.g. POST /api/negotiate)
+  // never had any notion of "insufficient, try again next round" to begin
+  // with, so it keeps its exact pre-Milestone-6 behavior: acceptable
+  // means accept.
+  //
+  // Within the final-two-round safety net, sufficiency never blocks
+  // acceptance — this is the SAME guaranteed-convergence carve-out every
+  // other strategic overlay in this codebase already respects (see
+  // computeBuyerConcessionPrice / computeMerchantConcessionPrice /
+  // decideBuyerConcessionMove). Without it, a severe, genuinely
+  // unresolvable shortfall (the merchant's stock is what it is — no
+  // amount of further negotiating rounds changes that) would strand the
+  // negotiation in an unreachable "insufficient forever" state instead of
+  // closing on the best achievable terms, exactly the failure mode this
+  // safety net was built to prevent.
+  let sufficiency: QuantitySufficiencyDecision | null = null;
+  if (validation.outcome === "ACCEPTABLE" && concessionContext) {
+    sufficiency = evaluateQuantitySufficiency(constraints, proposal.quantity, proposal.unitPrice);
+    const roundsLeft = Math.max(1, concessionContext.maxRounds - concessionContext.round + 1);
+    if (sufficiency.verdict !== "INSUFFICIENT" || roundsLeft <= 2) {
+      // SUFFICIENT (no meaningful shortfall, or one within tolerance),
+      // INSUFFICIENT_PRICE_COMPENSATES (a real shortfall, but the price
+      // is good enough to justify accepting it anyway), or the
+      // final-rounds safety net — all are a genuine "accept this,"
+      // never a blind quantity-fits-under-the-ceiling shortcut.
+      return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null, tradeMove: null, sufficiency };
+    }
+    // INSUFFICIENT, with real negotiating room still ahead — fall
+    // through to negotiate instead of accepting, exactly like the "not
+    // yet acceptable" path below.
+  } else if (validation.outcome === "ACCEPTABLE") {
+    // No round context (a single-shot caller) — exact pre-Milestone-6 behavior.
+    return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null, tradeMove: null, sufficiency: null };
   }
 
-  // Not acceptable yet. Adopt whatever quantity/delivery the merchant
-  // already offered — no reason to keep re-asking for terms it has
-  // already granted. The PRICE is where the buyer now genuinely
-  // decides whether moving is worthwhile (buyerMoveSelector.ts) rather
-  // than always conceding: HOLD repeats the buyer's own previous price,
-  // CONCEDE uses the existing round-aware computeBuyerConcessionPrice
-  // formula, completely unchanged. Without a round context (a caller
-  // that predates this option), it holds flat at maxUnitPrice, exactly
-  // as before Phase 5B even existed.
+  // Not acceptable yet (or acceptable but insufficient — see above).
+  // Adopt whatever quantity/delivery the merchant already offered — no
+  // reason to keep re-asking for terms it has already granted. The
+  // PRICE is where the buyer now genuinely decides whether moving is
+  // worthwhile (buyerMoveSelector.ts) rather than always conceding:
+  // HOLD repeats the buyer's own previous price, CONCEDE uses the
+  // existing round-aware computeBuyerConcessionPrice formula, completely
+  // unchanged. Without a round context (a caller that predates this
+  // option), it holds flat at maxUnitPrice, exactly as before Phase 5B
+  // even existed.
   if (!concessionContext) {
     return {
       action: {
@@ -166,6 +269,47 @@ function buildResponseToMerchantOffer(
       validation,
       move: null,
       moveReason: null,
+      tradeMove: null,
+      sufficiency,
+    };
+  }
+
+  // Milestone 5: before falling back to a plain price move, ask whether
+  // this is a good round to use the buyer's (single-use) quantity-for-price
+  // chip instead — see buyerQuantityTrade.ts for exactly when this fires.
+  // A genuine structured decision, not a quantity change explained after
+  // the fact: when it fires, the counter's quantity/price come directly
+  // from that decision, and decideBuyerConcessionMove is never consulted
+  // this round at all. (When reached via the new insufficient-quantity
+  // path above, this always declines — the trade's own gate refuses
+  // whenever the merchant is already short-supplying the original
+  // request, which is exactly the situation that got us here — so the
+  // buyer falls through to ordinary price concession instead, never a
+  // NEW kind of trade; see the Milestone 6 design review.)
+  const tradeDecision = decideBuyerQuantityTrade(
+    constraints,
+    proposal.unitPrice,
+    proposal.quantity,
+    concessionContext,
+    strategyContext?.priorMerchantUnitPrice,
+    strategyContext?.leverageScore,
+    strategyContext?.quantityTradeAlreadyUsed ?? false,
+  );
+
+  if (tradeDecision.move === "QUANTITY_FOR_PRICE") {
+    return {
+      action: {
+        type: "counter_offer",
+        sku: constraints.sku,
+        quantity: tradeDecision.quantity as number,
+        unitPrice: tradeDecision.unitPrice as number,
+        deliveryDays: proposal.deliveryDays,
+      },
+      validation,
+      move: null,
+      moveReason: tradeDecision.reason,
+      tradeMove: "QUANTITY_FOR_PRICE",
+      sufficiency,
     };
   }
 
@@ -188,7 +332,9 @@ function buildResponseToMerchantOffer(
     },
     validation,
     move: decision.move,
-    moveReason: decision.reason,
+    moveReason: sufficiency ? `${sufficiency.reason} ${decision.reason}` : decision.reason,
+    tradeMove: "NO_TRADE",
+    sufficiency,
   };
 }
 
@@ -225,12 +371,14 @@ export async function runBuyerAgent(
   concessionContext?: BuyerConcessionContext,
   strategyContext?: BuyerStrategyContext,
 ): Promise<BuyerAgentResponse> {
-  const { action, validation, moveReason } =
+  const { action, validation, moveReason, tradeMove, sufficiency } =
     merchantResult === null
       ? {
           action: buildOpeningRequest(constraints, manifestProduct, concessionContext),
           validation: null,
           moveReason: null,
+          tradeMove: null,
+          sufficiency: null,
         }
       : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext, strategyContext);
 
@@ -243,7 +391,14 @@ export async function runBuyerAgent(
           ...explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft),
           ...(moveReason ? [moveReason] : []),
         ]
-      : [];
+      : // Milestone 6: an "accept" is explainable too when it followed a
+        // real sufficiency judgment (a genuine shortfall the buyer
+        // decided was acceptable) — never populated merely because
+        // "quantity <= requested," only when there was an actual
+        // shortfall to reason about (sufficiency.shortfallFraction > 0).
+        action.type === "accept" && sufficiency && sufficiency.shortfallFraction > 0
+        ? [sufficiency.reason]
+        : [];
 
   // The block the LLM must treat as immutable fact — every number here
   // is what checkAgentMessageIntegrity requires the final message to
@@ -286,7 +441,7 @@ export async function runBuyerAgent(
       systemPrompt: BUYER_SYSTEM_PROMPT,
       context,
       instruction:
-        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative.",
+        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"), still using only the exact numbers given.",
     });
     const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
     if (check.valid) {
@@ -305,7 +460,7 @@ export async function runBuyerAgent(
     message = buildFallbackBuyerMessage(action);
   }
 
-  return { action, validation, message, strategicReasons };
+  return { action, validation, message, strategicReasons, tradeMove, sufficiency };
 }
 
 /**

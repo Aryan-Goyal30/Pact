@@ -352,10 +352,21 @@ describe("runBuyerAgent — HOLD vs CONCEDE strategy", () => {
   });
 
   // F. Leverage shifts the decision while staying within hard constraints.
+  //
+  // quantityTradeAlreadyUsed: true isolates this Milestone-3-era test
+  // from Milestone 6's independent leverage-modulated quantity-trade
+  // mechanism (which, since strong leverage is no longer excluded from
+  // it, would otherwise also become eligible at leverageScore 85 here) —
+  // this test's own purpose is specifically the HOLD/CONCEDE leverage
+  // behavior in isolation, unchanged from Milestone 3.
   it("F: higher buyer leverage shifts the decision toward holding, without ever exceeding maxUnitPrice", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
     const context = { round: 3, maxRounds: 8 } as const;
-    const history = { priorMerchantUnitPrice: 47200, previousBuyerUnitPrice: 43700 }; // merchant moved slightly
+    const history = {
+      priorMerchantUnitPrice: 47200,
+      previousBuyerUnitPrice: 43700,
+      quantityTradeAlreadyUsed: true,
+    }; // merchant moved slightly
 
     const lowLeverage = await runBuyerAgent(constraints, manifestProduct, stuckMerchantResult, context, {
       ...history,
@@ -384,6 +395,286 @@ describe("runBuyerAgent — HOLD vs CONCEDE strategy", () => {
     );
 
     expect(response.action.unitPrice).toBe(constraints.maxUnitPrice);
+  });
+});
+
+// PACT V2 Milestone 5: buyer-initiated quantity-for-price bargaining,
+// wired through the real runBuyerAgent (not just buyerQuantityTrade.ts's
+// own isolated unit tests) — proves the plumbing (strategyContext.leverageScore
+// + quantityTradeAlreadyUsed) actually reaches the decision, and that the
+// LLM boundary safely communicates the conditional trade.
+describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
+  const tradeConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 50,
+    maxUnitPrice: 45500,
+    deliveryDeadlineDays: 10,
+    urgency: "high",
+  };
+  // Verified empirically against the real orchestrator's golden
+  // trajectory (see orchestrator.test.ts) — not hand-derived.
+  const merchantResult: NegotiationResult = {
+    outcome: "COUNTER_OFFER",
+    sku: "LAPTOP-14-I5",
+    requestedQuantity: 50,
+    offeredQuantity: 50,
+    unitPrice: 45613,
+    deliveryDays: 10,
+    reasons: [],
+  };
+
+  it("proposes QUANTITY_FOR_PRICE at moderate leverage, exposing tradeMove and the reason", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 54, quantityTradeAlreadyUsed: false },
+    );
+
+    expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
+    expect(response.action).toEqual({
+      type: "counter_offer",
+      sku: "LAPTOP-14-I5",
+      quantity: 100,
+      unitPrice: 43963,
+      deliveryDays: 10,
+    });
+    expect(response.strategicReasons.some((r) => r.includes("increase the order to 100 units"))).toBe(true);
+  });
+
+  // Milestone 6: a high-leverage buyer is NOT excluded from the trade —
+  // the old leverage-band gate was found (via real browser testing) to
+  // incorrectly block exactly this case. Leverage instead sizes a MORE
+  // aggressive ask (a bigger discount request) than the moderate-leverage
+  // case above.
+  it("still trades at strong leverage, asking for an even better price than at moderate leverage", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 90, quantityTradeAlreadyUsed: false },
+    );
+
+    expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
+    expect(response.action.quantity).toBe(100);
+    expect(response.action.unitPrice).toBe(43640);
+    expect(response.action.unitPrice!).toBeLessThan(43963); // more aggressive than the moderate-leverage ask
+  });
+
+  it("does not trade once the chip has already been used, even at otherwise-favorable leverage", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 54, quantityTradeAlreadyUsed: true },
+    );
+
+    expect(response.tradeMove).toBe("NO_TRADE");
+    expect(response.action.quantity).toBe(50);
+  });
+
+  // 13. LLM message contains all required conditional-trade numbers.
+  it("passes through an LLM message that correctly states the conditional trade's quantity, price, and delivery", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      "I'll take 100 units if you can bring the price down to 43963 each, delivered within 10 days.",
+    );
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 54, quantityTradeAlreadyUsed: false },
+    );
+
+    expect(response.message).toBe(
+      "I'll take 100 units if you can bring the price down to 43963 each, delivered within 10 days.",
+    );
+  });
+
+  // 14. Invalid Gemini conditional message falls back deterministically.
+  it("falls back to a deterministic message when the LLM's conditional-trade text omits the required price", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("I'll take more units if you can help on price.");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 54, quantityTradeAlreadyUsed: false },
+    );
+
+    // The structured decision itself is completely unaffected...
+    expect(response.action.quantity).toBe(100);
+    expect(response.action.unitPrice).toBe(43963);
+    // ...but the fallback caption states the real numbers, not the vague LLM text.
+    expect(response.message).toContain("100");
+    expect(response.message).toContain("43963");
+    expect(response.message).not.toContain("help on price");
+  });
+
+  it("falls back to a deterministic message when the LLM invents a conditional-trade quantity not in the context", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("I'll take 99999 units if you can do 1 each.");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 54, quantityTradeAlreadyUsed: false },
+    );
+
+    expect(response.action.quantity).toBe(100); // structured value unaffected
+    expect(response.message).not.toContain("99999");
+    expect(response.message).not.toContain("1 each");
+    expect(response.message).toContain("100");
+    expect(response.message).toContain("43963");
+  });
+});
+
+// PACT V2 Milestone 6: quantity SUFFICIENCY — a separate question from
+// buyerQuantityTrade.ts's bargaining chip. Proves the plumbing through
+// the real runBuyerAgent, not just buyerQuantitySufficiency.ts's own
+// isolated unit tests (see buyerQuantitySufficiency.test.ts for those).
+describe("runBuyerAgent — quantity sufficiency (partial fulfillment is not automatic acceptance)", () => {
+  const shortfallConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 150,
+    maxUnitPrice: 47000,
+    deliveryDeadlineDays: 10,
+    urgency: "medium",
+  };
+
+  // 10. A technically acceptable partial fulfillment (within the hard
+  // price/quantity-ceiling/delivery constraints) can still lead to a
+  // COUNTER instead of an automatic ACCEPT — this is the exact real
+  // browser Scenario 2 shape from the Milestone 6 browser-failure review.
+  it("a technically acceptable but insufficient partial fulfillment leads to a counter, not an automatic accept", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 100, // a 33% shortfall
+      unitPrice: 46900, // merely acceptable — close to the ceiling (47000), not a real bargain
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(
+      shortfallConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 }, // plenty of rounds left — the final-rounds safety net does not apply
+    );
+
+    expect(response.sufficiency).not.toBeNull();
+    expect(response.sufficiency!.verdict).toBe("INSUFFICIENT");
+    expect(response.action.type).not.toBe("accept");
+    expect(response.action.type).toBe("counter_offer");
+    expect(response.action.quantity).toBe(100); // still adopts the merchant's offered quantity while negotiating price
+  });
+
+  it("the SAME shortfall at a substantially better price IS accepted — the policy weighs price, it doesn't ignore quantity", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 100,
+      unitPrice: 44900, // substantially better — close to the buyer's own target
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(
+      shortfallConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+    );
+
+    expect(response.sufficiency!.verdict).toBe("INSUFFICIENT_PRICE_COMPENSATES");
+    expect(response.action.type).toBe("accept");
+  });
+
+  it("a small shortfall is accepted without needing any price justification", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 145, // a 3% shortfall
+      unitPrice: 46950, // a poor price — irrelevant here, the shortfall itself is within tolerance
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(
+      shortfallConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+    );
+
+    expect(response.sufficiency!.verdict).toBe("SUFFICIENT");
+    expect(response.action.type).toBe("accept");
+  });
+
+  // The final-rounds safety net (established since Milestone 2) still
+  // guarantees convergence: an otherwise-insufficient shortfall is still
+  // accepted once no real negotiating room remains, rather than
+  // stranding the negotiation in an unreachable state.
+  it("still accepts an insufficient shortfall within the final-rounds safety net, rather than stalling forever", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 100,
+      unitPrice: 46900, // the same "merely acceptable" price that was rejected earlier in this negotiation
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(
+      shortfallConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 9, maxRounds: 10 }, // roundsLeft = 2 -> the safety net
+    );
+
+    expect(response.action.type).toBe("accept");
+  });
+
+  // Single-shot callers that predate Phase 5B's round-aware system never
+  // had a "try again next round" option to begin with — sufficiency
+  // must not newly block them either.
+  it("does not apply sufficiency at all for a single-shot caller without a round context", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const merchantResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 100,
+      unitPrice: 46900,
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(shortfallConstraints, manifestProduct, merchantResult);
+
+    expect(response.sufficiency).toBeNull();
+    expect(response.action.type).toBe("accept");
   });
 });
 

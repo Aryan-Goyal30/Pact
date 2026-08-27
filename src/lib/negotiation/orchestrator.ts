@@ -141,6 +141,23 @@ export async function runNegotiationTurn(
    * merchant moved" (today's pre-Milestone-3 behavior — always concede).
    */
   priorMerchantUnitPrice?: number | null,
+  /**
+   * Milestone 5: the buyer's own quantity from ONE ROUND BEFORE this
+   * one — lets the merchant recognize a genuine round-over-round
+   * quantity increase (buyerAgent.ts's quantity-for-price trade) even
+   * below the flat bulk-order threshold. Optional and additive: omitting
+   * it reproduces exactly today's (pre-Milestone-5) trigger condition.
+   */
+  previousBuyerQuantity?: number | null,
+  /**
+   * Milestone 5: whether the buyer has already used its quantity-for-price
+   * bargaining chip earlier in this same negotiation — derived by the
+   * caller from actual negotiation history (see
+   * runNegotiationToCompletion below / negotiationSessionRepository.ts),
+   * never guessed here. Omitted (or false) leaves the chip available,
+   * exactly as if this option didn't exist.
+   */
+  quantityTradeAlreadyUsed?: boolean,
 ): Promise<NegotiationTurnResult> {
   if (TERMINAL_STATUSES.includes(state.status)) {
     throw new Error(
@@ -236,7 +253,13 @@ export async function runNegotiationTurn(
     context.manifestProduct,
     previousMerchantResult,
     { round: state.round + 1, maxRounds: state.maxRounds },
-    { priorMerchantUnitPrice, previousBuyerUnitPrice, leverageScore: buyerLeverageScore },
+    {
+      priorMerchantUnitPrice,
+      previousBuyerUnitPrice,
+      leverageScore: buyerLeverageScore,
+      quantityTradeAlreadyUsed,
+      previousBuyerQuantity,
+    },
   );
   const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
 
@@ -312,6 +335,10 @@ export async function runNegotiationTurn(
     // (buyerResponse.action.unitPrice, above) is a genuine concession
     // from its own prior ask, a hold, or a withdrawal.
     previousBuyerUnitPrice,
+    // Milestone 5: lets the merchant recognize a genuine round-over-round
+    // quantity increase (buyerResponse.action.quantity, above) even
+    // below the flat bulk-order threshold.
+    previousBuyerQuantity,
   );
   const merchantResult = merchantAgentResponse.decision;
 
@@ -413,12 +440,26 @@ export async function runNegotiationToCompletion(
     // — i.e. two turns back in the transcript — see runNegotiationTurn's
     // priorMerchantUnitPrice parameter.
     const priorMerchantUnitPrice = transcript[transcript.length - 2]?.merchant.unitPrice ?? null;
+    // Milestone 5: the buyer's own quantity one round back, and whether
+    // the quantity-for-price chip has EVER been used across the WHOLE
+    // transcript so far (not just the immediately previous round) —
+    // scanning the full history, rather than a single-round lookback,
+    // is what makes this reliable: a single-round comparison could
+    // "forget" a trade used two rounds ago if the buyer's mirrored
+    // quantity later drops back down (e.g. a subsequent partial-fulfillment
+    // offer), which would wrongly let the chip fire again.
+    const previousBuyerQuantity = transcript[transcript.length - 1]?.buyer.quantity ?? null;
+    const quantityTradeAlreadyUsed = transcript.some(
+      (t) => t.buyer.quantity !== null && t.buyer.quantity > context.buyerConstraints.quantity,
+    );
     const turn = await runNegotiationTurn(
       context,
       state,
       previousMerchantResult,
       previousBuyerUnitPrice,
       priorMerchantUnitPrice,
+      previousBuyerQuantity,
+      quantityTradeAlreadyUsed,
     );
     transcript.push(turn);
     state = turn.state;

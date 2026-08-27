@@ -31,10 +31,15 @@ export interface BuyerMoveDecision {
   reason: string;
 }
 
-/** Buyer leverage at/above this holds firm even if the merchant has technically moved a little — it can afford the patience. */
-const HOLD_LEVERAGE_THRESHOLD = 60;
+/**
+ * Buyer leverage at/above this holds firm even if the merchant has
+ * technically moved a little — it can afford the patience. Exported so
+ * buyerQuantityTrade.ts (Milestone 5) can reuse the exact same leverage
+ * bands rather than defining a parallel, drifting set of thresholds.
+ */
+export const HOLD_LEVERAGE_THRESHOLD = 60;
 /** Buyer leverage at/below this concedes even if the merchant hasn't moved — protecting the deal actually closing matters more than testing firmness. */
-const CONCEDE_LEVERAGE_THRESHOLD = 40;
+export const CONCEDE_LEVERAGE_THRESHOLD = 40;
 
 /**
  * Decides whether the buyer should CONCEDE (move price toward the

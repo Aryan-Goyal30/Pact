@@ -17,8 +17,16 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
   if (typeof body !== "object" || body === null) {
     return null;
   }
-  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds, urgency, deliveryFlexible } =
-    body as Record<string, unknown>;
+  const {
+    sku,
+    quantity,
+    maxUnitPrice,
+    deliveryDeadlineDays,
+    maxRounds,
+    urgency,
+    deliveryFlexible,
+    quantityShortfallTolerance,
+  } = body as Record<string, unknown>;
 
   if (typeof sku !== "string" || sku.trim().length === 0) {
     return null;
@@ -48,6 +56,14 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
   if (deliveryFlexible !== undefined && typeof deliveryFlexible !== "boolean") {
     return null;
   }
+  if (
+    quantityShortfallTolerance !== undefined &&
+    (typeof quantityShortfallTolerance !== "number" ||
+      quantityShortfallTolerance < 0 ||
+      quantityShortfallTolerance > 1)
+  ) {
+    return null;
+  }
 
   return {
     sku,
@@ -57,6 +73,7 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
     maxRounds,
     urgency: urgency as NegotiationSessionCreateRequest["urgency"],
     deliveryFlexible,
+    quantityShortfallTolerance: quantityShortfallTolerance as number | undefined,
   };
 }
 
@@ -110,6 +127,7 @@ export async function POST(request: Request) {
         deliveryDeadlineDays: createRequest.deliveryDeadlineDays,
         urgency: createRequest.urgency,
         deliveryFlexible: createRequest.deliveryFlexible,
+        quantityShortfallTolerance: createRequest.quantityShortfallTolerance,
       },
       maxRounds,
     );

@@ -72,6 +72,8 @@ export interface NegotiationSessionCreateRequest {
   urgency?: "low" | "medium" | "high";
   /** Whether the buyer will trade a later delivery date for a price concession — see BuyerConstraints.deliveryFlexible. Defaults to false when omitted. */
   deliveryFlexible?: boolean;
+  /** How much shortfall from `quantity` (as a fraction, e.g. 0.2 = up to 20% less) the buyer tolerates without needing price to compensate — see BuyerConstraints.quantityShortfallTolerance. Defaults to a value derived from `urgency` when omitted. */
+  quantityShortfallTolerance?: number;
 }
 
 /**

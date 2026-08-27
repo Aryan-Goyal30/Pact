@@ -136,6 +136,7 @@ function applyMerchantConcession(
   decision: NegotiationResult,
   concessionContext: MerchantConcessionContext,
   priorBuyerUnitPrice?: number | null,
+  previousBuyerQuantity?: number | null,
 ): NegotiationResult {
   if (
     request.maxUnitPrice === undefined ||
@@ -159,13 +160,26 @@ function applyMerchantConcession(
     reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
   });
 
-  const tradeEvaluation = hasQuantityLeverage(request.quantity)
-    ? evaluateMerchantTrade(
-        item,
-        { quantity: request.quantity, unitPrice: request.maxUnitPrice },
-        { baselineConcessionPrice },
-      )
-    : null;
+  // Milestone 5: a genuine round-over-round quantity increase engages
+  // the SAME trade evaluator as the flat bulk-order threshold below —
+  // deliberately not a separate "quantity increase -> discount" formula.
+  // evaluateMerchantTrade's own stock-pressure logic (untouched) is what
+  // decides ACCEPT/COUNTER/HOLD/REJECT; this only widens WHEN it gets
+  // consulted, so a 100 -> 200 offer is recognized even though 200 stays
+  // well under the flat LARGE_ORDER_QUANTITY_THRESHOLD.
+  const quantityIncreasedFromPrior =
+    previousBuyerQuantity !== null &&
+    previousBuyerQuantity !== undefined &&
+    request.quantity > previousBuyerQuantity;
+
+  const tradeEvaluation =
+    hasQuantityLeverage(request.quantity) || quantityIncreasedFromPrior
+      ? evaluateMerchantTrade(
+          item,
+          { quantity: request.quantity, unitPrice: request.maxUnitPrice },
+          { baselineConcessionPrice, hasGenuineIncrease: quantityIncreasedFromPrior },
+        )
+      : null;
   const finalPrice = tradeEvaluation?.unitPrice ?? baselineConcessionPrice;
 
   if (finalPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
@@ -177,6 +191,11 @@ function applyMerchantConcession(
     .concat(
       `Countering with an adjusted unit price of ${finalPrice} instead of the listed ${item.listedPrice}.`,
       ...(reciprocity.reason ? [reciprocity.reason] : []),
+      ...(quantityIncreasedFromPrior
+        ? [
+            `The buyer increased its requested quantity from ${previousBuyerQuantity} to ${request.quantity}, so the merchant evaluated the full package instead of price alone.`,
+          ]
+        : []),
       ...(tradeEvaluation ? [tradeEvaluation.reason] : []),
       // quantityLeveraged is false here — the trade evaluation above
       // already supplies a more specific quantity reason when relevant,
@@ -252,10 +271,26 @@ export async function runMerchantAgent(
   request: NegotiationRequest,
   concessionContext?: MerchantConcessionContext,
   priorBuyerUnitPrice?: number | null,
+  /**
+   * Milestone 5: the buyer's unit quantity from ONE ROUND BEFORE
+   * `request` — lets the merchant recognize a genuine round-over-round
+   * quantity increase (a quantity-for-price trade) even when the
+   * absolute quantity stays below the flat bulk-order threshold. See
+   * applyMerchantConcession. Omitting it reproduces exactly today's
+   * behavior (only the absolute threshold can engage the trade evaluator).
+   */
+  previousBuyerQuantity?: number | null,
 ): Promise<MerchantAgentResponse> {
   let decision = evaluateNegotiationRequest(item, request);
   if (item && concessionContext) {
-    decision = applyMerchantConcession(item, request, decision, concessionContext, priorBuyerUnitPrice);
+    decision = applyMerchantConcession(
+      item,
+      request,
+      decision,
+      concessionContext,
+      priorBuyerUnitPrice,
+      previousBuyerQuantity,
+    );
   }
 
   const context = toPublicContext(decision);

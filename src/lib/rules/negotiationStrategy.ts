@@ -69,6 +69,90 @@ export function hasQuantityLeverage(quantity: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Quantity-for-price bargaining — PACT V2 Milestone 5. Deliberately
+// independent of LARGE_ORDER_QUANTITY_THRESHOLD above: that constant
+// gates a flat bulk-order posture at an absolute quantity; these gate a
+// RELATIVE increase the buyer deliberately offers mid-negotiation, which
+// can (and typically will) stay well below that absolute threshold — see
+// buyerQuantityTrade.ts. Calibration parameters of the strategy, not the
+// mechanic itself — sanity-checked against several representative
+// scenarios (not just one fixture) before being set; not sacred.
+// ---------------------------------------------------------------------------
+
+/** How much more quantity the buyer offers, as a fraction of its original ask, when it uses its (single-use) quantity-for-price bargaining chip. */
+export const QUANTITY_TRADE_INCREASE_FRACTION = 1.0;
+
+/** Extra fractional discount, on top of the buyer's ordinary round-aware concession ask, requested in exchange for that additional quantity. */
+export const QUANTITY_TRADE_PRICE_ASK_DISCOUNT = 0.02;
+
+// ---------------------------------------------------------------------------
+// Quantity SUFFICIENCY — PACT V2 Milestone 6. Deliberately a SEPARATE
+// concept from the quantity-for-price bargaining chip above: this is
+// "how much shortfall from what I actually need can I tolerate," not
+// "how much extra am I willing to offer." See buyerQuantitySufficiency.ts.
+//
+// Tolerance is expressed as a FRACTION of the buyer's originally
+// requested quantity, keyed off the same urgency categories every other
+// urgency-driven factor in this codebase already uses
+// (resolveUrgencyConcessionFactor). High urgency tolerates more
+// shortfall (time pressure matters more than getting the exact amount);
+// low urgency tolerates less (a patient buyer can afford to hold out for
+// the full quantity). Sanity-checked against several representative
+// shortfall/price combinations (not just one fixture) before being set
+// — see the Milestone 6 design review — and, like every other
+// calibration constant in this file, not sacred.
+// ---------------------------------------------------------------------------
+
+export const QUANTITY_SHORTFALL_TOLERANCE_HIGH_URGENCY = 0.35;
+export const QUANTITY_SHORTFALL_TOLERANCE_MEDIUM_URGENCY = 0.2;
+export const QUANTITY_SHORTFALL_TOLERANCE_LOW_URGENCY = 0.1;
+
+/**
+ * The default shortfall tolerance for a buyer that hasn't stated an
+ * explicit one (BuyerConstraints.quantityShortfallTolerance) — derived
+ * purely from urgency, the same "medium is the neutral default" shape
+ * every other urgency-driven factor in this file already follows.
+ */
+export function resolveQuantityShortfallTolerance(urgency: UrgencyLevel = "medium"): number {
+  switch (urgency) {
+    case "high":
+      return QUANTITY_SHORTFALL_TOLERANCE_HIGH_URGENCY;
+    case "low":
+      return QUANTITY_SHORTFALL_TOLERANCE_LOW_URGENCY;
+    case "medium":
+    default:
+      return QUANTITY_SHORTFALL_TOLERANCE_MEDIUM_URGENCY;
+  }
+}
+
+/**
+ * How close to the buyer's own aspirational target (not merely under its
+ * hard ceiling) a price needs to be to be considered "substantially
+ * better" enough to justify accepting a shortfall that only barely
+ * exceeds ordinary tolerance. 0 = at the ceiling (no advantage at all),
+ * 1 = at or below the target (the best the buyer could realistically
+ * hope for). This is the BASELINE requirement — see
+ * QUANTITY_SHORTFALL_PRICE_COMPENSATION_SEVERITY_SCALING for how it
+ * rises as the shortfall gets more severe, so a severe shortfall is
+ * never treated the same as a marginal one just because both exceed
+ * tolerance.
+ */
+export const QUANTITY_SHORTFALL_PRICE_COMPENSATION_THRESHOLD = 0.65;
+
+/**
+ * How much the required price advantage rises per unit of shortfall
+ * beyond tolerance — e.g. a shortfall 20 percentage points beyond
+ * tolerance raises the bar by 20 * 1.5 = 30 percentage points. This is
+ * what makes a severe shortfall (well beyond tolerance) require a price
+ * advantage the [0,1] scale cannot reach at all — no price ever
+ * compensates for it — while a shortfall only just beyond tolerance
+ * still has a real, reachable bar to clear. Sanity-checked (not
+ * hand-picked to pass one fixture) against shortfalls ranging from just
+ * over tolerance to near-total (150 requested / 10 offered).
+ */
+export const QUANTITY_SHORTFALL_PRICE_COMPENSATION_SEVERITY_SCALING = 1.5;
+
+// ---------------------------------------------------------------------------
 // Merchant-side factors
 // ---------------------------------------------------------------------------
 

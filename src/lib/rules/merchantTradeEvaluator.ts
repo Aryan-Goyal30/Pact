@@ -48,6 +48,17 @@ export interface MerchantTradeContext {
    * the fallback price for HOLD/REJECT/below-threshold verdicts.
    */
   baselineConcessionPrice: number;
+  /**
+   * Milestone 5: true when the buyer's quantity genuinely increased from
+   * its own prior round — even if the absolute quantity itself stays
+   * below LARGE_ORDER_QUANTITY_THRESHOLD (hasQuantityLeverage). Widens
+   * ONLY the entry gate immediately below: every other part of this
+   * function's verdict (the stock-pressure discount size, the floor
+   * rejection, the ACCEPT threshold) is completely unchanged. Omitted
+   * (or false) reproduces exactly today's (pre-Milestone-5) behavior —
+   * only the flat bulk-order threshold can unlock a discount.
+   */
+  hasGenuineIncrease?: boolean;
 }
 
 export interface MerchantTradeEvaluation {
@@ -108,7 +119,7 @@ export function evaluateMerchantTrade(
     };
   }
 
-  if (!hasQuantityLeverage(proposal.quantity)) {
+  if (!hasQuantityLeverage(proposal.quantity) && !context.hasGenuineIncrease) {
     return {
       verdict: "COUNTER",
       unitPrice: baseline,

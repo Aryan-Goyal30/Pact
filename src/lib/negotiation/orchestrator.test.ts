@@ -9,6 +9,7 @@ import {
   type NegotiationContext,
 } from "./orchestrator";
 import { getLlmProvider } from "@/lib/llm/provider";
+import { runMerchantAgent } from "@/lib/agents/merchantAgent";
 import * as walkAway from "@/lib/rules/walkAway";
 
 // The LLM is mocked at the provider boundary — every other layer (buyer
@@ -1076,5 +1077,237 @@ describe("buyer HOLD strategy through the real orchestrator", () => {
       expect(price).toBeLessThanOrEqual(44300);
     }
     expect(finalState.status).toBe("AGREED"); // holding didn't prevent a real, achievable deal from closing
+  });
+});
+
+// PACT V2 Milestone 5: buyer-initiated quantity-for-price bargaining,
+// end to end through the real orchestrator. Exact values verified
+// empirically (see the Milestone 5 design/implementation session) after
+// fixing a real bug this milestone surfaced: buyerRules.isQuantityAcceptable
+// used to hard-reject any merchant offer above the buyer's ORIGINAL
+// constraints.quantity, which would have silently blocked a negotiation
+// from ever closing once the buyer legitimately asked for more via a
+// trade — see the maxAcceptableQuantity parameter added to
+// validateMerchantProposal / isQuantityAcceptable (buyerRules.ts).
+describe("buyer-initiated quantity-for-price trade through the real orchestrator", () => {
+  const item: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 150,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiationEnabled: true,
+  };
+  const listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 150,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiable: true,
+  };
+  const tradeBuyerConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 50,
+    maxUnitPrice: 45500,
+    deliveryDeadlineDays: 10,
+    urgency: "high",
+  };
+
+  // 15, 16, 17. The golden behavioral scenario (section 17 of the
+  // Milestone 5 spec): the buyer changes quantity SPECIFICALLY to
+  // negotiate price (not an unrelated independent change), the merchant
+  // evaluates the resulting package rather than blindly moving price
+  // alone, and the negotiation still reaches a genuine AGREED close.
+  it("the buyer increases quantity specifically to seek a better price, the merchant evaluates the package, and they still reach AGREED", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: tradeBuyerConstraints },
+      10,
+    );
+
+    // Round 1: ordinary opening exchange, no trade yet.
+    expect(transcript[0].buyer.quantity).toBe(50);
+    expect(transcript[0].buyer.unitPrice).toBe(43225);
+    expect(transcript[0].merchant.unitPrice).toBe(45613);
+
+    // Round 2: the buyer changes quantity SPECIFICALLY to negotiate price
+    // — both move together in the SAME round, not independently.
+    expect(transcript[1].buyer.quantity).toBe(100); // doubled from the original 50
+    expect(transcript[1].buyer.unitPrice).toBe(43963);
+    // The merchant evaluated the whole package (not just moved its plain
+    // per-round price formula): the countered price reflects a real
+    // stock-driven discount on top of the baseline, and says so.
+    expect(transcript[1].merchant.type).toBe("counter_offer");
+    expect(transcript[1].merchant.quantity).toBe(100); // available stock (150) fully covers the traded quantity
+    expect(transcript[1].merchant.unitPrice).toBe(44664);
+
+    // Round 3: a genuine AGREED close — the trade did not force agreement
+    // on its own; the buyer still only accepts once the merchant's own
+    // (package-evaluated) offer actually satisfies its ceiling.
+    expect(transcript[2].buyer.type).toBe("accept");
+    expect(transcript[2].buyer.unitPrice).toBe(44664);
+    expect(finalState.status).toBe("AGREED");
+
+    // The trade is never used a second time, even though three rounds ran.
+    const buyerQuantities = transcript.map((t) => t.buyer.quantity);
+    expect(buyerQuantities.filter((q) => q === 100)).toHaveLength(2); // round 2's trade, then round 3 mirrors it back
+    expect(buyerQuantities.every((q) => q === 50 || q === 100)).toBe(true); // never a third, escalating value
+  });
+
+  // Counterfactual proving the trade materially changed the merchant's
+  // response, not merely "a different number happened to come out":
+  // the SAME round-2 merchant call, with the SAME baseline inputs,
+  // produces a WORSE price when the quantity increase is absent.
+  it("the quantity trade materially changes the merchant's response compared to an ordinary (non-traded) counter", async () => {
+    const { transcript: traded } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: tradeBuyerConstraints },
+      10,
+    );
+
+    const withoutTrade = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 50, maxUnitPrice: 43999, deliveryDeadlineDays: 10 },
+      { round: 2, maxRounds: 10, previousOfferUnitPrice: 45613 },
+    );
+
+    // Same round, same merchant offer anchor, same buyer price — only the
+    // quantity differs (50, not traded, vs 100, traded) — and yet the
+    // merchant's price differs materially, because it evaluated the
+    // package rather than reacting to price alone.
+    expect(traded[1].merchant.unitPrice!).toBeLessThan(withoutTrade.decision.unitPrice!);
+  });
+
+  // 18. Impossible negotiation still walks away — the quantity-trade
+  // machinery being fully wired in (previousBuyerQuantity threaded,
+  // quantityTradeAlreadyUsed derived every round) never interferes with
+  // Milestone 2's structural walk-away check, which runs before any
+  // concession/trade price is even computed.
+  it("an impossible budget still closes as an early walk-away with the quantity-trade machinery fully wired in", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item,
+        manifestProduct: listing,
+        buyerConstraints: { ...tradeBuyerConstraints, maxUnitPrice: 30000 }, // below item.minPrice (44000)
+      },
+      6,
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+    expect(transcript.length).toBeLessThan(6);
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("reject");
+    expect(closingTurn.merchant.type).toBe("reject");
+  });
+});
+
+// PACT V2 Milestone 6: the two real browser scenarios from the
+// Milestone 5 browser-failure review, promoted to permanent
+// INTEGRATION regression fixtures — exact real-world inputs (the same
+// SKU/catalog the actual dev server serves, the default maxRounds a real
+// browser session uses since the UI never sets one, leverage derived
+// entirely through the real computeLeverage() path via the orchestrator,
+// never hand-supplied), so this specific class of bug (a real,
+// unremarkable browser input silently never triggering strategy that
+// unit tests proved works) cannot regress unnoticed again. Contrast with
+// buyerQuantityTrade.test.ts / buyerQuantitySufficiency.test.ts, which
+// are UNIT tests of the pure decision functions with controlled,
+// hand-picked inputs — both kinds are needed, and neither substitutes
+// for the other (see the Milestone 6 diagnosis for why the original
+// Milestone 5 suite, despite passing 312/312, missed this exact gap).
+describe("real browser scenarios (Milestone 6 regression fixtures)", () => {
+  const item: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 100,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiationEnabled: true,
+  };
+  const listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 100,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiable: true,
+  };
+
+  // Scenario 1: quantity 50, ceiling 45000, medium urgency — the exact
+  // browser inputs that previously never triggered a quantity trade at
+  // all (pre-round leverage 67 was excluded by the old leverage-band
+  // eligibility gate). maxRounds omitted, matching the real UI (which
+  // never sets one, so the API's DEFAULT_MAX_ROUNDS applies).
+  it("Scenario 1 (quantity 50): the quantity trade now fires naturally with real, orchestrator-derived leverage", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion({
+      item,
+      manifestProduct: listing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 50,
+        maxUnitPrice: 45000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+      },
+    });
+
+    // Round 1: unchanged from the original browser report.
+    expect(transcript[0].buyer.unitPrice).toBe(42750);
+    expect(transcript[0].merchant.unitPrice).toBe(45375);
+
+    // Round 2: the buyer now uses its quantity chip — this is the fix.
+    // Leverage here is the real value computeLeverage() produces from
+    // round 1's own price, not a hand-picked test value.
+    expect(transcript[1].buyer.quantity).toBe(100); // doubled from 50
+    expect(transcript[1].buyer.unitPrice).toBe(43032);
+    expect(transcript[1].merchant.quantity).toBe(100); // availableQty (100) fully covers it
+    expect(transcript[1].merchant.unitPrice).toBe(44028);
+
+    expect(transcript[2].buyer.type).toBe("accept");
+    expect(finalState.status).toBe("AGREED");
+  });
+
+  // Scenario 2: quantity 150 against 100 available (a 33% shortfall),
+  // deliveryFlexible true — the exact browser inputs that previously
+  // auto-accepted the partial fulfillment the instant price cleared the
+  // ceiling. maxRounds omitted, matching the real UI.
+  it("Scenario 2 (quantity 150, 100 available): the 33% shortfall is no longer auto-accepted", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion({
+      item,
+      manifestProduct: listing,
+      buyerConstraints: {
+        sku: "LAPTOP-14-I5",
+        quantity: 150,
+        maxUnitPrice: 47000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: true,
+      },
+    });
+
+    // Round 1: unchanged from the original browser report — a genuine
+    // partial fulfillment, not something this milestone touches.
+    expect(transcript[0].merchant.type).toBe("counter_offer");
+    expect(transcript[0].merchant.quantity).toBe(100);
+    expect(transcript[0].merchant.unitPrice).toBe(46125);
+
+    // Round 2: the OLD bug — the buyer accepted 100 units the instant
+    // 46125 cleared its 47000 ceiling. The fix: it does NOT accept here.
+    expect(transcript[1].buyer.type).not.toBe("accept");
+
+    // The negotiation still resolves (does not stall forever) — either
+    // because the merchant's price eventually compensates for the
+    // shortfall on its own merits, or via the same final-rounds
+    // guaranteed-convergence safety net every other strategic overlay in
+    // this codebase already respects.
+    expect(finalState.status).toBe("AGREED");
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.merchant.quantity).toBe(100); // the shortfall itself is never silently inflated
   });
 });

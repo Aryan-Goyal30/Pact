@@ -194,3 +194,25 @@ export async function loadMerchantUnitPriceAtRound(
   });
   return row?.pricePerUnit ?? null;
 }
+
+/**
+ * Milestone 5: whether the buyer has EVER proposed a quantity greater
+ * than its original requested quantity anywhere in this session's
+ * history — i.e. whether the quantity-for-price bargaining chip
+ * (buyerQuantityTrade.ts) has already been used. Deliberately scans the
+ * WHOLE history rather than only the most recent round: a single-round
+ * lookback could "forget" a trade used earlier if the buyer's mirrored
+ * quantity later drops back down (e.g. a subsequent partial-fulfillment
+ * offer), which would wrongly let the chip fire again. No schema
+ * change — reuses the existing NegotiationMessage.quantity column,
+ * same pattern as loadMerchantUnitPriceAtRound above.
+ */
+export async function hasBuyerProposedQuantityAbove(
+  sessionId: string,
+  originalQuantity: number,
+): Promise<boolean> {
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "buyer", quantity: { gt: originalQuantity } },
+  });
+  return row !== null;
+}

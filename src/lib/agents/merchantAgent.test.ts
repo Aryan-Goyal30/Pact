@@ -295,6 +295,175 @@ describe("runMerchantAgent", () => {
     });
   });
 
+  // PACT V2 Milestone 5: buyer-initiated quantity-for-price bargaining,
+  // from the MERCHANT's side. The merchant recognizes a genuine
+  // round-over-round quantity increase (previousBuyerQuantity) even when
+  // the absolute quantity stays below the flat bulk-order threshold
+  // (LARGE_ORDER_QUANTITY_THRESHOLD = 300) — see the trigger-widening in
+  // applyMerchantConcession and the matching hasGenuineIncrease flag now
+  // accepted by merchantTradeEvaluator.evaluateMerchantTrade (Milestone
+  // 1's own verdict logic is otherwise completely untouched). Exact
+  // values verified empirically against the real deterministic formulas,
+  // not hand-derived.
+  describe("quantity-for-price trade recognition (Milestone 5)", () => {
+    const request = { sku: item.sku, quantity: 100, maxUnitPrice: 44100 };
+    const concessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 46000 };
+    const previousBuyerQuantity = 50; // the buyer's ask increased 50 -> 100 this round
+
+    // 6. Attractive quantity-for-price trade with abundant stock.
+    it("an abundant-stock merchant recognizes the increase (100, below the 300 bulk threshold) and grants a real discount", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const response = await runMerchantAgent(
+        abundant,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+      expect(response.decision.offeredQuantity).toBe(100);
+      expect(response.decision.unitPrice).toBe(44485);
+      expect(
+        response.decision.reasons.some((r) => r.includes("increased its requested quantity from 50 to 100")),
+      ).toBe(true);
+      expect(response.decision.reasons.some((r) => r.includes("additional discount"))).toBe(true);
+    });
+
+    // 7. Same proposal with scarce stock produces different behavior.
+    it("the IDENTICAL proposal against scarce stock produces a materially worse price than abundant stock", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+      const medium: CatalogItemSnapshot = { ...item, availableQty: 300 };
+
+      const abundantResponse = await runMerchantAgent(
+        abundant,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+      const mediumResponse = await runMerchantAgent(
+        medium,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(abundantResponse.decision.unitPrice!).toBeLessThan(mediumResponse.decision.unitPrice!);
+      expect(mediumResponse.decision.reasons.some((r) => r.includes("modest additional discount"))).toBe(
+        true,
+      );
+    });
+
+    // Genuinely scarce stock — the existing partial-fulfillment rule
+    // (untouched) still governs quantity; the trade evaluator still runs
+    // on top of whatever price that path produces.
+    it("stock too scarce to fulfill the traded quantity still triggers partial fulfillment, not a full grant", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const scarce: CatalogItemSnapshot = { ...item, availableQty: 40 };
+
+      const response = await runMerchantAgent(
+        scarce,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(response.decision.outcome).toBe("PARTIAL_FULFILLMENT");
+      expect(response.decision.offeredQuantity).toBe(40);
+      expect(response.decision.reasons.some((r) => r.includes("Only 40 unit(s) available"))).toBe(true);
+    });
+
+    // 8. Trade below merchant floor is never accepted.
+    it("never grants a trade-evaluated price below minPrice, however attractive the quantity", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const response = await runMerchantAgent(
+        abundant,
+        { sku: item.sku, quantity: 100, maxUnitPrice: 1 },
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(response.decision.unitPrice).toBe(item.minPrice);
+    });
+
+    // 9, 10. Merchant can counter (not force an accept) or hold/reject an
+    // unattractive package — a genuine increase does not universally
+    // translate into "accept immediately."
+    it("still counters rather than caving outright, even for a recognized genuine increase", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const medium: CatalogItemSnapshot = { ...item, availableQty: 300 };
+
+      const response = await runMerchantAgent(
+        medium,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+      expect(response.decision.unitPrice!).toBeGreaterThan(request.maxUnitPrice);
+    });
+
+    // A quantity that did NOT genuinely increase (same as last round, or
+    // no history at all) never engages the widened trigger — only the
+    // flat bulk threshold can, exactly as before this milestone.
+    it("does not engage the trade evaluator's genuine-increase path when the quantity did not actually increase", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const sameAsLastRound = await runMerchantAgent(
+        abundant,
+        request,
+        concessionContext,
+        undefined,
+        100, // identical to request.quantity -> no increase
+      );
+      const noHistory = await runMerchantAgent(abundant, request, concessionContext, undefined, null);
+
+      for (const response of [sameAsLastRound, noHistory]) {
+        expect(response.decision.reasons.some((r) => r.includes("increased its requested quantity"))).toBe(
+          false,
+        );
+        expect(response.decision.reasons.some((r) => r.includes("additional discount"))).toBe(false);
+      }
+    });
+
+    // 11, 12. Integration: the buyer's trade flows into the merchant's
+    // evaluation correctly, and the response is built entirely from
+    // structured terms (never from the LLM's own text).
+    it("the LLM's invented numbers never leak into the structured decision, even for a trade round", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("We can offer 99999 units at 1 each.");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const response = await runMerchantAgent(
+        abundant,
+        request,
+        concessionContext,
+        undefined,
+        previousBuyerQuantity,
+      );
+
+      expect(response.decision.offeredQuantity).toBe(100);
+      expect(response.decision.unitPrice).toBe(44485);
+      expect(response.offer).toEqual({
+        sku: item.sku,
+        quantity: 100,
+        unitPrice: 44485,
+        deliveryDays: item.standardDeliveryDays,
+      });
+    });
+  });
+
   // PACT V2 Milestone 1: the merchant's conditional quantity <-> price
   // trade evaluator (merchantTradeEvaluator.ts), flowing through the
   // real agent rather than just its own isolated unit tests.

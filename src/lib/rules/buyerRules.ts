@@ -49,6 +49,18 @@ export interface BuyerConstraints {
    * omitted (false) reproduces existing behavior exactly.
    */
   deliveryFlexible?: boolean;
+  /**
+   * Milestone 6: how much shortfall from `quantity` (as a fraction,
+   * e.g. 0.2 = up to 20% less than requested) the buyer will tolerate
+   * without needing the price to compensate for it — see
+   * buyerQuantitySufficiency.ts. Optional: when omitted, a sensible
+   * default is derived purely from `urgency` (see
+   * negotiationStrategy.resolveQuantityShortfallTolerance) — no caller
+   * is required to state this explicitly, and every caller that predates
+   * Milestone 6 (which never even checked for a shortfall floor) still
+   * gets a real, principled default rather than no floor at all.
+   */
+  quantityShortfallTolerance?: number;
 }
 
 /** Converts buyer constraints into the structured request the merchant engine expects. */
@@ -68,12 +80,28 @@ export function isSkuMatch(constraints: BuyerConstraints, proposal: ProposedAgre
   return proposal.sku === constraints.sku;
 }
 
-/** Is the proposed quantity acceptable — positive, and not more than the buyer asked for? */
+/**
+ * Is the proposed quantity acceptable — positive, and not more than the
+ * buyer is actually willing to take?
+ *
+ * `maxAcceptableQuantity` defaults to `constraints.quantity` (the
+ * buyer's original requirement) when omitted — exactly the pre-Milestone-5
+ * behavior every existing caller relies on. Milestone 5's
+ * quantity-for-price trade lets the buyer deliberately ask for MORE than
+ * its original quantity in exchange for a better price (see
+ * buyerQuantityTrade.ts); once it has, the merchant's own offer mirroring
+ * that larger ask must not be rejected here as "too much" — the caller
+ * (buyerAgent.ts) passes the buyer's own most recent ask as the ceiling
+ * in that case. Never affects merchant-side stock limits — those are
+ * checked separately by negotiationEngine.ts's checkQuantityAvailable /
+ * validateProposedAgreement.
+ */
 export function isQuantityAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableQuantity: number = constraints.quantity,
 ): boolean {
-  return proposal.quantity > 0 && proposal.quantity <= constraints.quantity;
+  return proposal.quantity > 0 && proposal.quantity <= maxAcceptableQuantity;
 }
 
 /** Is the proposed unit price at or below the buyer's maximum? */
@@ -103,19 +131,23 @@ export interface BuyerValidationResult {
  * Runs all four buyer-side checks against a merchant's proposal. This is
  * the single gate the Buyer Agent's decision logic goes through — an
  * LLM-proposed "accept" is only ever acted on if this function agrees.
+ *
+ * `maxAcceptableQuantity` — see isQuantityAcceptable — defaults to
+ * `constraints.quantity`, exactly the pre-Milestone-5 behavior.
  */
 export function validateMerchantProposal(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableQuantity: number = constraints.quantity,
 ): BuyerValidationResult {
   const reasons: string[] = [];
 
   if (!isSkuMatch(constraints, proposal)) {
     reasons.push(`Proposal is for ${proposal.sku}, but ${constraints.sku} was requested.`);
   }
-  if (!isQuantityAcceptable(constraints, proposal)) {
+  if (!isQuantityAcceptable(constraints, proposal, maxAcceptableQuantity)) {
     reasons.push(
-      `Offered quantity ${proposal.quantity} is not acceptable (requested up to ${constraints.quantity}).`,
+      `Offered quantity ${proposal.quantity} is not acceptable (requested up to ${maxAcceptableQuantity}).`,
     );
   }
   if (!isPriceAcceptable(constraints, proposal)) {

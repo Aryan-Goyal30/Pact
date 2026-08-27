@@ -2,6 +2,7 @@ import { findCatalogItemBySku } from "@/lib/rules/catalogRepository";
 import { getPublicManifest } from "@/lib/manifest";
 import { runNegotiationTurn } from "@/lib/negotiation/orchestrator";
 import {
+  hasBuyerProposedQuantityAbove,
   loadLatestTurn,
   loadMerchantUnitPriceAtRound,
   loadNegotiationSession,
@@ -145,12 +146,21 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
     const priorMerchantUnitPrice = previousTurn
       ? await loadMerchantUnitPriceAtRound(id, previousTurn.turnNumber - 1)
       : null;
+    // Milestone 5: previousTurn already carries the buyer's quantity for
+    // free (loadLatestTurn's existing DTO); the "chip already used" check
+    // needs a small dedicated history scan (see negotiationSessionRepository.ts).
+    const quantityTradeAlreadyUsed = await hasBuyerProposedQuantityAbove(
+      id,
+      loaded.buyerConstraints.quantity,
+    );
     const turn = await runNegotiationTurn(
       { item, manifestProduct, buyerConstraints: loaded.buyerConstraints },
       loaded.state,
       loaded.previousMerchantResult,
       previousTurn?.buyer.unitPrice ?? null,
       priorMerchantUnitPrice,
+      previousTurn?.buyer.quantity ?? null,
+      quantityTradeAlreadyUsed,
     );
 
     const { turnNumber } = await persistNegotiationTurn(id, turn);
