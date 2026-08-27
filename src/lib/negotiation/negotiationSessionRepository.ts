@@ -172,3 +172,25 @@ export async function loadLatestTurn(
 
   return { turnNumber: latest.round, buyer: toDTO(buyerRow), merchant: toDTO(merchantRow) };
 }
+
+/**
+ * Milestone 3: the merchant's unit price from the round BEFORE the
+ * given one — lets the buyer's move selector (buyerMoveSelector.ts)
+ * detect whether the merchant's most recent offer was genuine forward
+ * progress. Reuses the existing NegotiationMessage history (no schema
+ * change); returns null if that earlier round doesn't exist (e.g. the
+ * buyer's first real counter, where there is only one merchant offer
+ * on record so far).
+ */
+export async function loadMerchantUnitPriceAtRound(
+  sessionId: string,
+  round: number,
+): Promise<number | null> {
+  if (round < 1) {
+    return null;
+  }
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "merchant", round },
+  });
+  return row?.pricePerUnit ?? null;
+}

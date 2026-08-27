@@ -9,6 +9,7 @@ import {
   type NegotiationContext,
 } from "./orchestrator";
 import { getLlmProvider } from "@/lib/llm/provider";
+import * as walkAway from "@/lib/rules/walkAway";
 
 // The LLM is mocked at the provider boundary — every other layer (buyer
 // agent, merchant agent, deterministic engine, state machine) runs for
@@ -25,12 +26,36 @@ vi.mock("@/lib/llm/provider", async (importOriginal) => {
   };
 });
 
-const mockedGetLlmProvider = vi.mocked(getLlmProvider);
+// arePositionsRepeated is spied on (not fully mocked — isPriceGapUnbridgeable
+// stays real via importOriginal) purely so ONE test (see "repeated-position
+// deadlock" below) can force it to report a repeat without needing to
+// mathematically reach one through real price convergence — the
+// concession formulas guarantee accept-or-converge whenever a solution
+// exists, so a genuine non-structural repeat is not reachable through
+// real play (verified empirically while building this milestone); this
+// spy tests the ORCHESTRATOR'S reaction to the signal, decoupled from
+// whether today's formulas can ever organically produce it themselves.
+vi.mock("@/lib/rules/walkAway", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/rules/walkAway")>();
+  return {
+    ...actual,
+    arePositionsRepeated: vi.fn(actual.arePositionsRepeated),
+  };
+});
 
-beforeEach(() => {
+const mockedGetLlmProvider = vi.mocked(getLlmProvider);
+const mockedArePositionsRepeated = vi.mocked(walkAway.arePositionsRepeated);
+
+beforeEach(async () => {
   mockedGetLlmProvider.mockReturnValue({
     generateAgentMessage: vi.fn().mockResolvedValue("mocked agent message"),
   });
+  // Full reset (not just mockClear) so a mockReturnValueOnce queued by a
+  // previous test but left unconsumed can never leak into the next one
+  // — then immediately re-establish the real implementation as the default.
+  const actual = await vi.importActual<typeof import("@/lib/rules/walkAway")>("@/lib/rules/walkAway");
+  mockedArePositionsRepeated.mockReset();
+  mockedArePositionsRepeated.mockImplementation(actual.arePositionsRepeated);
 });
 
 // Mirrors the real seeded LAPTOP-14-I5 catalog item (prisma/seed.ts).
@@ -172,7 +197,14 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
 
     // Buyer: target (42750) on the opening ask, then a progressive
     // counter, never touching its true ceiling (45000) until it has to.
-    expect(transcript.map((t) => t.buyer.unitPrice)).toEqual([42750, 44063, 44719]);
+    // Milestone 4: the buyer's round-2 ask (44063) is a genuine concession
+    // over its round-1 ask (42750) — CONCEDED reciprocity — so the
+    // merchant meets it with a larger-than-baseline concession on round 2,
+    // and the buyer's final accept price drops accordingly (44621, was
+    // 44719 before reciprocity existed). Verified empirically by running
+    // this test after wiring reciprocitySpeedMultiplier through the
+    // orchestrator, not hand-derived.
+    expect(transcript.map((t) => t.buyer.unitPrice)).toEqual([42750, 44063, 44621]);
     // Merchant: gradual concession from its listed-price anchor, closing
     // the moment the buyer's own ceiling is actually met.
     expect(transcript.map((t) => t.merchant.type)).toEqual([
@@ -180,7 +212,10 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
       "counter_offer",
       "accept",
     ]);
-    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([45375, 44719, 44719]);
+    // Round 1 is unaffected (no prior buyer ask yet -> UNKNOWN -> neutral
+    // 1.0 multiplier, same 45375 as before Milestone 4). Round 2 reflects
+    // the CONCEDED reciprocity bonus (44621 instead of 44719).
+    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([45375, 44621, 44621]);
 
     // Every merchant counter strictly decreases — genuine gradual
     // concession, not a static repeat.
@@ -199,6 +234,36 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
     const agreedPrice = transcript[transcript.length - 1].merchant.unitPrice!;
     expect(agreedPrice).toBeGreaterThan(44000);
     expect(agreedPrice).toBeLessThan(45000);
+  });
+
+  // PACT V2 Milestone 4: the orchestrator-level acceptance criterion —
+  // the merchant's FIRST counter differs purely because of the buyer's
+  // (artificial, orchestrator-injected) prior-round history, even though
+  // the buyer's own opening ask this round is IDENTICAL in every case.
+  // Round 1 (previousMerchantResult null) is used deliberately: that
+  // branch of runBuyerAgent never consults previousBuyerUnitPrice for its
+  // own decision (see buyerAgent.ts — the whole move-selector path is
+  // skipped when merchantResult is null), so it's a clean, isolated probe
+  // of the merchant's reaction alone, decoupled from any buyer-side
+  // effect the same value might otherwise have.
+  it("the merchant's opening counter differs when the (injected) buyer history differs, even though the buyer's own current ask is identical", async () => {
+    const state = createNegotiationState(4);
+
+    const buyerConceded = await runNegotiationTurn(demoContext(), state, null, 41000);
+    const buyerHeld = await runNegotiationTurn(demoContext(), state, null, 42750);
+    const buyerWithdrew = await runNegotiationTurn(demoContext(), state, null, 44000);
+
+    // The buyer's own opening ask is unaffected by the injected history —
+    // proves the comparison below isolates the MERCHANT'S reaction.
+    expect(buyerConceded.buyer.unitPrice).toBe(42750);
+    expect(buyerHeld.buyer.unitPrice).toBe(42750);
+    expect(buyerWithdrew.buyer.unitPrice).toBe(42750);
+
+    // The merchant's counter strictly differs, in the direction the
+    // reciprocity design intends: rewarding apparent movement toward it
+    // with a stronger concession, and a withdrawal with the weakest one.
+    expect(buyerConceded.merchant.unitPrice!).toBeLessThan(buyerHeld.merchant.unitPrice!);
+    expect(buyerHeld.merchant.unitPrice!).toBeLessThan(buyerWithdrew.merchant.unitPrice!);
   });
 });
 
@@ -262,10 +327,14 @@ describe("runNegotiationToCompletion — a different product (monitor)", () => {
 
 // 7. Negotiation round count remains bounded.
 describe("runNegotiationToCompletion — bounded rounds when no agreement is possible", () => {
-  it("terminates as EXPIRED, never looping past the configured round limit", async () => {
+  it("terminates as EXPIRED via an early walk-away, never looping to the round limit", async () => {
     // Buyer's ceiling (₹30,000) is below the merchant's private floor
-    // (₹44,000) — no deterministic path to agreement exists, so this
-    // should run out its rounds and stop rather than loop forever.
+    // (₹44,000) — no deterministic path to agreement exists. Before
+    // Milestone 2 (walk-away detection), this ran out every configured
+    // round repeating the same numbers; now the structural-impossibility
+    // check (walkAway.ts) recognizes this after the first real exchange
+    // and closes immediately instead — 2 turns, not 3, even with
+    // maxRounds=2 headroom to spare.
     const context: NegotiationContext = {
       item: laptop,
       manifestProduct: laptopManifestListing,
@@ -280,9 +349,14 @@ describe("runNegotiationToCompletion — bounded rounds when no agreement is pos
     const { transcript, finalState } = await runNegotiationToCompletion(context, 2);
 
     expect(finalState.status).toBe("EXPIRED");
-    // 2 COUNTERED rounds + 1 final EXPIRED attempt.
-    expect(transcript.length).toBe(3);
+    // Turn 1: a real opening exchange (merchant's actual floor-clamped
+    // counter). Turn 2: the walk-away close — not a 3rd repeated round.
+    expect(transcript.length).toBe(2);
+    expect(transcript[0].merchant.unitPrice).toBe(44000); // the merchant's real, floor-clamped counter
     expect(transcript[transcript.length - 1].state.status).toBe("EXPIRED");
+    // Both sides explain why, referencing the real numbers, not a bare repeat.
+    expect(transcript[1].buyer.message).toContain("30000");
+    expect(transcript[1].merchant.message).toBeTruthy();
   });
 });
 
@@ -749,5 +823,258 @@ describe("conditional merchant trade flows through the real orchestrator", () =>
     const abundantFirstOffer = abundantRun.transcript[0].merchant.unitPrice!;
     const scarceFirstOffer = scarceRun.transcript[0].merchant.unitPrice!;
     expect(abundantFirstOffer).toBeLessThan(scarceFirstOffer);
+  });
+});
+
+// PACT V2 Milestone 2: walk-away / deadlock detection.
+describe("walk-away / deadlock detection", () => {
+  const laptop2: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 100,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiationEnabled: true,
+  };
+  const laptop2Listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 100,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiable: true,
+  };
+
+  // A. Impossible budget: buyer max (₹30,000) below merchant floor
+  // (₹44,000) closes early rather than exhausting maxRounds.
+  it("A: an impossible budget gap closes as an early walk-away, not a repeated-number round loop", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 30000, deliveryDeadlineDays: 10 },
+      },
+      4, // generous round budget — the point is closing well before it's used up
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+    expect(transcript.length).toBeLessThan(4);
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("reject");
+    expect(closingTurn.merchant.type).toBe("reject");
+    expect(closingTurn.buyer.message).toContain("30000"); // buyer's authoritative budget
+    expect(closingTurn.merchant.message.length).toBeGreaterThan(0);
+    expect(closingTurn.merchant.message).not.toContain("44000"); // the private floor never appears in the merchant's own message
+  });
+
+  // F (agent-level tests already cover G/H fallback directly) — here,
+  // confirm the orchestrator-level walk-away close never triggers
+  // Agreement-eligible terms: quantity/price/delivery all null, exactly
+  // like the existing reject path, so the turn route's existing
+  // Agreement-creation guard (gated on turn.state.status === "AGREED")
+  // is untouched and this can never create an Agreement.
+  it("a walk-away close carries no structured terms an Agreement could ever be created from", async () => {
+    const { transcript } = await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 30000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.merchant.quantity).toBeNull();
+    expect(closingTurn.merchant.unitPrice).toBeNull();
+    expect(closingTurn.merchant.deliveryDays).toBeNull();
+  });
+
+  // D. Repeated positions: forced via a spy on arePositionsRepeated,
+  // since the concession formulas guarantee accept-or-converge whenever
+  // a solution exists (verified empirically), so a genuine non-structural
+  // repeat cannot be reached through real price computation — this
+  // proves the ORCHESTRATOR correctly reacts to the signal regardless.
+  it("D: a detected repeated-position deadlock closes the negotiation instead of continuing as COUNTERED", async () => {
+    mockedArePositionsRepeated.mockReturnValueOnce(true);
+
+    const state = { status: "COUNTERED" as const, round: 2, maxRounds: 6 };
+    const previousMerchantResult = {
+      outcome: "COUNTER_OFFER" as const,
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 10,
+      offeredQuantity: 10,
+      // Deliberately still above the buyer's ceiling (46000), so the
+      // buyer does NOT immediately accept and actually computes a fresh
+      // counter — reaching the repeated-position check at all requires
+      // the negotiation to still be genuinely open, not already resolved.
+      unitPrice: 47000,
+      deliveryDays: 5,
+      reasons: [],
+    };
+
+    const turn = await runNegotiationTurn(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        // Not structurally impossible (46000 >= 44000) — isolates the
+        // repeated-position path from the structural-impossibility one.
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 46000, deliveryDeadlineDays: 10 },
+      },
+      state,
+      previousMerchantResult,
+      44000, // previousBuyerUnitPrice — value itself is irrelevant since the spy forces the verdict
+    );
+
+    expect(turn.state.status).toBe("EXPIRED");
+    expect(turn.buyer.type).toBe("reject");
+    expect(turn.merchant.type).toBe("reject");
+    expect(mockedArePositionsRepeated).toHaveBeenCalledTimes(1);
+  });
+
+  it("never fires the repeated-position check on a round that is already accepting", async () => {
+    // A high buyer ceiling reaches EXACT_MATCH/accept immediately —
+    // arePositionsRepeated must never even be consulted on that path.
+    await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 90000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+    expect(mockedArePositionsRepeated).not.toHaveBeenCalled();
+  });
+
+  // PACT V2 Milestone 4 regression: reciprocity must never turn an
+  // impossible-budget negotiation into a longer, looping one — the
+  // structural walk-away check (walkAway.isPriceGapUnbridgeable) runs
+  // BEFORE any concession price is even computed, so it is completely
+  // unaffected by whatever speedMultiplier the buyer's (nonexistent, in
+  // this scenario) history would have produced.
+  it("Milestone 4: an impossible budget still closes as an early walk-away with reciprocity wired in, regardless of injected buyer history", async () => {
+    const state = { status: "COUNTERED" as const, round: 1, maxRounds: 6 };
+    const previousMerchantResult = {
+      outcome: "COUNTER_OFFER" as const,
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 10,
+      offeredQuantity: 10,
+      unitPrice: 47000,
+      deliveryDays: 5,
+      reasons: [],
+    };
+    const buyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 10,
+      maxUnitPrice: 30000, // below laptop2.minPrice (44000) -> structurally impossible
+      deliveryDeadlineDays: 10,
+    };
+
+    for (const injectedPriorBuyerPrice of [null, 28000, 30000, 32000]) {
+      const turn = await runNegotiationTurn(
+        { item: laptop2, manifestProduct: laptop2Listing, buyerConstraints },
+        state,
+        previousMerchantResult,
+        injectedPriorBuyerPrice,
+      );
+      expect(turn.state.status).toBe("EXPIRED");
+      expect(turn.merchant.type).toBe("reject");
+    }
+  });
+
+  // F. Non-negotiable item regression: existing REJECTED behavior for a
+  // price mismatch on a non-negotiable item is completely untouched by
+  // the new structural-impossibility check (gated on negotiationEnabled).
+  it("F: a non-negotiable item's price mismatch still follows the existing REJECTED path, not a walk-away", async () => {
+    const nonNegotiable: CatalogItemSnapshot = { ...laptop2, negotiationEnabled: false };
+    const nonNegotiableListing: PublicManifestProduct = { ...laptop2Listing, negotiable: false };
+
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: nonNegotiable,
+        manifestProduct: nonNegotiableListing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 30000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+
+    expect(finalState.status).toBe("REJECTED");
+    expect(transcript).toHaveLength(1); // rejected outright on the opening round, not via walk-away
+  });
+
+  // E. Successful negotiation regression: the flagship scenario still
+  // reaches AGREED, untouched by the new walk-away checks.
+  it("E: a normal, achievable negotiation still reaches AGREED", async () => {
+    const { finalState } = await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 200, maxUnitPrice: 45000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+    expect(finalState.status).toBe("AGREED");
+  });
+});
+
+// PACT V2 Milestone 3: real buyer bargaining strategy, end to end
+// through the full orchestrator (not just buyerAgent.ts's own direct
+// calls) — a genuinely high-leverage buyer (large order against
+// abundant stock) actually holds its position mid-negotiation instead
+// of moving every single round.
+describe("buyer HOLD strategy through the real orchestrator", () => {
+  // A modest, non-scarce (but not abundant-enough-to-trigger-the-stock-
+  // speedup) laptop stock, a low-urgency + delivery-flexible buyer with
+  // a tight-but-achievable ceiling — verified empirically (see the
+  // Milestone 3 report) to produce a genuine, real HOLD round via the
+  // actual concession formulas, not a contrived/mocked one.
+  const item: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 35,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiationEnabled: true,
+  };
+  const listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 35,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 12,
+    negotiable: true,
+  };
+
+  it("a high-leverage buyer holds its price for at least one round instead of moving every round", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item,
+        manifestProduct: listing,
+        buyerConstraints: {
+          sku: "LAPTOP-14-I5",
+          quantity: 20,
+          maxUnitPrice: 44300,
+          deliveryDeadlineDays: 10,
+          urgency: "low",
+          deliveryFlexible: true,
+        },
+      },
+      10, // generous round budget so a hold has room to actually happen before the final-round safety net
+    );
+
+    const buyerPrices = transcript.map((t) => t.buyer.unitPrice).filter((p): p is number => p !== null);
+    const heldSomewhere = buyerPrices.some((price, i) => i > 0 && price === buyerPrices[i - 1]);
+
+    expect(heldSomewhere).toBe(true);
+    // Structural invariants unaffected by holding: never breaches the
+    // buyer's own ceiling, never leaks a value the merchant never stated.
+    for (const price of buyerPrices) {
+      expect(price).toBeLessThanOrEqual(44300);
+    }
+    expect(finalState.status).toBe("AGREED"); // holding didn't prevent a real, achievable deal from closing
   });
 });

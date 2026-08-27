@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
-import { runMerchantAgent } from "./merchantAgent";
+import { runMerchantAgent, runMerchantWalkAway } from "./merchantAgent";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 // The LLM is mocked at the provider boundary for every test in this
@@ -229,6 +229,72 @@ describe("runMerchantAgent", () => {
     });
   });
 
+  // PACT V2 Milestone 4: the merchant reacts to the buyer's OWN prior
+  // move (merchantReciprocity.ts), not just to the buyer's current ask.
+  // Same current maxUnitPrice (45000) and the same concessionContext
+  // (round 2, previousOfferUnitPrice 46500 -> baseline 45750 with no
+  // history signal) throughout; only priorBuyerUnitPrice changes.
+  // Exact values verified empirically (see the scratch probe run in this
+  // milestone's session), not hand-derived.
+  describe("reciprocity (Milestone 4: history-aware, not just current-value)", () => {
+    const request = { sku: item.sku, quantity: 10, maxUnitPrice: 45000 };
+    const concessionContext = { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 };
+
+    it("omitting priorBuyerUnitPrice reproduces the pre-Milestone-4 baseline exactly (UNKNOWN, neutral)", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(item, request, concessionContext);
+      expect(response.decision.unitPrice).toBe(45750);
+    });
+
+    it("a genuine buyer concession (44000 -> 45000) earns a stronger merchant concession than the neutral baseline", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(item, request, concessionContext, 44000);
+      expect(response.decision.unitPrice).toBe(45638);
+      expect(response.decision.unitPrice!).toBeLessThan(45750);
+      expect(response.decision.reasons.some((r) => r.includes("moved toward the merchant"))).toBe(true);
+    });
+
+    it("a held buyer position (45000 -> 45000) earns a weaker merchant concession than the neutral baseline", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(item, request, concessionContext, 45000);
+      expect(response.decision.unitPrice).toBe(45938);
+      expect(response.decision.unitPrice!).toBeGreaterThan(45750);
+      expect(response.decision.reasons.some((r) => r.includes("hasn't moved"))).toBe(true);
+    });
+
+    it("a withdrawn buyer position (46000 -> 45000) earns the weakest merchant concession of all", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(item, request, concessionContext, 46000);
+      expect(response.decision.unitPrice).toBe(46050);
+      expect(response.decision.reasons.some((r) => r.includes("moved away from the merchant"))).toBe(true);
+    });
+
+    // The headline acceptance criterion: identical current buyer ask,
+    // identical everything else, only the buyer's PRIOR ask differs — and
+    // the merchant's price differs solely because of that history, not
+    // because any input to the price formula itself changed.
+    it("the SAME current ask produces genuinely different merchant behavior depending only on buyer history", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const conceded = await runMerchantAgent(item, request, concessionContext, 44000);
+      const held = await runMerchantAgent(item, request, concessionContext, 45000);
+      const withdrew = await runMerchantAgent(item, request, concessionContext, 46000);
+
+      expect(conceded.decision.unitPrice!).toBeLessThan(held.decision.unitPrice!);
+      expect(held.decision.unitPrice!).toBeLessThan(withdrew.decision.unitPrice!);
+    });
+
+    it("still respects the final [minPrice, listedPrice] clamp even in the reciprocity-active round range", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runMerchantAgent(
+        item,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 1 },
+        concessionContext, // round 2 of 4 -> the reciprocity-active branch
+        50000, // WITHDREW: current (1) far below prior (50000), most conservative multiplier
+      );
+      expect(response.decision.unitPrice).toBe(item.minPrice);
+    });
+  });
+
   // PACT V2 Milestone 1: the merchant's conditional quantity <-> price
   // trade evaluator (merchantTradeEvaluator.ts), flowing through the
   // real agent rather than just its own isolated unit tests.
@@ -443,5 +509,54 @@ describe("runMerchantAgent", () => {
         "network exploded",
       );
     });
+  });
+});
+
+// PACT V2 Milestone 2: the merchant's deterministic walk-away decision.
+describe("runMerchantWalkAway", () => {
+  it("the message communicates inability to meet the buyer's ask, without ever stating a private minimum", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      "We understand, but we're unable to meet 30000 per unit for this order while remaining viable.",
+    );
+
+    const { message } = await runMerchantWalkAway(30000, "price_gap_unbridgeable");
+
+    expect(message).toContain("30000");
+    expect(message).not.toContain("44000"); // the seeded LAPTOP-14-I5 private floor must never appear
+  });
+
+  it("falls back to a deterministic message when the LLM response fails integrity validation", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("*** a Sentence");
+
+    const { message } = await runMerchantWalkAway(30000, "price_gap_unbridgeable");
+
+    expect(message).not.toContain("***");
+    expect(message).toContain("30000");
+  });
+
+  it("falls back to a deterministic message when no LLM provider is configured", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const { message } = await runMerchantWalkAway(30000, "price_gap_unbridgeable");
+
+    expect(message.length).toBeGreaterThan(0);
+    expect(message).toContain("30000");
+  });
+
+  it("still propagates a non-key-related error instead of masking it", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new Error("network exploded"));
+
+    await expect(runMerchantWalkAway(30000, "price_gap_unbridgeable")).rejects.toThrow(
+      "network exploded",
+    );
+  });
+
+  it("produces a distinct message for a repeated-positions walk-away vs a price-gap walk-away", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const priceGap = await runMerchantWalkAway(30000, "price_gap_unbridgeable");
+    const repeated = await runMerchantWalkAway(30000, "repeated_positions");
+
+    expect(priceGap.message).not.toBe(repeated.message);
   });
 });

@@ -27,7 +27,6 @@
 import type { PublicManifestProduct } from "@/types/manifest";
 import type { NegotiationResult, ProposedAgreement } from "@/lib/rules/negotiationEngine";
 import {
-  computeBuyerConcessionPrice,
   resolveBuyerTarget,
   validateMerchantProposal,
   type BuyerConcessionContext,
@@ -35,6 +34,8 @@ import {
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
+import { decideBuyerConcessionMove, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
+import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
@@ -51,6 +52,21 @@ export interface BuyerAgentResponse {
   message: string;
   /** Which strategic factors (urgency, quantity leverage, remaining rounds) shaped this action — see negotiationStrategy.explainBuyerFactors. Empty when none applied (e.g. an outright accept/reject, or no round context). */
   strategicReasons: string[];
+}
+
+/**
+ * Optional Milestone 3 inputs for the buyer's HOLD-vs-CONCEDE decision
+ * (buyerMoveSelector.ts). All optional and additive: a caller that omits
+ * this entirely gets the exact pre-Milestone-3 behavior (always
+ * concede) — see decideBuyerConcessionMove's own defaults.
+ */
+export interface BuyerStrategyContext {
+  /** The merchant's unit price from one round before the offer being reacted to now — lets the buyer detect whether the merchant's most recent move was genuine progress. */
+  priorMerchantUnitPrice?: number | null;
+  /** The buyer's own previous-round unit price — the price HOLD repeats. */
+  previousBuyerUnitPrice?: number | null;
+  /** The buyer's live 0-100 leverage score (see leverage.ts), computed by the orchestrator from data buyerAgent.ts never itself has access to (item.minPrice) — only the aggregate public score crosses this boundary, the same one already sent to the browser. */
+  leverageScore?: number;
 }
 
 const BUYER_SYSTEM_PROMPT = `You are PACT's Buyer Agent, communicating with a merchant's AI agent on behalf of the buyer.
@@ -95,7 +111,13 @@ function buildResponseToMerchantOffer(
   constraints: BuyerConstraints,
   merchantResult: NegotiationResult,
   concessionContext?: BuyerConcessionContext,
-): { action: BuyerAction; validation: BuyerValidationResult } {
+  strategyContext?: BuyerStrategyContext,
+): {
+  action: BuyerAction;
+  validation: BuyerValidationResult;
+  move: BuyerMove | null;
+  moveReason: string | null;
+} {
   if (
     merchantResult.outcome === "REJECTED" ||
     merchantResult.offeredQuantity === null ||
@@ -105,6 +127,8 @@ function buildResponseToMerchantOffer(
     return {
       action: { type: "reject", sku: constraints.sku, quantity: null, unitPrice: null, deliveryDays: null },
       validation: { outcome: "UNACCEPTABLE", reasons: merchantResult.reasons },
+      move: null,
+      moveReason: null,
     };
   }
 
@@ -118,27 +142,53 @@ function buildResponseToMerchantOffer(
   const validation = validateMerchantProposal(constraints, proposal);
 
   if (validation.outcome === "ACCEPTABLE") {
-    return { action: { type: "accept", ...proposal }, validation };
+    return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null };
   }
 
   // Not acceptable yet. Adopt whatever quantity/delivery the merchant
   // already offered — no reason to keep re-asking for terms it has
-  // already granted — and move the price gradually toward (but never
-  // past) the buyer's ceiling. With a round context, that movement is
-  // the progressive computeBuyerConcessionPrice strategy; without one
-  // (a caller that predates this option), it holds flat at
-  // maxUnitPrice, exactly as before.
+  // already granted. The PRICE is where the buyer now genuinely
+  // decides whether moving is worthwhile (buyerMoveSelector.ts) rather
+  // than always conceding: HOLD repeats the buyer's own previous price,
+  // CONCEDE uses the existing round-aware computeBuyerConcessionPrice
+  // formula, completely unchanged. Without a round context (a caller
+  // that predates this option), it holds flat at maxUnitPrice, exactly
+  // as before Phase 5B even existed.
+  if (!concessionContext) {
+    return {
+      action: {
+        type: "counter_offer",
+        sku: constraints.sku,
+        quantity: proposal.quantity,
+        unitPrice: constraints.maxUnitPrice,
+        deliveryDays: proposal.deliveryDays,
+      },
+      validation,
+      move: null,
+      moveReason: null,
+    };
+  }
+
+  const decision = decideBuyerConcessionMove(
+    constraints,
+    proposal.unitPrice,
+    concessionContext,
+    strategyContext?.priorMerchantUnitPrice,
+    strategyContext?.previousBuyerUnitPrice,
+    strategyContext?.leverageScore,
+  );
+
   return {
     action: {
       type: "counter_offer",
       sku: constraints.sku,
       quantity: proposal.quantity,
-      unitPrice: concessionContext
-        ? computeBuyerConcessionPrice(constraints, proposal.unitPrice, concessionContext)
-        : constraints.maxUnitPrice,
+      unitPrice: decision.unitPrice,
       deliveryDays: proposal.deliveryDays,
     },
     validation,
+    move: decision.move,
+    moveReason: decision.reason,
   };
 }
 
@@ -173,18 +223,26 @@ export async function runBuyerAgent(
   manifestProduct: PublicManifestProduct,
   merchantResult: NegotiationResult | null,
   concessionContext?: BuyerConcessionContext,
+  strategyContext?: BuyerStrategyContext,
 ): Promise<BuyerAgentResponse> {
-  const { action, validation } =
+  const { action, validation, moveReason } =
     merchantResult === null
-      ? { action: buildOpeningRequest(constraints, manifestProduct, concessionContext), validation: null }
-      : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext);
+      ? {
+          action: buildOpeningRequest(constraints, manifestProduct, concessionContext),
+          validation: null,
+          moveReason: null,
+        }
+      : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext, strategyContext);
 
   const roundsLeft = concessionContext
     ? Math.max(1, concessionContext.maxRounds - concessionContext.round + 1)
     : Number.POSITIVE_INFINITY;
   const strategicReasons =
     action.type === "request" || action.type === "counter_offer"
-      ? explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft)
+      ? [
+          ...explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft),
+          ...(moveReason ? [moveReason] : []),
+        ]
       : [];
 
   // The block the LLM must treat as immutable fact — every number here
@@ -248,4 +306,67 @@ export async function runBuyerAgent(
   }
 
   return { action, validation, message, strategicReasons };
+}
+
+/**
+ * Deterministic, non-LLM walk-away caption — built entirely from real
+ * numbers already known to the buyer (its own maxUnitPrice, and the
+ * merchant's own last stated offer, which is public), so it never
+ * fabricates a number or a reason.
+ */
+function buildFallbackBuyerWalkAwayMessage(
+  reason: WalkAwayReason,
+  maxUnitPrice: number,
+  merchantOfferUnitPrice: number,
+): string {
+  if (reason === "repeated_positions") {
+    return `We don't appear to be converging — my maximum remains ${maxUnitPrice} per unit, below your ${merchantOfferUnitPrice}, so I have to end this negotiation here.`;
+  }
+  return `${merchantOfferUnitPrice} per unit is above my maximum budget of ${maxUnitPrice}, so I can't proceed.`;
+}
+
+/**
+ * Runs the Buyer Agent's walk-away decision: the deterministic layer
+ * (walkAway.ts, consulted by the orchestrator) has already decided the
+ * negotiation cannot succeed — this only phrases that decision. Carries
+ * no quantity/delivery/price terms of its own (there is no offer on the
+ * table to state), mirroring the existing "reject" action's shape.
+ */
+export async function runBuyerWalkAway(
+  constraints: BuyerConstraints,
+  merchantOfferUnitPrice: number,
+  reason: WalkAwayReason,
+): Promise<{ message: string }> {
+  const authoritativeFacts = {
+    side: "BUYER" as const,
+    action: "walk_away",
+    reason,
+    ownMaxUnitPrice: constraints.maxUnitPrice,
+    merchantOfferUnitPrice,
+  };
+  const context = { authoritativeFacts };
+
+  let message: string;
+  try {
+    const generated = await getLlmProvider().generateAgentMessage({
+      systemPrompt: BUYER_SYSTEM_PROMPT,
+      context,
+      instruction:
+        "Generate only the natural-language message explaining that the buyer is walking away from this negotiation — the terms cannot be reconciled. Do not invent, change, or round any number. State clearly that the merchant's price (merchantOfferUnitPrice) exceeds the buyer's maximum budget (ownMaxUnitPrice). Do not propose new numbers or suggest the negotiation could still continue.",
+    });
+    const check = checkAgentMessageIntegrity(generated, [constraints.maxUnitPrice, merchantOfferUnitPrice], context);
+    if (check.valid) {
+      message = generated;
+    } else {
+      console.warn(`Buyer Agent walk-away message failed integrity check, falling back: ${check.reason}`);
+      message = buildFallbackBuyerWalkAwayMessage(reason, constraints.maxUnitPrice, merchantOfferUnitPrice);
+    }
+  } catch (error) {
+    if (!(error instanceof LlmUnavailableError)) {
+      throw error;
+    }
+    message = buildFallbackBuyerWalkAwayMessage(reason, constraints.maxUnitPrice, merchantOfferUnitPrice);
+  }
+
+  return { message };
 }

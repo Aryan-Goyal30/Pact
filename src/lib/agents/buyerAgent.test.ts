@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NegotiationResult } from "@/lib/rules/negotiationEngine";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import type { PublicManifestProduct } from "@/types/manifest";
-import { runBuyerAgent } from "./buyerAgent";
+import { runBuyerAgent, runBuyerWalkAway } from "./buyerAgent";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
 // LlmUnavailableError is kept real (via importOriginal) so the
@@ -283,5 +283,177 @@ describe("runBuyerAgent", () => {
         "network exploded",
       );
     });
+  });
+});
+
+// PACT V2 Milestone 3: the buyer's HOLD-vs-CONCEDE strategy, wired
+// through the real runBuyerAgent (not just buyerMoveSelector.ts's own
+// isolated unit tests) — proves the plumbing (concessionContext +
+// strategyContext) actually reaches the decision.
+describe("runBuyerAgent — HOLD vs CONCEDE strategy", () => {
+  const stuckMerchantResult: NegotiationResult = {
+    outcome: "COUNTER_OFFER",
+    sku: "LAPTOP-14-I5",
+    requestedQuantity: 200,
+    offeredQuantity: 200,
+    unitPrice: 46500,
+    deliveryDays: 10,
+    reasons: [],
+  };
+
+  it("A: holds at its own previous price when the merchant hasn't moved since its prior offer", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 }, // merchant's offer unchanged
+    );
+
+    expect(response.action.type).toBe("counter_offer");
+    expect(response.action.unitPrice).toBe(43700); // repeated, not moved
+    expect(response.strategicReasons.some((r) => r.toLowerCase().includes("has not moved"))).toBe(true);
+  });
+
+  it("B: concedes (a controlled, clamped move) when the merchant did move", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 47200, previousBuyerUnitPrice: 43700 }, // merchant improved from 47200 -> 46500
+    );
+
+    expect(response.action.type).toBe("counter_offer");
+    expect(response.action.unitPrice).toBeGreaterThan(43700);
+    expect(response.action.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
+  });
+
+  // E. Same buyer state, different merchant movement -> different decision.
+  it("E: identical buyer state produces a different action depending only on whether the merchant moved", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const context = { round: 3, maxRounds: 8 } as const;
+
+    const merchantMoved = await runBuyerAgent(constraints, manifestProduct, stuckMerchantResult, context, {
+      priorMerchantUnitPrice: 47200,
+      previousBuyerUnitPrice: 43700,
+    });
+    const merchantStalled = await runBuyerAgent(constraints, manifestProduct, stuckMerchantResult, context, {
+      priorMerchantUnitPrice: 46500,
+      previousBuyerUnitPrice: 43700,
+    });
+
+    expect(merchantMoved.action.unitPrice).not.toBe(merchantStalled.action.unitPrice);
+    expect(merchantStalled.action.unitPrice).toBe(43700); // held
+  });
+
+  // F. Leverage shifts the decision while staying within hard constraints.
+  it("F: higher buyer leverage shifts the decision toward holding, without ever exceeding maxUnitPrice", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const context = { round: 3, maxRounds: 8 } as const;
+    const history = { priorMerchantUnitPrice: 47200, previousBuyerUnitPrice: 43700 }; // merchant moved slightly
+
+    const lowLeverage = await runBuyerAgent(constraints, manifestProduct, stuckMerchantResult, context, {
+      ...history,
+      leverageScore: 15,
+    });
+    const highLeverage = await runBuyerAgent(constraints, manifestProduct, stuckMerchantResult, context, {
+      ...history,
+      leverageScore: 85,
+    });
+
+    expect(highLeverage.action.unitPrice).toBe(43700); // held despite the merchant moving
+    expect(lowLeverage.action.unitPrice).not.toBe(43700); // conceded
+    expect(lowLeverage.action.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    expect(highLeverage.action.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
+  });
+
+  it("still concedes to the true ceiling in the final rounds regardless of leverage or merchant movement", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 7, maxRounds: 8 }, // roundsLeft = 2
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700, leverageScore: 95 },
+    );
+
+    expect(response.action.unitPrice).toBe(constraints.maxUnitPrice);
+  });
+});
+
+// PACT V2 Milestone 2: the buyer's deterministic walk-away decision.
+describe("runBuyerWalkAway", () => {
+  it("the message states the buyer's own maximum budget and the merchant's offer that exceeded it", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      "44000 per unit is above my maximum budget of 30000, so I can't proceed.",
+    );
+
+    const { message } = await runBuyerWalkAway(
+      { ...constraints, maxUnitPrice: 30000 },
+      44000,
+      "price_gap_unbridgeable",
+    );
+
+    expect(message).toContain("30000");
+    expect(message).toContain("44000");
+  });
+
+  it("falls back to a deterministic message when the LLM response fails integrity validation", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("*** a Sentence");
+
+    const { message } = await runBuyerWalkAway(
+      { ...constraints, maxUnitPrice: 30000 },
+      44000,
+      "price_gap_unbridgeable",
+    );
+
+    expect(message).not.toContain("***");
+    expect(message).toContain("30000");
+    expect(message).toContain("44000");
+  });
+
+  it("falls back to a deterministic message when no LLM provider is configured", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const { message } = await runBuyerWalkAway(
+      { ...constraints, maxUnitPrice: 30000 },
+      44000,
+      "price_gap_unbridgeable",
+    );
+
+    expect(message.length).toBeGreaterThan(0);
+    expect(message).toContain("30000");
+    expect(message).toContain("44000");
+  });
+
+  it("still propagates a non-key-related error instead of masking it", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new Error("network exploded"));
+
+    await expect(
+      runBuyerWalkAway({ ...constraints, maxUnitPrice: 30000 }, 44000, "price_gap_unbridgeable"),
+    ).rejects.toThrow("network exploded");
+  });
+
+  it("produces a distinct message for a repeated-positions walk-away vs a price-gap walk-away", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const priceGap = await runBuyerWalkAway(
+      { ...constraints, maxUnitPrice: 30000 },
+      44000,
+      "price_gap_unbridgeable",
+    );
+    const repeated = await runBuyerWalkAway(
+      { ...constraints, maxUnitPrice: 30000 },
+      44000,
+      "repeated_positions",
+    );
+
+    expect(priceGap.message).not.toBe(repeated.message);
   });
 });

@@ -30,14 +30,16 @@ import {
   acceptNegotiation,
   advanceNegotiationState,
   createNegotiationState,
+  expireNegotiation,
   rejectNegotiation,
   type NegotiationState,
   type NegotiationStatus,
 } from "@/lib/rules/negotiationState";
-import { runBuyerAgent, type BuyerAction } from "@/lib/agents/buyerAgent";
-import { runMerchantAgent } from "@/lib/agents/merchantAgent";
+import { runBuyerAgent, runBuyerWalkAway, type BuyerAction } from "@/lib/agents/buyerAgent";
+import { runMerchantAgent, runMerchantWalkAway } from "@/lib/agents/merchantAgent";
 import type { StructuredNegotiationMessage } from "@/lib/negotiation/protocol";
 import { computeLeverage, type LeverageScore } from "@/lib/rules/leverage";
+import { arePositionsRepeated, isPriceGapUnbridgeable, type WalkAwayReason } from "@/lib/rules/walkAway";
 
 export interface NegotiationContext {
   item: CatalogItemSnapshot;
@@ -120,6 +122,25 @@ export async function runNegotiationTurn(
   context: NegotiationContext,
   state: NegotiationState,
   previousMerchantResult: NegotiationResult | null,
+  /**
+   * The buyer's own previous-round unit price, if any — used for
+   * repeated-position deadlock detection (walkAway.ts) AND, as of
+   * Milestone 3, as the price buyerMoveSelector.ts's HOLD move repeats.
+   * Optional and additive: every existing caller that predates this
+   * parameter behaves exactly as before, since omitting it simply means
+   * the repeated-position check can never fire and the buyer's HOLD
+   * falls back to its own aspirational target instead.
+   */
+  previousBuyerUnitPrice?: number | null,
+  /**
+   * The merchant's unit price from ONE ROUND BEFORE previousMerchantResult
+   * — Milestone 3: lets the buyer's move selector detect whether the
+   * merchant's most recent offer was genuine forward progress or a
+   * repeat, without the buyer ever seeing item.minPrice. Optional and
+   * additive: omitting it makes the buyer treat every offer as "the
+   * merchant moved" (today's pre-Milestone-3 behavior — always concede).
+   */
+  priorMerchantUnitPrice?: number | null,
 ): Promise<NegotiationTurnResult> {
   if (TERMINAL_STATUSES.includes(state.status)) {
     throw new Error(
@@ -141,11 +162,81 @@ export async function runNegotiationTurn(
     return { ...core, leverage };
   }
 
+  // Milestone 2: closes the negotiation as a legitimate walk-away
+  // (EXPIRED — a real outcome, not a system failure) instead of another
+  // round of negotiation. Both buyer and merchant explain why through
+  // the same LLM -> integrity -> fallback pipeline every other message
+  // in this codebase already goes through; walkAway.ts never decides
+  // price/quantity/delivery, only whether to stop.
+  async function buildWalkAwayTurn(
+    reason: WalkAwayReason,
+    merchantOfferUnitPrice: number,
+    buyerAskUnitPrice: number,
+  ): Promise<NegotiationTurnResultCore> {
+    const [buyerWalkAway, merchantWalkAway] = await Promise.all([
+      runBuyerWalkAway(context.buyerConstraints, merchantOfferUnitPrice, reason),
+      runMerchantWalkAway(buyerAskUnitPrice, reason),
+    ]);
+
+    const walkAwayMessage = (
+      sender: "buyer" | "merchant",
+      message: string,
+    ): StructuredNegotiationMessage => ({
+      sender,
+      type: "reject",
+      sku: context.buyerConstraints.sku,
+      quantity: null,
+      unitPrice: null,
+      deliveryDays: null,
+      message,
+    });
+
+    return {
+      state: expireNegotiation(state),
+      buyer: walkAwayMessage("buyer", buyerWalkAway.message),
+      merchant: walkAwayMessage("merchant", merchantWalkAway.message),
+      nextMerchantResult: null,
+    };
+  }
+
+  // Structural impossibility: the buyer's ceiling is below the
+  // merchant's floor, so no further round could ever succeed. Checked
+  // only from the second call onward (previousMerchantResult !== null)
+  // so the merchant's real, floor-clamped opening counter is still
+  // visible in the transcript first — this closes on the NEXT turn
+  // instead of repeating that same offer for the remaining rounds.
+  if (
+    previousMerchantResult !== null &&
+    previousMerchantResult.unitPrice !== null &&
+    isPriceGapUnbridgeable(context.item, context.buyerConstraints)
+  ) {
+    return finish(
+      await buildWalkAwayTurn(
+        "price_gap_unbridgeable",
+        previousMerchantResult.unitPrice,
+        context.buyerConstraints.maxUnitPrice,
+      ),
+    );
+  }
+
+  // Milestone 3: the buyer's own pre-round leverage score, computed from
+  // the LAST round's merchant price (this round's hasn't been decided
+  // yet) — only the aggregate 0-100 number crosses into buyerAgent.ts,
+  // never context.item itself, preserving buyerAgent.ts's existing
+  // invariant that it never sees item.minPrice or any other private
+  // catalog field.
+  const buyerLeverageScore = computeLeverage({
+    item: context.item,
+    buyerConstraints: context.buyerConstraints,
+    currentMerchantUnitPrice: previousMerchantResult?.unitPrice ?? null,
+  }).buyerLeverage;
+
   const buyerResponse = await runBuyerAgent(
     context.buyerConstraints,
     context.manifestProduct,
     previousMerchantResult,
     { round: state.round + 1, maxRounds: state.maxRounds },
+    { priorMerchantUnitPrice, previousBuyerUnitPrice, leverageScore: buyerLeverageScore },
   );
   const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
 
@@ -215,6 +306,12 @@ export async function runNegotiationTurn(
       maxRounds: state.maxRounds,
       previousOfferUnitPrice: previousMerchantResult?.unitPrice ?? undefined,
     },
+    // Milestone 4: previousBuyerUnitPrice is already threaded into this
+    // function for walk-away/HOLD purposes — reused here, unchanged, so
+    // the merchant can now react to whether the buyer's CURRENT ask
+    // (buyerResponse.action.unitPrice, above) is a genuine concession
+    // from its own prior ask, a hold, or a withdrawal.
+    previousBuyerUnitPrice,
   );
   const merchantResult = merchantAgentResponse.decision;
 
@@ -249,6 +346,27 @@ export async function runNegotiationTurn(
   }
 
   const nextState = advanceNegotiationState(state, merchantResult.outcome);
+
+  // Repeated-position deadlock: only relevant when the negotiation would
+  // otherwise continue as COUNTERED (never overrides an already-accepted
+  // or already-rejected round) — both sides' prices exactly matching
+  // their own previous round is treated as sufficient evidence that
+  // neither has anything left to concede.
+  if (
+    nextState.status === "COUNTERED" &&
+    arePositionsRepeated(
+      { buyerUnitPrice: buyerResponse.action.unitPrice, merchantUnitPrice: merchantResult.unitPrice },
+      { buyerUnitPrice: previousBuyerUnitPrice, merchantUnitPrice: previousMerchantResult?.unitPrice },
+    )
+  ) {
+    return finish(
+      await buildWalkAwayTurn(
+        "repeated_positions",
+        merchantResult.unitPrice as number,
+        buyerResponse.action.unitPrice as number,
+      ),
+    );
+  }
 
   return finish({
     state: nextState,
@@ -290,7 +408,18 @@ export async function runNegotiationToCompletion(
   const safetyLimit = state.maxRounds + 3;
 
   while (!TERMINAL_STATUSES.includes(state.status)) {
-    const turn = await runNegotiationTurn(context, state, previousMerchantResult);
+    const previousBuyerUnitPrice = transcript[transcript.length - 1]?.buyer.unitPrice ?? null;
+    // The merchant's price from ONE ROUND BEFORE previousMerchantResult
+    // — i.e. two turns back in the transcript — see runNegotiationTurn's
+    // priorMerchantUnitPrice parameter.
+    const priorMerchantUnitPrice = transcript[transcript.length - 2]?.merchant.unitPrice ?? null;
+    const turn = await runNegotiationTurn(
+      context,
+      state,
+      previousMerchantResult,
+      previousBuyerUnitPrice,
+      priorMerchantUnitPrice,
+    );
     transcript.push(turn);
     state = turn.state;
     previousMerchantResult = turn.nextMerchantResult;

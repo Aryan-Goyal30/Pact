@@ -217,6 +217,51 @@ describe("computeMerchantConcessionPrice", () => {
     expect(settled).toBe(8800);
     expect(settled).toBeGreaterThanOrEqual(monitor.minPrice);
   });
+
+  // Milestone 4: reciprocitySpeedMultiplier — omitting it must reproduce
+  // the exact pre-Milestone-4 formula (every existing caller/test).
+  describe("reciprocitySpeedMultiplier", () => {
+    it("omitting it reproduces the exact formula from before this option existed", () => {
+      const withoutMultiplier = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const withNeutralMultiplier = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1,
+      });
+      expect(withoutMultiplier).toBe(withNeutralMultiplier);
+    });
+
+    it("a multiplier above 1 concedes further than the baseline; below 1 concedes less", () => {
+      const baseline = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const rewarded = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1.15,
+      });
+      const withheld = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 0.75,
+      });
+
+      expect(rewarded).toBeLessThan(baseline); // concedes further (lower price) than baseline
+      expect(withheld).toBeGreaterThan(baseline); // concedes less (higher price) than baseline
+    });
+
+    it("never breaches [minPrice, listedPrice], even with an aggressive multiplier", () => {
+      const price = computeMerchantConcessionPrice(item, 1, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1.15,
+      });
+      expect(price).toBeGreaterThanOrEqual(item.minPrice);
+      expect(price).toBeLessThanOrEqual(item.listedPrice);
+    });
+
+    it("does not apply in the final-2-rounds settle-at-ceiling branch — the guaranteed-convergence safety net is unaffected", () => {
+      const withheld = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(4, 900),
+        reciprocitySpeedMultiplier: 0.6,
+      });
+      expect(withheld).toBe(900); // identical to the unmultiplied final-round settlement
+    });
+  });
 });
 
 describe("validateProposedAgreement", () => {

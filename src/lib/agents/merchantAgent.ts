@@ -22,6 +22,8 @@ import {
   resolveDeliveryTrade,
 } from "@/lib/rules/negotiationStrategy";
 import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
+import { evaluateBuyerReciprocity } from "@/lib/rules/merchantReciprocity";
+import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
@@ -117,12 +119,23 @@ function toPublicContext(result: NegotiationResult): Record<string, unknown> {
  * meets or beats the listed price (no negotiation needed at all), or
  * the outcome isn't one that carries a negotiated price in the first
  * place (REJECTED / no price adjustment needed).
+ *
+ * Milestone 4: `priorBuyerUnitPrice` (the buyer's own ask from one round
+ * before the one being reacted to now) drives evaluateBuyerReciprocity
+ * (merchantReciprocity.ts), which produces a speed multiplier folded
+ * into the SAME baseline calculation the trade evaluator already
+ * consumes — so a buyer concession/hold/withdrawal is reflected in the
+ * baseline BEFORE evaluateMerchantTrade ever runs, without that
+ * function (Milestone 1) needing to change at all. Omitted (undefined)
+ * reproduces exactly today's behavior — see
+ * evaluateBuyerReciprocity's UNKNOWN case.
  */
 function applyMerchantConcession(
   item: CatalogItemSnapshot,
   request: NegotiationRequest,
   decision: NegotiationResult,
   concessionContext: MerchantConcessionContext,
+  priorBuyerUnitPrice?: number | null,
 ): NegotiationResult {
   if (
     request.maxUnitPrice === undefined ||
@@ -138,9 +151,12 @@ function applyMerchantConcession(
       ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
       : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
 
+  const reciprocity = evaluateBuyerReciprocity(request.maxUnitPrice, priorBuyerUnitPrice);
+
   const baselineConcessionPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
     ...concessionContext,
     deliveryTradeDiscount: trade.discount,
+    reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
   });
 
   const tradeEvaluation = hasQuantityLeverage(request.quantity)
@@ -160,6 +176,7 @@ function applyMerchantConcession(
     .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
     .concat(
       `Countering with an adjusted unit price of ${finalPrice} instead of the listed ${item.listedPrice}.`,
+      ...(reciprocity.reason ? [reciprocity.reason] : []),
       ...(tradeEvaluation ? [tradeEvaluation.reason] : []),
       // quantityLeveraged is false here — the trade evaluation above
       // already supplies a more specific quantity reason when relevant,
@@ -224,15 +241,21 @@ function toOffer(result: NegotiationResult): MerchantAgentOffer | null {
  * single-shot "meet in the middle once" price. Omitting it (every
  * existing single-shot caller, e.g. POST /api/negotiate) leaves
  * behavior exactly as it was before this option existed.
+ *
+ * `priorBuyerUnitPrice` (Milestone 4) is likewise optional — the
+ * buyer's own ask from one round before the one in `request`, used only
+ * for reciprocity (merchantReciprocity.ts). Omitting it leaves the
+ * merchant's concession exactly as strong as before this milestone.
  */
 export async function runMerchantAgent(
   item: CatalogItemSnapshot | null,
   request: NegotiationRequest,
   concessionContext?: MerchantConcessionContext,
+  priorBuyerUnitPrice?: number | null,
 ): Promise<MerchantAgentResponse> {
   let decision = evaluateNegotiationRequest(item, request);
   if (item && concessionContext) {
-    decision = applyMerchantConcession(item, request, decision, concessionContext);
+    decision = applyMerchantConcession(item, request, decision, concessionContext, priorBuyerUnitPrice);
   }
 
   const context = toPublicContext(decision);
@@ -272,4 +295,64 @@ export async function runMerchantAgent(
     offer: toOffer(decision),
     message,
   };
+}
+
+/**
+ * Deterministic, non-LLM walk-away caption. Built entirely from the
+ * buyer's own stated ask (public — the buyer said it) — never from
+ * item.minPrice, which must never reach this message or its LLM
+ * context, exactly like every other merchant-facing message in this
+ * codebase.
+ */
+function buildFallbackMerchantWalkAwayMessage(reason: WalkAwayReason, buyerAskUnitPrice: number): string {
+  if (reason === "repeated_positions") {
+    return `We don't appear to be converging on terms, so we're unable to continue this negotiation at ${buyerAskUnitPrice} per unit.`;
+  }
+  return `We understand, but we're unable to meet ${buyerAskUnitPrice} per unit for this order while remaining viable.`;
+}
+
+/**
+ * Runs the Merchant Agent's walk-away decision: the deterministic layer
+ * (walkAway.ts, consulted by the orchestrator) has already decided the
+ * negotiation cannot succeed — this only phrases that decision. Never
+ * receives or reveals item.minPrice; the merchant's own private floor
+ * stays exactly as invisible here as it is everywhere else in the
+ * codebase — the message only ever explains that the buyer's own ask
+ * cannot be met, not why.
+ */
+export async function runMerchantWalkAway(
+  buyerAskUnitPrice: number,
+  reason: WalkAwayReason,
+): Promise<{ message: string }> {
+  const authoritativeFacts = {
+    side: "MERCHANT" as const,
+    action: "walk_away",
+    reason,
+    buyerAskUnitPrice,
+  };
+  const context = { authoritativeFacts };
+
+  let message: string;
+  try {
+    const generated = await getLlmProvider().generateAgentMessage({
+      systemPrompt: MERCHANT_SYSTEM_PROMPT,
+      context,
+      instruction:
+        "Generate only the natural-language message explaining that the merchant cannot proceed with this negotiation — the buyer's terms cannot be met. Do not invent, change, or round any number. State clearly that the buyer's requested price (buyerAskUnitPrice) cannot be met while fulfilling this order. Never mention or imply a specific minimum acceptable price of your own — only that the buyer's number does not work. Do not propose alternative numbers.",
+    });
+    const check = checkAgentMessageIntegrity(generated, [buyerAskUnitPrice], context);
+    if (check.valid) {
+      message = generated;
+    } else {
+      console.warn(`Merchant Agent walk-away message failed integrity check, falling back: ${check.reason}`);
+      message = buildFallbackMerchantWalkAwayMessage(reason, buyerAskUnitPrice);
+    }
+  } catch (error) {
+    if (!(error instanceof LlmUnavailableError)) {
+      throw error;
+    }
+    message = buildFallbackMerchantWalkAwayMessage(reason, buyerAskUnitPrice);
+  }
+
+  return { message };
 }

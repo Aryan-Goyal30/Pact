@@ -86,3 +86,19 @@ export function rejectNegotiation(state: NegotiationState): NegotiationState {
   }
   return { ...state, status: "REJECTED" };
 }
+
+/**
+ * Explicitly closes the negotiation as EXPIRED — used both by the
+ * existing round-exhaustion path (advanceNegotiationState) and by a
+ * recognized walk-away (see walkAway.ts): a deliberate decision that no
+ * further round could produce agreement, not merely "ran out of
+ * rounds." Both share the same public EXPIRED status on purpose — a
+ * walk-away is not a system failure, it is a legitimate negotiation
+ * outcome, same as today's round-exhaustion EXPIRED.
+ */
+export function expireNegotiation(state: NegotiationState): NegotiationState {
+  if (isTerminal(state)) {
+    return state;
+  }
+  return { ...state, status: "EXPIRED" };
+}

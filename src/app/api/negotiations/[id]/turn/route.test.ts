@@ -154,6 +154,27 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
     expect(serialized).not.toContain("44000"); // the seeded LAPTOP-14-I5 private floor
   });
 
+  // PACT V2 Milestone 4 regression: the DB-backed path (loadLatestTurn ->
+  // previousBuyerUnitPrice) must apply the exact same reciprocity as the
+  // in-memory orchestrator path — these are the same pinned values
+  // verified in orchestrator.test.ts's flagship trace (200 laptops
+  // requested, 100 available), reproduced here through the real route
+  // handler and real SQLite session/message persistence.
+  it("Milestone 4: the merchant's second-round counter reflects buyer reciprocity through the persisted DB-backed history path", async () => {
+    const sessionId = await createTestSession(
+      { sku: LAPTOP_SKU, quantity: 200, maxUnitPrice: 45000, deliveryDeadlineDays: 10 },
+      4,
+    );
+
+    const first = await callTurn(sessionId); // round 1: no prior buyer price -> UNKNOWN, neutral
+    expect(first.body.buyer.unitPrice).toBe(42750);
+    expect(first.body.merchant.unitPrice).toBe(45375);
+
+    const second = await callTurn(sessionId); // round 2: buyer's ask rose (42750 -> 44063) -> CONCEDED
+    expect(second.body.buyer.unitPrice).toBe(44063);
+    expect(second.body.merchant.unitPrice).toBe(44621); // reciprocity-adjusted, not the pre-Milestone-4 44719
+  });
+
   it("a REJECTED session still returns 409 on a repeated POST (unchanged behavior)", async () => {
     const sessionId = await createTestSession(
       { sku: LAPTOP_SKU, quantity: 10, maxUnitPrice: 45000, deliveryDeadlineDays: 1 },

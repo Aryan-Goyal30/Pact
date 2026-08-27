@@ -121,6 +121,16 @@ export interface MerchantConcessionContext {
   requestedQuantity?: number;
   /** A rupee amount to additionally subtract for a delivery-for-price trade (negotiationStrategy.resolveDeliveryTrade), still subject to the final minPrice clamp below. Omitted by callers that predate this option. */
   deliveryTradeDiscount?: number;
+  /**
+   * Milestone 4: a multiplier on the concession step, driven by whether
+   * the buyer's own last move was a genuine concession, a hold, or a
+   * withdrawal (merchantReciprocity.evaluateBuyerReciprocity). Defaults
+   * to 1.0 (a complete no-op) when omitted, so every caller that
+   * predates this option — including every existing test — behaves
+   * exactly as before. Still fully subject to the final
+   * [minPrice, listedPrice] clamp below regardless of magnitude.
+   */
+  reciprocitySpeedMultiplier?: number;
 }
 
 /**
@@ -152,18 +162,21 @@ export interface MerchantConcessionContext {
  * ceiling still has to be explicitly accepted, same as any other
  * counter-offer).
  *
- * Beyond the base "split the remaining difference" step, three optional
- * strategic overlays apply (negotiationStrategy.ts):
- *  - a stock-pressure speed factor, always derived from item.availableQty
- *    alone (ample stock concedes faster, scarce stock holds firmer) —
- *    always active, but a documented no-op for every catalog fixture
- *    this codebase currently uses (see negotiationStrategy.ts's
- *    calibration note);
+ * Beyond the base "split the remaining difference" step, four optional
+ * strategic overlays apply:
+ *  - a stock-pressure speed factor (negotiationStrategy.ts), always
+ *    derived from item.availableQty alone (ample stock concedes faster,
+ *    scarce stock holds firmer) — always active, but a documented no-op
+ *    for every catalog fixture this codebase currently uses (see
+ *    negotiationStrategy.ts's calibration note);
+ *  - a reciprocity speed multiplier (merchantReciprocity.ts), only when
+ *    context.reciprocitySpeedMultiplier is supplied — otherwise 1.0, a
+ *    complete no-op;
  *  - a large-order quantity discount, only when context.requestedQuantity
  *    is supplied and crosses the leverage threshold;
  *  - a delivery-for-price trade discount, only when
  *    context.deliveryTradeDiscount is supplied.
- * All three are inert unless the caller opts in, and the final clamp to
+ * All four are inert unless the caller opts in, and the final clamp to
  * [minPrice, listedPrice] still applies no matter what they compute —
  * they can shift the number, never the hard floor/ceiling.
  */
@@ -180,7 +193,8 @@ export function computeMerchantConcessionPrice(
 
   const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
   const speedFactor = resolveMerchantConcessionSpeedFactor(item);
-  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * speedFactor;
+  const reciprocityFactor = context.reciprocitySpeedMultiplier ?? 1;
+  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * speedFactor * reciprocityFactor;
 
   if (context.requestedQuantity !== undefined && hasQuantityLeverage(context.requestedQuantity)) {
     conceded -= (item.listedPrice - item.minPrice) * LARGE_ORDER_MERCHANT_DISCOUNT;

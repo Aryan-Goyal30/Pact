@@ -3,6 +3,7 @@ import { getPublicManifest } from "@/lib/manifest";
 import { runNegotiationTurn } from "@/lib/negotiation/orchestrator";
 import {
   loadLatestTurn,
+  loadMerchantUnitPriceAtRound,
   loadNegotiationSession,
   persistNegotiationTurn,
 } from "@/lib/negotiation/negotiationSessionRepository";
@@ -131,10 +132,25 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       );
     }
 
+    // Milestone 2: repeated-position deadlock detection needs the
+    // buyer's own previous-round price — reuses loadLatestTurn (already
+    // built for the AGREED-replay path above) rather than adding any
+    // new persistence. null on the opening round (no prior turn exists
+    // yet), which correctly leaves that check inactive for round 1.
+    const previousTurn = await loadLatestTurn(id, loaded.sku);
+    // Milestone 3: the buyer's move selector additionally needs the
+    // merchant's price from ONE ROUND BEFORE that — a second small,
+    // schema-free history lookup (loadMerchantUnitPriceAtRound), null
+    // when that earlier round doesn't exist yet.
+    const priorMerchantUnitPrice = previousTurn
+      ? await loadMerchantUnitPriceAtRound(id, previousTurn.turnNumber - 1)
+      : null;
     const turn = await runNegotiationTurn(
       { item, manifestProduct, buyerConstraints: loaded.buyerConstraints },
       loaded.state,
       loaded.previousMerchantResult,
+      previousTurn?.buyer.unitPrice ?? null,
+      priorMerchantUnitPrice,
     );
 
     const { turnNumber } = await persistNegotiationTurn(id, turn);
