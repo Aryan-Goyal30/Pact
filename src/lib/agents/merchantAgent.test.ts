@@ -229,6 +229,127 @@ describe("runMerchantAgent", () => {
     });
   });
 
+  // PACT V2 Milestone 1: the merchant's conditional quantity <-> price
+  // trade evaluator (merchantTradeEvaluator.ts), flowing through the
+  // real agent rather than just its own isolated unit tests.
+  describe("conditional quantity <-> price trade (real merchant bargaining)", () => {
+    const bulkQuantity = 300; // LARGE_ORDER_QUANTITY_THRESHOLD
+
+    it("a bulk order against abundant stock earns a materially better price than the plain baseline", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const withoutBulk = await runMerchantAgent(
+        abundant,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 44100 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+      );
+      const withBulk = await runMerchantAgent(
+        abundant,
+        { sku: item.sku, quantity: bulkQuantity, maxUnitPrice: 44100 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+      );
+
+      expect(withBulk.decision.unitPrice!).toBeLessThan(withoutBulk.decision.unitPrice!);
+      expect(withBulk.decision.reasons.some((r) => r.includes("order size"))).toBe(true);
+    });
+
+    // The core requirement: the IDENTICAL bulk order/price proposal
+    // produces a materially different merchant price depending only on
+    // the merchant's own stock — not a universal "more units = cheaper" rule.
+    it("the identical bulk proposal produces a materially different price when stock is scarce vs abundant", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+      const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+      const request = { sku: item.sku, quantity: bulkQuantity, maxUnitPrice: 44100 };
+      const concessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 };
+
+      const abundantResult = await runMerchantAgent(abundant, request, concessionContext);
+      const scarceResult = await runMerchantAgent(scarce, request, concessionContext);
+
+      expect(abundantResult.decision.unitPrice!).toBeLessThan(scarceResult.decision.unitPrice!);
+      expect(scarceResult.decision.reasons.some((r) => r.includes("does not currently justify"))).toBe(
+        true,
+      );
+    });
+
+    it("a conditional counter states both the quantity context and the price — not a bare number", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      // availableQty exactly matches the requested bulk quantity: fully
+      // fulfillable (a plain COUNTER_OFFER, not PARTIAL_FULFILLMENT) and
+      // still squarely in the "medium" stock-pressure band.
+      const medium: CatalogItemSnapshot = { ...item, availableQty: bulkQuantity };
+
+      const response = await runMerchantAgent(
+        medium,
+        { sku: item.sku, quantity: bulkQuantity, maxUnitPrice: 44200 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+      );
+
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+      expect(
+        response.decision.reasons.some((r) => r.includes("order size justifies")),
+      ).toBe(true);
+    });
+
+    it("a generous enough proposal against abundant stock is accepted at the buyer's own price", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const response = await runMerchantAgent(
+        abundant,
+        { sku: item.sku, quantity: bulkQuantity, maxUnitPrice: 45500 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+      );
+
+      expect(response.decision.unitPrice).toBe(45500);
+      expect(response.decision.reasons.some((r) => r.includes("attractive given available stock"))).toBe(
+        true,
+      );
+    });
+
+    // Never below the floor, even for a maximally attractive bulk trade.
+    it("never grants a trade-evaluated price below minPrice", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 100000 };
+
+      const response = await runMerchantAgent(
+        abundant,
+        { sku: item.sku, quantity: 100000, maxUnitPrice: 1 },
+        { round: 2, maxRounds: 6, previousOfferUnitPrice: 44500 },
+      );
+
+      expect(response.decision.unitPrice!).toBeGreaterThanOrEqual(item.minPrice);
+    });
+
+    // Merchant strategy is genuinely different from the buyer's — the
+    // buyer's own concession math (buyerRules.ts) has no notion of stock
+    // pressure or order-value trade evaluation at all; asymmetric
+    // objectives, not a mirrored formula.
+    it("merchant strategy consults stock pressure that the buyer's own concession formula has no concept of", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+      const concessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 };
+
+      // Scarce stock's HOLD verdict grants zero additional quantity
+      // discount — so a bulk request and a small request receive the
+      // IDENTICAL price under otherwise-identical conditions, proven
+      // without hand-computing the underlying speed-factor arithmetic.
+      const bulkResult = await runMerchantAgent(
+        scarce,
+        { sku: item.sku, quantity: bulkQuantity, maxUnitPrice: 44100 },
+        concessionContext,
+      );
+      const smallResult = await runMerchantAgent(
+        scarce,
+        { sku: item.sku, quantity: 10, maxUnitPrice: 44100 },
+        concessionContext,
+      );
+
+      expect(bulkResult.decision.unitPrice).toBe(smallResult.decision.unitPrice);
+    });
+  });
+
   // Message-integrity hardening: a malformed/conflicting LLM message
   // must never reach the caller — the negotiation itself must not fail
   // either way, only the prose falls back.

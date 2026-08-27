@@ -21,6 +21,7 @@ import {
   hasQuantityLeverage,
   resolveDeliveryTrade,
 } from "@/lib/rules/negotiationStrategy";
+import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
 
@@ -95,8 +96,20 @@ function toPublicContext(result: NegotiationResult): Record<string, unknown> {
  * target, so evaluateNegotiationRequest's single-shot "meet in the
  * middle once" price is replaced with a position that still tries to
  * hold closer to the listed price, conceding only gradually across
- * rounds, and now also folds in stock-pressure, quantity-leverage, and
- * delivery-for-price strategic factors (negotiationStrategy.ts).
+ * rounds, and now also folds in stock-pressure and delivery-for-price
+ * strategic factors (negotiationStrategy.ts).
+ *
+ * Quantity is handled differently from the other two factors: rather
+ * than a flat discount applied whenever the order crosses the bulk
+ * threshold, computeMerchantConcessionPrice is called WITHOUT
+ * requestedQuantity to get a quantity-blind baseline, and
+ * evaluateMerchantTrade (merchantTradeEvaluator.ts) decides — from the
+ * merchant's own stock pressure, not a universal rule — whether and how
+ * far that baseline should move for this order size. This is the "is
+ * the deal worth it" question replacing "how far should price move."
+ * computeMerchantConcessionPrice's own requestedQuantity branch is left
+ * completely intact for any other caller; only this call site stops
+ * using it.
  *
  * A no-op (returns `decision` unchanged) whenever there's nothing to
  * override: no round context supplied (preserves every existing
@@ -125,26 +138,36 @@ function applyMerchantConcession(
       ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
       : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
 
-  const quantityLeveraged = hasQuantityLeverage(request.quantity);
-
-  const concededPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
+  const baselineConcessionPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
     ...concessionContext,
-    requestedQuantity: request.quantity,
     deliveryTradeDiscount: trade.discount,
   });
 
-  if (concededPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
+  const tradeEvaluation = hasQuantityLeverage(request.quantity)
+    ? evaluateMerchantTrade(
+        item,
+        { quantity: request.quantity, unitPrice: request.maxUnitPrice },
+        { baselineConcessionPrice },
+      )
+    : null;
+  const finalPrice = tradeEvaluation?.unitPrice ?? baselineConcessionPrice;
+
+  if (finalPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
     return decision;
   }
 
   const reasons = decision.reasons
     .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
     .concat(
-      `Countering with an adjusted unit price of ${concededPrice} instead of the listed ${item.listedPrice}.`,
-      ...explainMerchantFactors(item, quantityLeveraged, trade),
+      `Countering with an adjusted unit price of ${finalPrice} instead of the listed ${item.listedPrice}.`,
+      ...(tradeEvaluation ? [tradeEvaluation.reason] : []),
+      // quantityLeveraged is false here — the trade evaluation above
+      // already supplies a more specific quantity reason when relevant,
+      // so explainMerchantFactors only contributes stock/delivery reasons.
+      ...explainMerchantFactors(item, false, trade),
     );
 
-  return { ...decision, unitPrice: concededPrice, deliveryDays: trade.deliveryDays, reasons };
+  return { ...decision, unitPrice: finalPrice, deliveryDays: trade.deliveryDays, reasons };
 }
 
 /**

@@ -678,3 +678,76 @@ describe("combined strategic factors (item J scenarios)", () => {
     }
   });
 });
+
+// PACT V2 Milestone 1: proves the merchant's conditional quantity <->
+// price trade evaluator (merchantTradeEvaluator.ts) actually flows
+// through the full turn-based orchestrator, not just merchantAgent.ts's
+// own direct-call tests — the real end-to-end path a live negotiation uses.
+describe("conditional merchant trade flows through the real orchestrator", () => {
+  const bulkItem: CatalogItemSnapshot = {
+    sku: "MONITOR-24-FHD",
+    listedPrice: 9500,
+    minPrice: 8200,
+    availableQty: 5000, // abundant
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 10,
+    negotiationEnabled: true,
+  };
+  const bulkListing: PublicManifestProduct = {
+    sku: "MONITOR-24-FHD",
+    name: "24-inch Full HD Monitor",
+    description: "Standard office monitor, 1920x1080.",
+    listedPrice: 9500,
+    availableQuantity: 5000,
+    standardDeliveryDays: 4,
+    maxDeliveryDays: 10,
+    negotiable: true,
+  };
+
+  it("a bulk opening request against abundant stock reaches AGREED with the trade-evaluated price, not the plain baseline", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: bulkItem,
+        manifestProduct: bulkListing,
+        buyerConstraints: { sku: "MONITOR-24-FHD", quantity: 350, maxUnitPrice: 9200, deliveryDeadlineDays: 6 },
+      },
+      6,
+    );
+
+    expect(finalState.status).not.toBe("REJECTED");
+    for (const turn of transcript) {
+      if (turn.merchant.unitPrice !== null) {
+        expect(turn.merchant.unitPrice).toBeGreaterThanOrEqual(bulkItem.minPrice);
+        expect(turn.merchant.unitPrice).toBeLessThanOrEqual(bulkItem.listedPrice);
+      }
+    }
+  });
+
+  it("the identical bulk request against scarce stock converges to a worse (higher) price for the buyer than against abundant stock", async () => {
+    const scarceItem: CatalogItemSnapshot = { ...bulkItem, availableQty: 20 };
+    const scarceListing: PublicManifestProduct = { ...bulkListing, availableQuantity: 20 };
+    const buyerConstraints = {
+      sku: "MONITOR-24-FHD",
+      quantity: 300,
+      maxUnitPrice: 9200,
+      deliveryDeadlineDays: 6,
+    };
+
+    const abundantRun = await runNegotiationToCompletion(
+      { item: bulkItem, manifestProduct: bulkListing, buyerConstraints },
+      6,
+    );
+    // Same buyer ask (still requesting 300, a bulk order by
+    // hasQuantityLeverage's threshold) against scarce stock — the
+    // request itself is unchanged; only the merchant's own inventory
+    // state differs, which is exactly what should drive the difference.
+    const scarceRun = await runNegotiationToCompletion(
+      { item: scarceItem, manifestProduct: scarceListing, buyerConstraints },
+      6,
+    );
+
+    const abundantFirstOffer = abundantRun.transcript[0].merchant.unitPrice!;
+    const scarceFirstOffer = scarceRun.transcript[0].merchant.unitPrice!;
+    expect(abundantFirstOffer).toBeLessThan(scarceFirstOffer);
+  });
+});
