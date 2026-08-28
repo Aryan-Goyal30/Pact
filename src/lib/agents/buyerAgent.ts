@@ -34,9 +34,10 @@ import {
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
-import { decideBuyerConcessionMove, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
-import { decideBuyerQuantityTrade, type BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
-import { decideBuyerDeliveryTrade, type BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
+import type { BuyerMove } from "@/lib/rules/buyerMoveSelector";
+import type { BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
+import type { BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
+import { generateBuyerCandidates, selectBestBuyerCandidate } from "@/lib/rules/buyerMoveSelection";
 import {
   evaluateQuantitySufficiency,
   type QuantitySufficiencyDecision,
@@ -59,6 +60,19 @@ export interface BuyerAgentResponse {
   /** Which strategic factors (urgency, quantity leverage, remaining rounds) shaped this action — see negotiationStrategy.explainBuyerFactors. Empty when none applied (e.g. an outright accept/reject, or no round context). */
   strategicReasons: string[];
   /**
+   * Milestone 3: HOLD or CONCEDE when the buyer's selected candidate this
+   * round was the ordinary price move (buyerMoveSelector.ts) rather than
+   * a trade — null whenever a trade candidate won instead (see
+   * tradeMove), or when there was nothing to decide (opening request,
+   * accept, reject, or no round context). Milestone 9: previously
+   * computed internally but never returned from runMerchantAgent's
+   * sibling here — now exposed alongside tradeMove so the full winning
+   * candidate (HOLD / CONCEDE / QUANTITY_FOR_PRICE / DELIVERY_FOR_PRICE)
+   * is always recoverable from the response without reconstructing it
+   * from price/quantity/delivery diffs.
+   */
+  move: BuyerMove | null;
+  /**
    * Milestone 5: whether this round's counter is a quantity-for-price
    * trade (buyerQuantityTrade.ts) rather than a plain price move. Null
    * whenever the trade decision was never consulted at all (the opening
@@ -69,7 +83,10 @@ export interface BuyerAgentResponse {
    * widens this to also carry "DELIVERY_FOR_PRICE" — the two trade
    * dimensions are mutually exclusive within a round (see
    * buildResponseToMerchantOffer's waterfall), so this single field is
-   * always enough to say which one (if either) fired.
+   * always enough to say which one (if either) fired. Milestone 9: the
+   * mutual exclusivity is now a genuine comparison outcome (the
+   * candidate with the better price wins), not merely "whichever rule
+   * ran first."
    */
   tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | null;
   /**
@@ -312,106 +329,44 @@ function buildResponseToMerchantOffer(
     };
   }
 
-  // Milestone 5: before falling back to a plain price move, ask whether
-  // this is a good round to use the buyer's (single-use) quantity-for-price
-  // chip instead — see buyerQuantityTrade.ts for exactly when this fires.
-  // A genuine structured decision, not a quantity change explained after
-  // the fact: when it fires, the counter's quantity/price come directly
-  // from that decision, and decideBuyerConcessionMove is never consulted
-  // this round at all. (When reached via the new insufficient-quantity
-  // path above, this always declines — the trade's own gate refuses
-  // whenever the merchant is already short-supplying the original
-  // request, which is exactly the situation that got us here — so the
-  // buyer falls through to ordinary price concession instead, never a
-  // NEW kind of trade; see the Milestone 6 design review.)
-  const tradeDecision = decideBuyerQuantityTrade(
+  // Milestone 9: instead of trying quantity, then delivery, then falling
+  // back to ordinary HOLD/CONCEDE (a fixed, first-eligible-wins
+  // waterfall that always favored quantity over delivery whenever both
+  // happened to qualify), generate every currently-eligible candidate —
+  // the ordinary HOLD/CONCEDE decision (buyerMoveSelector.ts, unchanged)
+  // plus the quantity and delivery trade candidates (unchanged gates) —
+  // and select whichever one is actually best for the buyer (lowest
+  // price — see buyerMoveSelection.ts). Nothing here decides eligibility
+  // or computes a price itself; this only compares what the existing,
+  // unchanged decision functions already independently produced.
+  const candidates = generateBuyerCandidates(
     constraints,
     proposal.unitPrice,
     proposal.quantity,
     concessionContext,
-    strategyContext?.priorMerchantUnitPrice,
-    strategyContext?.leverageScore,
-    strategyContext?.quantityTradeAlreadyUsed ?? false,
+    strategyContext,
   );
+  const selected = selectBestBuyerCandidate(candidates);
 
-  if (tradeDecision.move === "QUANTITY_FOR_PRICE") {
-    return {
-      action: {
-        type: "counter_offer",
-        sku: constraints.sku,
-        quantity: tradeDecision.quantity as number,
-        unitPrice: tradeDecision.unitPrice as number,
-        deliveryDays: proposal.deliveryDays,
-      },
-      validation,
-      move: null,
-      moveReason: tradeDecision.reason,
-      tradeMove: "QUANTITY_FOR_PRICE",
-      sufficiency,
-    };
-  }
-
-  // Milestone 7: the quantity chip declined (for whatever reason —
-  // already used, no gap, ineligible, or the merchant is already
-  // short-supplying the original request, in which case this is the
-  // buyer's ONLY remaining proactive lever, since offering slower
-  // delivery never requires more stock) — try the delivery chip next,
-  // before falling back to plain concession. A deliberate, documented
-  // waterfall (quantity first, delivery second), not a permanent
-  // "quantity always matters more" product principle — see the
-  // Milestone 7 design review for why this ordering is safe: each chip
-  // is a narrow, independently-gated, single-use, near-zero-cost check,
-  // so trying quantity first never meaningfully forecloses a genuinely
-  // better delivery opportunity — it only means that when BOTH would
-  // technically qualify, quantity is tried first. Mutually exclusive
-  // with the quantity chip by construction: at most one of them ever
-  // returns its own FOR_PRICE move in a single round.
-  const deliveryTradeDecision = decideBuyerDeliveryTrade(
-    constraints,
-    proposal.unitPrice,
-    concessionContext,
-    strategyContext?.leverageScore,
-    strategyContext?.deliveryTradeAlreadyUsed ?? false,
-  );
-
-  if (deliveryTradeDecision.move === "DELIVERY_FOR_PRICE") {
-    return {
-      action: {
-        type: "counter_offer",
-        sku: constraints.sku,
-        quantity: proposal.quantity,
-        unitPrice: deliveryTradeDecision.unitPrice as number,
-        deliveryDays: deliveryTradeDecision.deliveryDays as number,
-      },
-      validation,
-      move: null,
-      moveReason: deliveryTradeDecision.reason,
-      tradeMove: "DELIVERY_FOR_PRICE",
-      sufficiency,
-    };
-  }
-
-  const decision = decideBuyerConcessionMove(
-    constraints,
-    proposal.unitPrice,
-    concessionContext,
-    strategyContext?.priorMerchantUnitPrice,
-    strategyContext?.previousBuyerUnitPrice,
-    strategyContext?.leverageScore,
-  );
+  const isTradeMove = selected.move === "QUANTITY_FOR_PRICE" || selected.move === "DELIVERY_FOR_PRICE";
 
   return {
     action: {
       type: "counter_offer",
       sku: constraints.sku,
-      quantity: proposal.quantity,
-      unitPrice: decision.unitPrice,
-      deliveryDays: proposal.deliveryDays,
+      quantity: selected.quantity ?? proposal.quantity,
+      unitPrice: selected.unitPrice,
+      deliveryDays: selected.deliveryDays ?? proposal.deliveryDays,
     },
     validation,
-    move: decision.move,
-    moveReason: sufficiency ? `${sufficiency.reason} ${decision.reason}` : decision.reason,
-    tradeMove: "NO_TRADE",
+    // move/tradeMove keep their exact pre-Milestone-9 meaning and shape
+    // (see BuyerAgentResponse's doc comments) — only HOW they get
+    // populated changed, from "whichever branch ran first" to "whichever
+    // candidate the comparison actually selected."
+    move: isTradeMove ? null : (selected.move as BuyerMove),
+    moveReason:
+      !isTradeMove && sufficiency ? `${sufficiency.reason} ${selected.reason}` : selected.reason,
+    tradeMove: isTradeMove ? (selected.move as BuyerTradeMove | BuyerDeliveryTradeMove) : "NO_TRADE",
     sufficiency,
   };
 }
@@ -449,11 +404,12 @@ export async function runBuyerAgent(
   concessionContext?: BuyerConcessionContext,
   strategyContext?: BuyerStrategyContext,
 ): Promise<BuyerAgentResponse> {
-  const { action, validation, moveReason, tradeMove, sufficiency } =
+  const { action, validation, move, moveReason, tradeMove, sufficiency } =
     merchantResult === null
       ? {
           action: buildOpeningRequest(constraints, manifestProduct, concessionContext),
           validation: null,
+          move: null,
           moveReason: null,
           tradeMove: null,
           sufficiency: null,
@@ -538,7 +494,7 @@ export async function runBuyerAgent(
     message = buildFallbackBuyerMessage(action);
   }
 
-  return { action, validation, message, strategicReasons, tradeMove, sufficiency };
+  return { action, validation, message, strategicReasons, move, tradeMove, sufficiency };
 }
 
 /**

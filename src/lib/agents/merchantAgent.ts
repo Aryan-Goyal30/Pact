@@ -10,20 +10,13 @@
 
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 import {
-  computeMerchantConcessionPrice,
   evaluateNegotiationRequest,
   type MerchantConcessionContext,
   type NegotiationRequest,
   type NegotiationResult,
 } from "@/lib/rules/negotiationEngine";
-import {
-  explainMerchantFactors,
-  hasQuantityLeverage,
-  resolveDeliveryTrade,
-} from "@/lib/rules/negotiationStrategy";
-import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
-import { evaluateMerchantDeliveryTrade } from "@/lib/rules/merchantDeliveryTradeEvaluator";
-import { evaluateBuyerReciprocity } from "@/lib/rules/merchantReciprocity";
+import { explainMerchantFactors, resolveDeliveryTrade } from "@/lib/rules/negotiationStrategy";
+import { generateMerchantCandidates, selectBestMerchantCandidate } from "@/lib/rules/merchantMoveSelection";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
@@ -157,110 +150,69 @@ function applyMerchantConcession(
     return decision;
   }
 
-  const trade =
-    request.deliveryDeadlineDays !== undefined
-      ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
-      : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
+  // Milestone 9: generate every currently-eligible candidate (ordinary
+  // concession, HOLD when the buyer isn't reciprocating, quantity trade,
+  // delivery trade — see merchantMoveSelection.ts) and select whichever
+  // is actually best for the merchant (highest price), instead of the
+  // old hard-coded "quantity trade always takes priority over delivery"
+  // rule. Every dimension's own evaluation logic (stock pressure,
+  // reciprocity, floor clamping) is completely unchanged — only HOW the
+  // winning move gets chosen is new.
+  const { candidates, deliveryDays, reciprocityReason } = generateMerchantCandidates(
+    item,
+    request as NegotiationRequest & { maxUnitPrice: number },
+    concessionContext,
+    priorBuyerUnitPrice,
+    previousBuyerQuantity,
+    previousBuyerDeliveryDays,
+  );
+  const selected = selectBestMerchantCandidate(candidates);
 
-  const reciprocity = evaluateBuyerReciprocity(request.maxUnitPrice, priorBuyerUnitPrice);
+  if (selected.unitPrice === decision.unitPrice && deliveryDays === decision.deliveryDays) {
+    return decision;
+  }
 
-  const baselineConcessionPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
-    ...concessionContext,
-    deliveryTradeDiscount: trade.discount,
-    reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
-  });
-
-  // Milestone 5: a genuine round-over-round quantity increase engages
-  // the SAME trade evaluator as the flat bulk-order threshold below —
-  // deliberately not a separate "quantity increase -> discount" formula.
-  // evaluateMerchantTrade's own stock-pressure logic (untouched) is what
-  // decides ACCEPT/COUNTER/HOLD/REJECT; this only widens WHEN it gets
-  // consulted, so a 100 -> 200 offer is recognized even though 200 stays
-  // well under the flat LARGE_ORDER_QUANTITY_THRESHOLD.
   const quantityIncreasedFromPrior =
     previousBuyerQuantity !== null &&
     previousBuyerQuantity !== undefined &&
     request.quantity > previousBuyerQuantity;
-
-  const tradeEvaluation =
-    hasQuantityLeverage(request.quantity) || quantityIncreasedFromPrior
-      ? evaluateMerchantTrade(
-          item,
-          { quantity: request.quantity, unitPrice: request.maxUnitPrice },
-          { baselineConcessionPrice, hasGenuineIncrease: quantityIncreasedFromPrior },
-        )
-      : null;
-
-  // Milestone 7: a genuine round-over-round delivery EXTENSION (a
-  // deliberate delivery-for-price trade — see buyerDeliveryTrade.ts) is
-  // evaluated by its own dedicated module, mirroring the quantity trade's
-  // shape but never its stock-pressure DIRECTION (extra delivery TIME is
-  // more valuable to a constrained merchant, not an abundant one — see
-  // merchantDeliveryTradeEvaluator.ts). Only considered when a quantity
-  // trade did NOT already fire this round — the two dimensions are
-  // mutually exclusive by construction of the buyer's own waterfall
-  // (buyerAgent.ts), and this is the defensive mirror of that on the
-  // merchant side. Evaluated against a DELIVERY-BLIND baseline (the
-  // legacy deliveryTradeDiscount deliberately excluded here) so this
-  // evaluator's own discount is the complete delivery-driven adjustment,
-  // never stacked on top of the legacy automatic formula.
   const deliveryIncreasedFromPrior =
     previousBuyerDeliveryDays !== null &&
     previousBuyerDeliveryDays !== undefined &&
     request.deliveryDeadlineDays !== undefined &&
     request.deliveryDeadlineDays > previousBuyerDeliveryDays &&
     (request.deliveryFlexible ?? false);
-
-  const deliveryTradeEvaluation =
-    !tradeEvaluation && deliveryIncreasedFromPrior
-      ? evaluateMerchantDeliveryTrade(
-          item,
-          { extraDays: trade.deliveryDays - item.standardDeliveryDays, unitPrice: request.maxUnitPrice },
-          {
-            baselineConcessionPrice: computeMerchantConcessionPrice(item, request.maxUnitPrice, {
-              ...concessionContext,
-              reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
-              // deliberately WITHOUT deliveryTradeDiscount.
-            }),
-          },
-        )
-      : null;
-
-  const finalPrice = tradeEvaluation?.unitPrice ?? deliveryTradeEvaluation?.unitPrice ?? baselineConcessionPrice;
-
-  if (finalPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
-    return decision;
-  }
+  const trade =
+    request.deliveryDeadlineDays !== undefined
+      ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
+      : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
 
   const reasons = decision.reasons
     .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
     .concat(
-      `Countering with an adjusted unit price of ${finalPrice} instead of the listed ${item.listedPrice}.`,
-      ...(reciprocity.reason ? [reciprocity.reason] : []),
-      ...(quantityIncreasedFromPrior
+      `Countering with an adjusted unit price of ${selected.unitPrice} instead of the listed ${item.listedPrice}.`,
+      ...(reciprocityReason ? [reciprocityReason] : []),
+      // Only the reasoning behind the WINNING candidate is stated —
+      // never a dimension the comparison considered but didn't select.
+      ...(selected.move === "QUANTITY_FOR_PRICE" && quantityIncreasedFromPrior
         ? [
             `The buyer increased its requested quantity from ${previousBuyerQuantity} to ${request.quantity}, so the merchant evaluated the full package instead of price alone.`,
           ]
         : []),
-      ...(tradeEvaluation ? [tradeEvaluation.reason] : []),
-      // Gated on deliveryTradeEvaluation actually having run (not just
-      // deliveryIncreasedFromPrior being true) — a genuine delivery
-      // signal that got PREEMPTED by a same-round quantity trade must
-      // never claim the merchant "evaluated the full package" for
-      // delivery, since it didn't.
-      ...(deliveryTradeEvaluation
+      ...(selected.move === "DELIVERY_FOR_PRICE" && deliveryIncreasedFromPrior
         ? [
             `The buyer offered a longer delivery window (from ${previousBuyerDeliveryDays} to ${trade.deliveryDays} days) in exchange for a better price, so the merchant evaluated the full package instead of price alone.`,
           ]
         : []),
-      ...(deliveryTradeEvaluation ? [deliveryTradeEvaluation.reason] : []),
-      // quantityLeveraged is false here — the trade evaluation above
-      // already supplies a more specific quantity reason when relevant,
-      // so explainMerchantFactors only contributes stock/delivery reasons.
+      selected.reason,
+      // quantityLeveraged is false here — the winning candidate's own
+      // reason above already supplies a more specific quantity/delivery
+      // reason when relevant, so explainMerchantFactors only contributes
+      // generic stock/delivery-trade reasons.
       ...explainMerchantFactors(item, false, trade),
     );
 
-  return { ...decision, unitPrice: finalPrice, deliveryDays: trade.deliveryDays, reasons };
+  return { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons };
 }
 
 /**

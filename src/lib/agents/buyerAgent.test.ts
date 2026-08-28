@@ -445,11 +445,17 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
     expect(response.strategicReasons.some((r) => r.includes("increase the order to 100 units"))).toBe(true);
   });
 
-  // Milestone 6: a high-leverage buyer is NOT excluded from the trade —
-  // the old leverage-band gate was found (via real browser testing) to
-  // incorrectly block exactly this case. Leverage instead sizes a MORE
-  // aggressive ask (a bigger discount request) than the moderate-leverage
-  // case above.
+  // Milestone 6: a high-leverage buyer is NOT excluded from the trade by
+  // ELIGIBILITY — the old leverage-band gate was found (via real browser
+  // testing) to incorrectly block exactly this case. Leverage instead
+  // sizes a MORE aggressive ask than the moderate-leverage case above.
+  //
+  // Milestone 9: eligibility alone is no longer the whole story — the
+  // trade candidate is generated here exactly as before, but now has to
+  // WIN a genuine comparison against the buyer's ordinary candidate too.
+  // With a real prior price on record (44700, from an earlier round) to
+  // hold at, the trade's more aggressive 43640 ask is still the better
+  // deal, so it correctly wins the comparison, not merely the gate.
   it("still trades at strong leverage, asking for an even better price than at moderate leverage", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
 
@@ -458,13 +464,38 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
       manifestProduct,
       merchantResult,
       { round: 2, maxRounds: 10 },
-      { leverageScore: 90, quantityTradeAlreadyUsed: false },
+      { leverageScore: 90, quantityTradeAlreadyUsed: false, previousBuyerUnitPrice: 44700 },
     );
 
     expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
     expect(response.action.quantity).toBe(100);
     expect(response.action.unitPrice).toBe(43640);
     expect(response.action.unitPrice!).toBeLessThan(43963); // more aggressive than the moderate-leverage ask
+  });
+
+  // Milestone 9: the flip side of the same comparison, proven directly —
+  // a strongly-leveraged buyer with NO prior price on record (its own
+  // aspirational target, not an already-conceded number) can afford to
+  // just HOLD at that target rather than trade anything away, since the
+  // target itself already beats what the trade would ask for. This is
+  // the comparator genuinely working, not a regression: the trade is
+  // still generated (confirmed by the previous test using the identical
+  // leverage), it simply loses to a better ordinary candidate here.
+  it("prefers HOLD over the trade when holding at the buyer's own target is already the better price", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      tradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 90, quantityTradeAlreadyUsed: false }, // no previousBuyerUnitPrice -> HOLD falls back to the buyer's own target
+    );
+
+    expect(response.tradeMove).toBe("NO_TRADE");
+    expect(response.move).toBe("HOLD");
+    expect(response.action.unitPrice).toBe(43225); // resolveBuyerTarget(tradeConstraints) — cheaper than the 43640 trade ask
+    expect(response.action.quantity).toBe(50); // unchanged — the trade was correctly outranked, not merely skipped
   });
 
   it("does not trade once the chip has already been used, even at otherwise-favorable leverage", async () => {

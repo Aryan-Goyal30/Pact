@@ -662,9 +662,19 @@ describe("runMerchantAgent", () => {
       const scarceResult = await runMerchantAgent(scarce, request, concessionContext);
 
       expect(abundantResult.decision.unitPrice!).toBeLessThan(scarceResult.decision.unitPrice!);
-      expect(scarceResult.decision.reasons.some((r) => r.includes("does not currently justify"))).toBe(
-        true,
-      );
+      // Milestone 9: scarce stock now ALSO independently justifies the
+      // merchant's own HOLD candidate (merchantMoveSelection.ts), not
+      // just the quantity evaluator's own "does not currently justify an
+      // additional discount" HOLD verdict — and HOLD's price (the
+      // merchant's last, higher offer, 45600) legitimately beats that
+      // verdict's own quantity-blind concession under genuine price
+      // comparison. This is the milestone's own new capability
+      // ("merchant can prefer HOLD... remains asymmetric") demonstrating
+      // itself in a pre-existing scarce-stock fixture — the winning
+      // reason changed accordingly; the quantity evaluator's specific
+      // insight is still computed and folded into the losing CONCEDE
+      // candidate, just no longer the one stated when HOLD wins outright.
+      expect(scarceResult.decision.reasons.some((r) => r.includes("not reciprocating"))).toBe(true);
     });
 
     it("a conditional counter states both the quantity context and the price — not a bare number", async () => {
