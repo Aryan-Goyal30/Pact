@@ -346,7 +346,7 @@ function buildResponseToMerchantOffer(
     concessionContext,
     strategyContext,
   );
-  const selected = selectBestBuyerCandidate(candidates);
+  const selected = selectBestBuyerCandidate(candidates, constraints, proposal.quantity, proposal.deliveryDays);
 
   const isTradeMove = selected.move === "QUANTITY_FOR_PRICE" || selected.move === "DELIVERY_FOR_PRICE";
 

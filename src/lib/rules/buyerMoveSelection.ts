@@ -30,6 +30,7 @@ import type { BuyerConcessionContext, BuyerConstraints } from "@/lib/rules/buyer
 import { decideBuyerConcessionMove } from "@/lib/rules/buyerMoveSelector";
 import { decideBuyerQuantityTrade } from "@/lib/rules/buyerQuantityTrade";
 import { decideBuyerDeliveryTrade } from "@/lib/rules/buyerDeliveryTrade";
+import { evaluateQuantitySufficiency } from "@/lib/rules/buyerQuantitySufficiency";
 import type { CandidateMove } from "@/lib/rules/candidateMove";
 
 /** The subset of BuyerStrategyContext (buyerAgent.ts) this module needs — kept as a local shape so this file doesn't import buyerAgent.ts (which imports this file). */
@@ -118,25 +119,121 @@ export function generateBuyerCandidates(
 
 /**
  * The buyer's objective, as a named function rather than a bare
- * comparison buried in a sort() — lower is better. Starting point only
- * (per the Milestone 9 spec): price is the buyer's dominant existing
- * objective, and every candidate already computes one, so no new number
- * is invented. Deliberately easy to extend later (quantity value,
- * delivery value, history) without changing this function's signature
- * or its callers.
+ * comparison buried in a sort() — lower is better. Introduced in
+ * Milestone 9 as the starting point; RETAINED here, unused by
+ * selectBestBuyerCandidate itself, purely so
+ * buyerMoveSelection.oldVsNew.test.ts can reconstruct exactly
+ * Milestone 9/10's price-only selection and prove Milestone 11's package
+ * comparator (compareBuyerPackages, below) is behaviorally equivalent to
+ * it across every candidate set this codebase can currently produce —
+ * see that module's own doc comment for why this is a genuine, provable
+ * no-op, not merely an empirically-observed coincidence.
  */
 export function scoreBuyerCandidate(candidate: CandidateMove): number {
   return candidate.unitPrice;
 }
 
 /**
- * Selects the best candidate for the buyer — the one with the lowest
- * score (see scoreBuyerCandidate). `candidates` must be non-empty;
- * generateBuyerCandidates always guarantees at least the ordinary
- * candidate.
+ * Milestone 11: package/deal-value comparison — PACT V2.
+ *
+ * A named LEXICOGRAPHIC comparison, not a weighted utility score. There
+ * is deliberately no `priceWeight * price + quantityWeight * quantity +
+ * ...` anywhere in this file: that would invent arbitrary weights the
+ * current product requirements do not justify (see the Milestone 11
+ * design review). Instead, three tiers are compared IN ORDER, each only
+ * consulted when every earlier tier ties exactly:
+ *
+ *  1. Quantity sufficiency (evaluateQuantitySufficiency, reused
+ *     verbatim, never duplicated) — a candidate whose resolved quantity
+ *     would leave the buyer under-supplied ranks below one that doesn't,
+ *     REGARDLESS of price. This is what stops a much-cheaper-but-short
+ *     candidate from automatically winning just because price is the
+ *     only thing being compared (the milestone's own Case C).
+ *  2. Unit price — lower wins. Exactly today's (Milestone 9/10) rule,
+ *     now only reached once sufficiency has already tied.
+ *  3. Delivery days — ONLY on an exact price tie, faster (lower) wins.
+ *     A real but secondary preference (the milestone's own Case B): it
+ *     can break a tie, but it can never override tier 2 — a genuinely
+ *     higher price is never forgiven by a better delivery date alone.
+ *
+ * A candidate's "resolved quantity"/"resolved delivery" for tiers 1/3
+ * falls back to `currentQuantity`/`currentDeliveryDays` (the round's
+ * existing terms) whenever the candidate itself doesn't set that field —
+ * the same "absence means no change" convention CandidateMove's own
+ * fields already use everywhere else in this codebase; never invented
+ * here.
+ *
+ * Returns positive when `a` is the preferred package, negative when `b`
+ * is, 0 on an exact tie across all three tiers (letting the caller's own
+ * reduce() preserve its existing first-encountered tie-break — see
+ * selectBestBuyerCandidate).
  */
-export function selectBestBuyerCandidate(candidates: CandidateMove[]): CandidateMove {
+export function compareBuyerPackages(
+  a: CandidateMove,
+  b: CandidateMove,
+  constraints: BuyerConstraints,
+  currentQuantity: number,
+  currentDeliveryDays: number,
+): number {
+  const rankA = sufficiencyRank(a, constraints, currentQuantity);
+  const rankB = sufficiencyRank(b, constraints, currentQuantity);
+  if (rankA !== rankB) {
+    return rankB - rankA; // a lower rank (more sufficient) is preferred
+  }
+
+  if (a.unitPrice !== b.unitPrice) {
+    return b.unitPrice - a.unitPrice; // a lower price is preferred
+  }
+
+  const deliveryA = a.deliveryDays ?? currentDeliveryDays;
+  const deliveryB = b.deliveryDays ?? currentDeliveryDays;
+  return deliveryB - deliveryA; // a lower (faster) delivery is preferred
+}
+
+/**
+ * Tier-1 helper for compareBuyerPackages: the sufficiency VERDICT a
+ * candidate would produce if adopted, collapsed to a numeric rank (lower
+ * = more sufficient = preferred). Deliberately keyed on the verdict
+ * alone, not shortfallFraction — two candidates that both land on
+ * SUFFICIENT (even at different shortfall sizes within tolerance) are
+ * meant to tie at tier 1 and fall through to price, matching the
+ * Milestone 11 spec's own "equal sufficiency falls through to price"
+ * requirement.
+ */
+function sufficiencyRank(
+  candidate: CandidateMove,
+  constraints: BuyerConstraints,
+  currentQuantity: number,
+): 0 | 1 | 2 {
+  const offeredQuantity = candidate.quantity ?? currentQuantity;
+  const { verdict } = evaluateQuantitySufficiency(constraints, offeredQuantity, candidate.unitPrice);
+  switch (verdict) {
+    case "SUFFICIENT":
+      return 0;
+    case "INSUFFICIENT_PRICE_COMPENSATES":
+      return 1;
+    case "INSUFFICIENT":
+      return 2;
+  }
+}
+
+/**
+ * Selects the best candidate for the buyer via compareBuyerPackages.
+ * `candidates` must be non-empty; generateBuyerCandidates always
+ * guarantees at least the ordinary candidate. `currentQuantity` /
+ * `currentDeliveryDays` are the round's existing terms (the merchant's
+ * current offer) — the fallback compareBuyerPackages uses for any
+ * candidate that doesn't itself change that dimension.
+ */
+export function selectBestBuyerCandidate(
+  candidates: CandidateMove[],
+  constraints: BuyerConstraints,
+  currentQuantity: number,
+  currentDeliveryDays: number,
+): CandidateMove {
   return candidates.reduce((best, candidate) =>
-    scoreBuyerCandidate(candidate) < scoreBuyerCandidate(best) ? candidate : best,
+    compareBuyerPackages(candidate, best, constraints, currentQuantity, currentDeliveryDays) > 0
+      ? candidate
+      : best,
   );
 }

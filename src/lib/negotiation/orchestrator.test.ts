@@ -1517,7 +1517,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     expect(trade?.unitPrice).toBe(43963);
     expect(trade!.unitPrice).toBeLessThan(ordinary!.unitPrice);
 
-    const selected = selectBestBuyerCandidate(candidates);
+    const selected = selectBestBuyerCandidate(candidates, constraints, 50, 5);
     expect(selected.move).toBe("QUANTITY_FOR_PRICE");
     expect(selected.unitPrice).toBe(43963);
   });
@@ -1557,7 +1557,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     expect(trade?.unitPrice).toBe(44625);
     expect(trade!.unitPrice).toBeLessThan(ordinary!.unitPrice);
 
-    const selected = selectBestBuyerCandidate(candidates);
+    const selected = selectBestBuyerCandidate(candidates, constraints, 30, 8);
     expect(selected.move).toBe("DELIVERY_FOR_PRICE");
     expect(selected.deliveryDays).toBe(12);
   });
@@ -1651,7 +1651,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     expect(quantityTrade!.unitPrice).toBeGreaterThanOrEqual(hold!.unitPrice);
     expect(deliveryTrade!.unitPrice).toBeGreaterThanOrEqual(hold!.unitPrice);
 
-    const selected = selectBestBuyerCandidate(candidates);
+    const selected = selectBestBuyerCandidate(candidates, constraints, 20, 10);
     expect(selected.move).toBe("HOLD");
     expect(selected.unitPrice).toBe(42085);
   });

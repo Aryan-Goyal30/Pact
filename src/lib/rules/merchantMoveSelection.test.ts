@@ -2,10 +2,13 @@ import { describe, expect, it } from "vitest";
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 import type { MerchantConcessionContext, NegotiationRequest } from "@/lib/rules/negotiationEngine";
 import {
+  compareMerchantPackages,
   generateMerchantCandidates,
   scoreMerchantCandidate,
   selectBestMerchantCandidate,
 } from "./merchantMoveSelection";
+import { compareBuyerPackages } from "./buyerMoveSelection";
+import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import type { CandidateMove } from "./candidateMove";
 
 const item: CatalogItemSnapshot = {
@@ -209,5 +212,77 @@ describe("realistic: merchant HOLD wins by genuine comparison in a real runMerch
     const nonTrade = candidates.filter((c) => c.move === "HOLD" || c.move === "CONCEDE");
     expect(hold).toBeDefined();
     expect(selectBestMerchantCandidate(nonTrade).move).toBe("HOLD");
+  });
+});
+
+// PACT V2 Milestone 11: package/deal-value comparison — direct unit
+// tests of compareMerchantPackages itself. See
+// merchantMoveSelection.oldVsNew.test.ts for the separate, mandatory
+// proof that this comparator is behaviorally equivalent to Milestone
+// 9/10's two-tier filter+reduce one across every candidate set the
+// current codebase can actually produce.
+describe("Milestone 11: compareMerchantPackages — asymmetric two-tier comparison", () => {
+  it("the trade tier retains priority — an eligible trade beats a non-trade candidate even at a lower raw price", () => {
+    const trade: CandidateMove = { move: "QUANTITY_FOR_PRICE", unitPrice: 45200, quantity: 300, reason: "q" };
+    const concede: CandidateMove = { move: "CONCEDE", unitPrice: 45900, reason: "c" }; // numerically higher/"better" by raw price
+    expect(selectBestMerchantCandidate([trade, concede]).move).toBe("QUANTITY_FOR_PRICE");
+    expect(selectBestMerchantCandidate([concede, trade]).move).toBe("QUANTITY_FOR_PRICE"); // order-independent
+  });
+
+  it("within the trade tier, a higher price wins", () => {
+    const quantity: CandidateMove = { move: "QUANTITY_FOR_PRICE", unitPrice: 45400, quantity: 300, reason: "q" };
+    const delivery: CandidateMove = { move: "DELIVERY_FOR_PRICE", unitPrice: 45000, deliveryDays: 15, reason: "d" };
+    expect(selectBestMerchantCandidate([quantity, delivery]).move).toBe("QUANTITY_FOR_PRICE");
+    expect(selectBestMerchantCandidate([delivery, quantity]).move).toBe("QUANTITY_FOR_PRICE");
+  });
+
+  it("within the non-trade tier, a higher price wins", () => {
+    const hold: CandidateMove = { move: "HOLD", unitPrice: 46500, reason: "h" };
+    const concede: CandidateMove = { move: "CONCEDE", unitPrice: 45938, reason: "c" };
+    expect(selectBestMerchantCandidate([hold, concede]).move).toBe("HOLD");
+    expect(selectBestMerchantCandidate([concede, hold]).move).toBe("HOLD");
+  });
+
+  it("is deterministic — repeated calls on the same input produce the same winner", () => {
+    const candidates: CandidateMove[] = [
+      { move: "CONCEDE", unitPrice: 45900, reason: "c" },
+      { move: "HOLD", unitPrice: 46200, reason: "h" },
+      { move: "QUANTITY_FOR_PRICE", unitPrice: 45400, quantity: 300, reason: "q" },
+    ];
+    const first = selectBestMerchantCandidate(candidates);
+    const second = selectBestMerchantCandidate(candidates);
+    expect(second).toBe(first);
+  });
+
+  it("never mutates the candidates it compares or selects among", () => {
+    const candidates: CandidateMove[] = [
+      { move: "CONCEDE", unitPrice: 45900, reason: "c" },
+      { move: "QUANTITY_FOR_PRICE", unitPrice: 45400, quantity: 300, reason: "q" },
+    ];
+    const snapshot = JSON.parse(JSON.stringify(candidates));
+    compareMerchantPackages(candidates[0], candidates[1]);
+    selectBestMerchantCandidate(candidates);
+    expect(candidates).toEqual(snapshot);
+  });
+
+  // Milestone 9's own requirement, re-verified at this layer: candidate
+  // quality must never be mirrored between sides. Feeding the EXACT same
+  // candidate pair into both comparators and getting opposite
+  // preferences is the concrete proof, not merely "they are different
+  // function bodies."
+  it("compareMerchantPackages is genuinely asymmetric with compareBuyerPackages — the same two candidates rank oppositely", () => {
+    const cheaper: CandidateMove = { move: "CONCEDE", unitPrice: 44500, quantity: 50, reason: "cheaper" };
+    const pricier: CandidateMove = { move: "CONCEDE", unitPrice: 45500, quantity: 50, reason: "pricier" };
+    const buyerConstraints: BuyerConstraints = {
+      sku: item.sku,
+      quantity: 50,
+      maxUnitPrice: 46000,
+      deliveryDeadlineDays: 10,
+    };
+
+    // The merchant prefers the pricier one (higher price -> positive)...
+    expect(compareMerchantPackages(pricier, cheaper)).toBeGreaterThan(0);
+    // ...while the buyer prefers the cheaper one, for the EXACT SAME pair.
+    expect(compareBuyerPackages(cheaper, pricier, buyerConstraints, 50, 10)).toBeGreaterThan(0);
   });
 });

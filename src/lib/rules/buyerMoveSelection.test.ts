@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { BuyerConcessionContext, BuyerConstraints } from "@/lib/rules/buyerRules";
 import {
+  compareBuyerPackages,
   generateBuyerCandidates,
   scoreBuyerCandidate,
   selectBestBuyerCandidate,
   type BuyerCandidateStrategyContext,
 } from "./buyerMoveSelection";
+import { evaluateQuantitySufficiency } from "./buyerQuantitySufficiency";
 import type { CandidateMove } from "./candidateMove";
 
 const constraints: BuyerConstraints = {
@@ -89,7 +91,7 @@ describe("generateBuyerCandidates — all eligible candidates are generated at o
       { move: "QUANTITY_FOR_PRICE", unitPrice: 45000, quantity: 100, reason: "trade" },
       { move: "HOLD", unitPrice: 44000, reason: "hold" }, // pushed AFTER the trade, yet cheaper
     ];
-    expect(selectBestBuyerCandidate(candidates).move).toBe("HOLD");
+    expect(selectBestBuyerCandidate(candidates, constraints, 50, 10).move).toBe("HOLD");
   });
 
   it("delivery trade can win over quantity trade purely because it is cheaper, regardless of array order", () => {
@@ -98,8 +100,8 @@ describe("generateBuyerCandidates — all eligible candidates are generated at o
       { move: "DELIVERY_FOR_PRICE", unitPrice: 44900, deliveryDays: 15, reason: "d" },
     ];
     const deliveryFirst: CandidateMove[] = [quantityFirst[1], quantityFirst[0]];
-    expect(selectBestBuyerCandidate(quantityFirst).move).toBe("DELIVERY_FOR_PRICE");
-    expect(selectBestBuyerCandidate(deliveryFirst).move).toBe("DELIVERY_FOR_PRICE");
+    expect(selectBestBuyerCandidate(quantityFirst, constraints, 50, 10).move).toBe("DELIVERY_FOR_PRICE");
+    expect(selectBestBuyerCandidate(deliveryFirst, constraints, 50, 10).move).toBe("DELIVERY_FOR_PRICE");
   });
 
   it("quantity trade can equally win over delivery trade when it is the cheaper one, regardless of array order", () => {
@@ -107,13 +109,13 @@ describe("generateBuyerCandidates — all eligible candidates are generated at o
       { move: "DELIVERY_FOR_PRICE", unitPrice: 45200, deliveryDays: 15, reason: "d" },
       { move: "QUANTITY_FOR_PRICE", unitPrice: 44900, quantity: 100, reason: "q" },
     ];
-    expect(selectBestBuyerCandidate(arr).move).toBe("QUANTITY_FOR_PRICE");
-    expect(selectBestBuyerCandidate([...arr].reverse()).move).toBe("QUANTITY_FOR_PRICE");
+    expect(selectBestBuyerCandidate(arr, constraints, 50, 10).move).toBe("QUANTITY_FOR_PRICE");
+    expect(selectBestBuyerCandidate([...arr].reverse(), constraints, 50, 10).move).toBe("QUANTITY_FOR_PRICE");
   });
 
   it("plain CONCEDE can win when neither trade is worthwhile (both absent this round)", () => {
     const arr: CandidateMove[] = [{ move: "CONCEDE", unitPrice: 45900, reason: "concede" }];
-    expect(selectBestBuyerCandidate(arr).move).toBe("CONCEDE");
+    expect(selectBestBuyerCandidate(arr, constraints, 50, 10).move).toBe("CONCEDE");
   });
 
   it("HOLD can win when it is genuinely the cheapest option available", () => {
@@ -122,7 +124,7 @@ describe("generateBuyerCandidates — all eligible candidates are generated at o
       { move: "QUANTITY_FOR_PRICE", unitPrice: 43900, quantity: 100, reason: "q" },
       { move: "DELIVERY_FOR_PRICE", unitPrice: 44100, deliveryDays: 15, reason: "d" },
     ];
-    expect(selectBestBuyerCandidate(arr).move).toBe("HOLD");
+    expect(selectBestBuyerCandidate(arr, constraints, 50, 10).move).toBe("HOLD");
   });
 });
 
@@ -172,6 +174,91 @@ describe("scoreBuyerCandidate / selectBestBuyerCandidate", () => {
       { move: "QUANTITY_FOR_PRICE", unitPrice: 44200, quantity: 100, reason: "q" },
       { move: "DELIVERY_FOR_PRICE", unitPrice: 44800, deliveryDays: 15, reason: "d" },
     ];
-    expect(selectBestBuyerCandidate(candidates).unitPrice).toBe(44200);
+    expect(selectBestBuyerCandidate(candidates, constraints, 50, 10).unitPrice).toBe(44200);
+  });
+});
+
+// PACT V2 Milestone 11: package/deal-value comparison — direct unit
+// tests of compareBuyerPackages itself (not just the pre-existing
+// price-only cases above). See buyerMoveSelection.oldVsNew.test.ts for
+// the separate, mandatory proof that this comparator is behaviorally
+// equivalent to Milestone 9/10's price-only one across every candidate
+// set the current codebase can actually produce.
+describe("Milestone 11: compareBuyerPackages — lexicographic tiers", () => {
+  // constraints.quantity is 50 (module-level, above) — a real shortfall
+  // relative to it exercises evaluateQuantitySufficiency for real,
+  // reusing that function verbatim, never duplicating its logic.
+  it("an insufficient candidate loses to a sufficient one even though it is cheaper", () => {
+    const insufficientButCheap: CandidateMove = {
+      move: "CONCEDE",
+      unitPrice: 44500, // cheaper...
+      quantity: 30, // ...but a 40% shortfall against constraints.quantity (50), well beyond
+      reason: "cheap-but-short",
+    };
+    const sufficientButPricier: CandidateMove = {
+      move: "HOLD",
+      unitPrice: 45500, // more expensive...
+      quantity: 50, // ...but fully sufficient
+      reason: "full-but-pricier",
+    };
+    const winner = selectBestBuyerCandidate(
+      [insufficientButCheap, sufficientButPricier],
+      constraints,
+      30,
+      10,
+    );
+    expect(winner).toBe(sufficientButPricier);
+
+    // Confirms the shortfall really does land on INSUFFICIENT (not
+    // INSUFFICIENT_PRICE_COMPENSATES) for this fixture, so the test is
+    // actually exercising tier 1, not accidentally passing tier 3.
+    expect(
+      evaluateQuantitySufficiency(constraints, insufficientButCheap.quantity!, insufficientButCheap.unitPrice)
+        .verdict,
+    ).toBe("INSUFFICIENT");
+  });
+
+  it("equal sufficiency (both fully sufficient) falls through to price", () => {
+    const a: CandidateMove = { move: "CONCEDE", unitPrice: 45200, quantity: 50, reason: "a" };
+    const b: CandidateMove = { move: "HOLD", unitPrice: 44800, quantity: 50, reason: "b" };
+    expect(selectBestBuyerCandidate([a, b], constraints, 50, 10)).toBe(b); // cheaper wins
+    expect(selectBestBuyerCandidate([b, a], constraints, 50, 10)).toBe(b); // order-independent
+  });
+
+  it("equal sufficiency AND equal price falls through to delivery — faster wins", () => {
+    const slower: CandidateMove = {
+      move: "DELIVERY_FOR_PRICE",
+      unitPrice: 44500,
+      deliveryDays: 15,
+      reason: "slower",
+    };
+    const faster: CandidateMove = { move: "HOLD", unitPrice: 44500, reason: "faster (implicit, via fallback)" };
+    // faster's own deliveryDays is absent -> resolves to currentDeliveryDays (10), which beats slower's 15.
+    expect(selectBestBuyerCandidate([slower, faster], constraints, 50, 10)).toBe(faster);
+    expect(selectBestBuyerCandidate([faster, slower], constraints, 50, 10)).toBe(faster);
+  });
+
+  it("is deterministic — repeated calls on the same input produce the same winner", () => {
+    const candidates: CandidateMove[] = [
+      { move: "CONCEDE", unitPrice: 45200, quantity: 50, reason: "a" },
+      { move: "HOLD", unitPrice: 44800, quantity: 50, reason: "b" },
+      { move: "DELIVERY_FOR_PRICE", unitPrice: 44800, deliveryDays: 20, quantity: 50, reason: "c" },
+    ];
+    const first = selectBestBuyerCandidate(candidates, constraints, 50, 10);
+    const second = selectBestBuyerCandidate(candidates, constraints, 50, 10);
+    const third = selectBestBuyerCandidate([...candidates], constraints, 50, 10);
+    expect(second).toBe(first);
+    expect(third).toEqual(first);
+  });
+
+  it("never mutates the candidates it compares or selects among", () => {
+    const candidates: CandidateMove[] = [
+      { move: "CONCEDE", unitPrice: 45200, quantity: 40, reason: "a" },
+      { move: "HOLD", unitPrice: 44800, quantity: 50, reason: "b" },
+    ];
+    const snapshot = JSON.parse(JSON.stringify(candidates));
+    compareBuyerPackages(candidates[0], candidates[1], constraints, 50, 10);
+    selectBestBuyerCandidate(candidates, constraints, 50, 10);
+    expect(candidates).toEqual(snapshot);
   });
 });

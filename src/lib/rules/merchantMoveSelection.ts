@@ -239,65 +239,82 @@ export function generateMerchantCandidates(
  * "invert the buyer's score" trick) so the merchant's own asymmetric
  * objective stays plainly visible at the call site, per the Milestone 9
  * requirement that candidate quality must never be mirrored between
- * sides. Starting point only — price is the merchant's dominant existing
- * objective (see computeMerchantConcessionPrice's own docs), deliberately
- * easy to extend later (order value, stock posture, history) without
- * changing this function's signature or its callers.
+ * sides. Introduced in Milestone 9; RETAINED here, unused by
+ * selectBestMerchantCandidate itself, purely so
+ * merchantMoveSelection.oldVsNew.test.ts can reconstruct exactly
+ * Milestone 9/10's two-tier selection (below, via isTradeCandidate) and
+ * prove Milestone 11's package comparator (compareMerchantPackages) is
+ * behaviorally equivalent to it.
  */
 export function scoreMerchantCandidate(candidate: CandidateMove): number {
   return candidate.unitPrice;
 }
 
-function isTradeCandidate(candidate: CandidateMove): boolean {
+/**
+ * Exported (Milestone 11) so the old-vs-new regression test can
+ * reconstruct the pre-Milestone-11 two-tier filter+reduce selection
+ * exactly, using the SAME trade/non-trade classification
+ * compareMerchantPackages now uses internally — never a second,
+ * independently-drifting definition of "is this a trade."
+ */
+export function isTradeCandidate(candidate: CandidateMove): boolean {
   return candidate.move === "QUANTITY_FOR_PRICE" || candidate.move === "DELIVERY_FOR_PRICE";
 }
 
-function highestScoring(candidates: CandidateMove[]): CandidateMove {
-  return candidates.reduce((best, candidate) =>
-    scoreMerchantCandidate(candidate) > scoreMerchantCandidate(best) ? candidate : best,
-  );
+/**
+ * Milestone 11: package/deal-value comparison — PACT V2, merchant side.
+ *
+ * Preserves the EXACT asymmetric two-tier structure Milestone 9 already
+ * established (see the extensive rationale that used to live on
+ * selectBestMerchantCandidate, now here) — restructured as an explicit
+ * pairwise comparator instead of a filter+reduce, so it shares the same
+ * SHAPE as compareBuyerPackages without sharing its content (the
+ * Milestone 9 requirement that candidate quality must never be mirrored
+ * between sides still holds: this file's tiers and their meaning are
+ * entirely different from buyerMoveSelection.ts's):
+ *
+ *  1. Trade tier: an eligible trade (QUANTITY_FOR_PRICE / DELIVERY_FOR_PRICE
+ *     — already vetted ACCEPT/COUNTER by its own evaluator) is preferred
+ *     over HOLD/CONCEDE UNCONDITIONALLY, regardless of raw price. A
+ *     trade's own resulting price is never higher than the ordinary
+ *     baseline it was computed from (see both evaluators' COUNTER math),
+ *     so comparing on price alone would make CONCEDE win by construction
+ *     every time — exactly the bug Milestone 9 found and fixed.
+ *  2. Unit price, only within the same tier — higher wins. This is where
+ *     a genuine quantity-vs-delivery trade choice happens (both already
+ *     represent "a price concession in exchange for something," a fair
+ *     comparison), and where HOLD vs CONCEDE is decided (an
+ *     apples-to-apples "how much to move on price alone" question).
+ *
+ * Deliberately NOT "maximize total order value" or "maximize unit price
+ * alone" in any other shape — the current code already establishes only
+ * this specific two-tier behavior, and this milestone preserves it
+ * exactly rather than replacing it with something new (see the
+ * Milestone 11 design review, section F: today's trade evaluators
+ * already convert quantity/delivery value into their own candidate's
+ * price, so raw price comparison within a tier is already a valid
+ * package judgment — no additional dimension needs folding in here).
+ *
+ * Returns positive when `a` is preferred, negative when `b` is, 0 on an
+ * exact tie (letting the caller's reduce() preserve the same
+ * first-encountered tie-break the old filter+reduce implementation had).
+ */
+export function compareMerchantPackages(a: CandidateMove, b: CandidateMove): number {
+  const tradeA = isTradeCandidate(a);
+  const tradeB = isTradeCandidate(b);
+  if (tradeA !== tradeB) {
+    return tradeA ? 1 : -1; // an eligible trade is preferred over a non-trade, unconditionally
+  }
+  return a.unitPrice - b.unitPrice; // within the same tier, a higher price is preferred
 }
 
 /**
- * Selects the best candidate for the merchant.
- *
- * Discovered empirically while probing representative scenarios (per the
- * Milestone 9 calibration discipline) — NOT assumed up front: a trade
- * candidate's whole premise is that evaluateMerchantTrade /
- * evaluateMerchantDeliveryTrade's own asymmetric stock logic has ALREADY
- * decided a worse per-unit price is worth accepting in exchange for
- * something price alone can't represent (committed extra quantity, or
- * operational delivery relief) — an ACCEPT/COUNTER verdict is never
- * priced HIGHER than the ordinary baseline it was computed from (see
- * both evaluators' own COUNTER math: baseline minus a non-negative
- * discount). Comparing a trade's resulting price directly against the
- * plain CONCEDE candidate on raw scoreMerchantCandidate() therefore
- * makes CONCEDE win by construction, every single time — not because
- * the trade was a bad idea, but because price alone cannot see the
- * value the merchant is actually receiving in return. Verified directly:
- * an unconditional flat comparison made every trade candidate
- * permanently unselectable in the full regression suite.
- *
- * The fix: a genuinely eligible trade (one whose own verdict already
- * said ACCEPT/COUNTER) is preferred over the ordinary/HOLD family — that
- * verdict IS the merchant's real "is this worth it" judgment, the same
- * role buyerMoveSelector.ts's eligibility check already plays for the
- * buyer's HOLD. scoreMerchantCandidate (raw price) still does the real
- * comparison WORK in both places it's actually meaningful: choosing
- * between HOLD and CONCEDE (an apples-to-apples "how much to move on
- * price alone" question), and — this milestone's actual new
- * capability — choosing between the quantity and delivery trade
- * candidates when both are simultaneously eligible, which IS a fair
- * comparison (both represent "a price concession in exchange for
- * something"), so the merchant genuinely prefers whichever trade costs
- * it less. This is what lets a genuine quantity-vs-delivery choice
- * happen (see the Milestone 9 integration tests) without reintroducing
- * a fixed, arbitrary priority between the two dimensions.
+ * Selects the best candidate for the merchant via compareMerchantPackages.
+ * Signature unchanged from Milestone 9/10 — every existing call site in
+ * merchantAgent.ts is untouched by this milestone.
  */
 export function selectBestMerchantCandidate(candidates: CandidateMove[]): CandidateMove {
-  const trades = candidates.filter(isTradeCandidate);
-  if (trades.length > 0) {
-    return highestScoring(trades);
-  }
-  return highestScoring(candidates.filter((c) => !isTradeCandidate(c)));
+  return candidates.reduce((best, candidate) =>
+    compareMerchantPackages(candidate, best) > 0 ? candidate : best,
+  );
 }
