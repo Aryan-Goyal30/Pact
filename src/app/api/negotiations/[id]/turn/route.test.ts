@@ -188,3 +188,71 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
     expect(second.status).toBe(409);
   });
 });
+
+// PACT V2 Milestone 10: move observability, exercised through the real
+// route handler and real SQLite session/message persistence — not just
+// the in-memory orchestrator.test.ts path. This fixture is the exact
+// same buyer request used for this milestone's live browser verification
+// against the real seeded LAPTOP-14-I5 catalog item (100 available,
+// listed 48000, floor 44000).
+describe("POST /api/negotiations/:id/turn — Milestone 10: move observability", () => {
+  it("a quantity-for-price trade round's HTTP response carries move === QUANTITY_FOR_PRICE", async () => {
+    const sessionId = await createTestSession(
+      { sku: LAPTOP_SKU, quantity: 50, maxUnitPrice: 45500, deliveryDeadlineDays: 10, urgency: "high" },
+      10,
+    );
+
+    const first = await callTurn(sessionId); // round 1: ordinary opening exchange
+    expect(first.body.buyer.move).toBeUndefined();
+
+    const second = await callTurn(sessionId); // round 2: the quantity-for-price trade fires
+    expect(second.body.buyer.move).toBe("QUANTITY_FOR_PRICE");
+    expect(second.body.buyer.quantity).toBe(100);
+
+    // 11: every existing field is still present, still correctly typed,
+    // and unaffected by the new optional field's presence — a snapshot
+    // of the full non-move shape, asserted explicitly rather than
+    // trusting TypeScript alone.
+    expect(second.body).toMatchObject({
+      sessionId,
+      turn: 2,
+      buyer: {
+        sender: "buyer",
+        type: "counter_offer",
+        sku: LAPTOP_SKU,
+        quantity: 100,
+        unitPrice: expect.any(Number),
+        deliveryDays: expect.any(Number),
+        message: expect.any(String),
+      },
+      merchant: {
+        sender: "merchant",
+        type: "counter_offer",
+        sku: LAPTOP_SKU,
+        quantity: expect.any(Number),
+        unitPrice: expect.any(Number),
+        deliveryDays: expect.any(Number),
+        message: expect.any(String),
+      },
+      status: "COUNTERED",
+      round: 2,
+      maxRounds: 10,
+      agreement: null,
+    });
+    expect(second.body.leverage.buyer + second.body.leverage.merchant).toBe(100);
+  });
+
+  it("a plain accept round's HTTP response carries no move field at all (JSON omits it, not null)", async () => {
+    const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
+
+    await callTurn(sessionId); // turn 1: counter_offer
+    const closing = await callTurn(sessionId); // turn 2: AGREED (a plain accept)
+
+    expect(closing.body.status).toBe("AGREED");
+    expect(closing.body.buyer.move).toBeUndefined();
+    expect(closing.body.merchant.move).toBeUndefined();
+    // Confirms JSON omission, not a serialized `"move":null`.
+    const raw = JSON.stringify(closing.body.buyer);
+    expect(raw).not.toContain("move");
+  });
+});

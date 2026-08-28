@@ -19,6 +19,8 @@ import {
   negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
   negotiationMessageTypeLabel,
+  negotiationMoveBadgeClass,
+  negotiationMoveLabel,
   negotiationStatusBadgeClass,
   negotiationStatusLabel,
   parseBuyerRequestForm,
@@ -672,10 +674,19 @@ function MessageBubble({
         <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
           {label}
         </span>
-        <span
-          className={`rounded px-2 py-0.5 text-xs font-medium ${negotiationMessageTypeBadgeClass(msg.type)}`}
-        >
-          {negotiationMessageTypeLabel(msg.type)}
+        <span className="flex items-center gap-1.5">
+          {msg.move && (
+            <span
+              className={`rounded px-2 py-0.5 text-xs font-medium ${negotiationMoveBadgeClass(msg.move)}`}
+            >
+              {negotiationMoveLabel(msg.move)}
+            </span>
+          )}
+          <span
+            className={`rounded px-2 py-0.5 text-xs font-medium ${negotiationMessageTypeBadgeClass(msg.type)}`}
+          >
+            {negotiationMessageTypeLabel(msg.type)}
+          </span>
         </span>
       </div>
       <p className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">{msg.message}</p>

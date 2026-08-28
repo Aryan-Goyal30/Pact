@@ -10,6 +10,7 @@ import type {
   NegotiationParticipant,
 } from "@/lib/negotiation/protocol";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 
 /** The buyer request a client submits to start a negotiation run. */
 export interface NegotiationRunRequest {
@@ -27,6 +28,8 @@ export interface NegotiationMessageDTO {
   unitPrice: number | null;
   deliveryDays: number | null;
   message: string;
+  /** Milestone 10: the deterministic strategic move behind this message, when one was genuinely decided — see StructuredNegotiationMessage.move. Absent (not null/undefined-on-the-wire — JSON simply omits it) whenever no such decision applies to this message. */
+  move?: CandidateMoveType;
 }
 
 export interface NegotiationTurnDTO {

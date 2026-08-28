@@ -1731,3 +1731,208 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     ).toBe(true);
   });
 });
+
+// PACT V2 Milestone 10: move observability — the already-selected
+// deterministic move (Milestone 9) now reaches
+// StructuredNegotiationMessage.move through the real orchestrator, not
+// just the agent-layer response. Every fixture below reuses an ALREADY
+// real, orchestrator-verified scenario from elsewhere in this file (the
+// "buyer-initiated quantity-for-price trade", "buyer-initiated
+// delivery-for-price trade", and "buyer HOLD strategy" describe blocks
+// above) or was empirically probed with the same discipline — no
+// hand-constructed move values.
+describe("Milestone 10: move observability through the real orchestrator", () => {
+  it("a quantity-for-price round reports buyer.move === QUANTITY_FOR_PRICE (reusing the quantity-trade fixture)", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 150,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 150,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 50,
+      maxUnitPrice: 45500,
+      deliveryDeadlineDays: 10,
+      urgency: "high",
+    };
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      10,
+    );
+
+    // Round 1: an ordinary counter — no genuine candidate comparison
+    // beyond the baseline concession yet on the buyer's side.
+    expect(transcript[0].buyer.move).toBeUndefined();
+    // Round 2: the buyer's quantity-for-price trade genuinely wins.
+    expect(transcript[1].buyer.move).toBe("QUANTITY_FOR_PRICE");
+    expect(transcript[1].buyer.quantity).toBe(100);
+    // Round 3: a plain accept — no move (see the exclusion list in
+    // StructuredNegotiationMessage.move's own doc comment).
+    expect(transcript[2].buyer.type).toBe("accept");
+    expect(transcript[2].buyer.move).toBeUndefined();
+  });
+
+  it("a delivery-for-price round reports move === DELIVERY_FOR_PRICE for BOTH buyer and merchant (reusing the delivery-trade fixture)", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 30,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 15,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 30,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 15,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 40,
+      maxUnitPrice: 45500,
+      deliveryDeadlineDays: 8,
+      urgency: "high",
+      deliveryFlexible: true,
+    };
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      10,
+    );
+
+    expect(transcript[1].buyer.move).toBe("DELIVERY_FOR_PRICE");
+    expect(transcript[1].buyer.deliveryDays).toBe(12);
+    // The merchant independently evaluated and selected the SAME
+    // dimension this round too — both sides' selected moves reach the
+    // transcript, not just the buyer's.
+    expect(transcript[1].merchant.move).toBe("DELIVERY_FOR_PRICE");
+  });
+
+  it("a HOLD round reports buyer.move === HOLD (reusing the buyer-HOLD fixture)", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 35,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 35,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 20,
+      maxUnitPrice: 44300,
+      deliveryDeadlineDays: 10,
+      urgency: "low",
+      deliveryFlexible: true,
+    };
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      10,
+    );
+
+    expect(transcript[1].buyer.move).toBe("HOLD");
+    expect(transcript[1].buyer.unitPrice).toBe(transcript[0].buyer.unitPrice); // genuinely repeated, not coincidence
+  });
+
+  it("an ordinary concession round reports move === CONCEDE for both sides", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 20,
+      maxUnitPrice: 45500,
+      deliveryDeadlineDays: 10,
+      urgency: "medium",
+    };
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      3,
+    );
+
+    expect(transcript[1].buyer.move).toBe("CONCEDE");
+    expect(transcript[1].merchant.move).toBe("CONCEDE");
+  });
+
+  it("a merchant HOLD round reports merchant.move === HOLD through the full buyer<->merchant orchestrator loop", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 15, // scarce -> opens the merchant's stock-scarcity HOLD gate
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 15,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 300, // bulk -> also opens the merchant's own quantity-trade evaluator
+      maxUnitPrice: 44100,
+      deliveryDeadlineDays: 10,
+      urgency: "medium",
+    };
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      8,
+    );
+
+    expect(transcript[1].merchant.move).toBe("HOLD");
+    expect(transcript[1].merchant.unitPrice).toBe(transcript[0].merchant.unitPrice); // genuinely repeated, not coincidence
+  });
+});

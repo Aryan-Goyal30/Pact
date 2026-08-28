@@ -17,6 +17,7 @@ import {
 } from "@/lib/rules/negotiationEngine";
 import { explainMerchantFactors, resolveDeliveryTrade } from "@/lib/rules/negotiationStrategy";
 import { generateMerchantCandidates, selectBestMerchantCandidate } from "@/lib/rules/merchantMoveSelection";
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
@@ -35,6 +36,18 @@ export interface MerchantAgentResponse {
   offer: MerchantAgentOffer | null;
   /** LLM-generated natural-language explanation of `decision`. */
   message: string;
+  /**
+   * Milestone 10: the strategic move the merchant's candidate-selection
+   * layer (merchantMoveSelection.ts) actually chose this round —
+   * HOLD / CONCEDE / QUANTITY_FOR_PRICE / DELIVERY_FOR_PRICE. Undefined
+   * whenever no candidate selection happened at all this round: no round
+   * context supplied, the buyer's ceiling already meets/beats the listed
+   * price, or the outcome isn't one that carries a negotiated price
+   * (REJECTED) — see applyMerchantConcession's own guard clause. Set from
+   * the SAME `selected` value merchantMoveSelection.ts already computed
+   * to build `decision.reasons`, never recomputed here.
+   */
+  move?: CandidateMoveType;
 }
 
 const MERCHANT_SYSTEM_PROMPT = `You are PACT's Merchant Agent, communicating with an AI buyer agent on behalf of the merchant.
@@ -123,6 +136,17 @@ function toPublicContext(result: NegotiationResult): Record<string, unknown> {
  * function (Milestone 1) needing to change at all. Omitted (undefined)
  * reproduces exactly today's behavior — see
  * evaluateBuyerReciprocity's UNKNOWN case.
+ *
+ * Milestone 10: returns `{ decision, move }` rather than a bare
+ * NegotiationResult, so the candidate genuinely selected by
+ * merchantMoveSelection.ts survives to the caller (runMerchantAgent) even
+ * on the no-op early-return path below, where `selected` was computed
+ * but its resulting price/delivery happened to numerically match what
+ * `decision` already had (see that branch's own comment). Without this,
+ * a genuinely-decided HOLD/CONCEDE/trade move would silently vanish
+ * whenever it happened to tie the engine's own single-shot number —
+ * purely an observability fix; `decision`'s own fields are completely
+ * unaffected on every path.
  */
 function applyMerchantConcession(
   item: CatalogItemSnapshot,
@@ -140,14 +164,18 @@ function applyMerchantConcession(
    * legacy, always-on resolveDeliveryTrade formula applies.
    */
   previousBuyerDeliveryDays?: number | null,
-): NegotiationResult {
+): { decision: NegotiationResult; move?: CandidateMoveType } {
   if (
     request.maxUnitPrice === undefined ||
     request.maxUnitPrice >= item.listedPrice ||
     decision.unitPrice === null ||
     (decision.outcome !== "COUNTER_OFFER" && decision.outcome !== "PARTIAL_FULFILLMENT")
   ) {
-    return decision;
+    // No candidate selection happened at all this round (nothing to
+    // observe) — move stays undefined, exactly like every other
+    // "no genuine decision made" case (see MerchantAgentResponse.move's
+    // doc comment).
+    return { decision };
   }
 
   // Milestone 9: generate every currently-eligible candidate (ordinary
@@ -169,7 +197,13 @@ function applyMerchantConcession(
   const selected = selectBestMerchantCandidate(candidates);
 
   if (selected.unitPrice === decision.unitPrice && deliveryDays === decision.deliveryDays) {
-    return decision;
+    // A genuine candidate WAS selected — `decision`'s own terms just
+    // happen to already match it numerically (e.g. the engine's
+    // single-shot price already equals what the comparison landed on),
+    // so there's nothing to override. The move itself is real and must
+    // still be reported — this is exactly the early-return gap flagged
+    // in the Milestone 10 design review.
+    return { decision, move: selected.move };
   }
 
   const quantityIncreasedFromPrior =
@@ -212,7 +246,7 @@ function applyMerchantConcession(
       ...explainMerchantFactors(item, false, trade),
     );
 
-  return { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons };
+  return { decision: { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons }, move: selected.move };
 }
 
 /**
@@ -298,8 +332,9 @@ export async function runMerchantAgent(
   previousBuyerDeliveryDays?: number | null,
 ): Promise<MerchantAgentResponse> {
   let decision = evaluateNegotiationRequest(item, request);
+  let move: CandidateMoveType | undefined;
   if (item && concessionContext) {
-    decision = applyMerchantConcession(
+    const concession = applyMerchantConcession(
       item,
       request,
       decision,
@@ -308,6 +343,8 @@ export async function runMerchantAgent(
       previousBuyerQuantity,
       previousBuyerDeliveryDays,
     );
+    decision = concession.decision;
+    move = concession.move;
   }
 
   const context = toPublicContext(decision);
@@ -346,6 +383,7 @@ export async function runMerchantAgent(
     decision,
     offer: toOffer(decision),
     message,
+    move,
   };
 }
 

@@ -35,11 +35,12 @@ import {
   type NegotiationState,
   type NegotiationStatus,
 } from "@/lib/rules/negotiationState";
-import { runBuyerAgent, runBuyerWalkAway, type BuyerAction } from "@/lib/agents/buyerAgent";
+import { runBuyerAgent, runBuyerWalkAway, type BuyerAction, type BuyerAgentResponse } from "@/lib/agents/buyerAgent";
 import { runMerchantAgent, runMerchantWalkAway } from "@/lib/agents/merchantAgent";
 import type { StructuredNegotiationMessage } from "@/lib/negotiation/protocol";
 import { computeLeverage, type LeverageScore } from "@/lib/rules/leverage";
 import { arePositionsRepeated, isPriceGapUnbridgeable, type WalkAwayReason } from "@/lib/rules/walkAway";
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 
 export interface NegotiationContext {
   item: CatalogItemSnapshot;
@@ -62,7 +63,34 @@ type NegotiationTurnResultCore = Omit<NegotiationTurnResult, "leverage">;
 
 const TERMINAL_STATUSES: NegotiationStatus[] = ["AGREED", "REJECTED", "EXPIRED"];
 
-function buyerActionToMessage(action: BuyerAction, text: string): StructuredNegotiationMessage {
+/**
+ * Milestone 10: combines BuyerAgentResponse's two already-computed move
+ * fields (move / tradeMove — see buyerAgent.ts) into the single public
+ * CandidateMoveType this message carries. This is NOT a new decision —
+ * buildResponseToMerchantOffer (buyerAgent.ts) already guarantees at most
+ * one of the two carries a real value whenever a genuine candidate
+ * selection happened this round (a trade winning sets tradeMove and
+ * nulls move; the ordinary candidate winning sets move and leaves
+ * tradeMove as "NO_TRADE"), and both are null whenever no selection was
+ * made at all (opening request, ordinary accept, ordinary reject, or a
+ * caller without a round context) — this function only picks whichever
+ * of the two is actually populated.
+ */
+function resolveBuyerMove(response: Pick<BuyerAgentResponse, "move" | "tradeMove">): CandidateMoveType | undefined {
+  if (response.tradeMove === "QUANTITY_FOR_PRICE" || response.tradeMove === "DELIVERY_FOR_PRICE") {
+    return response.tradeMove;
+  }
+  if (response.move === "HOLD" || response.move === "CONCEDE") {
+    return response.move;
+  }
+  return undefined;
+}
+
+function buyerActionToMessage(
+  action: BuyerAction,
+  text: string,
+  move: CandidateMoveType | undefined,
+): StructuredNegotiationMessage {
   return {
     sender: "buyer",
     type: action.type,
@@ -71,6 +99,7 @@ function buyerActionToMessage(action: BuyerAction, text: string): StructuredNego
     unitPrice: action.unitPrice,
     deliveryDays: action.deliveryDays,
     message: text,
+    move,
   };
 }
 
@@ -281,7 +310,11 @@ export async function runNegotiationTurn(
       previousBuyerDeliveryDays,
     },
   );
-  const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
+  const buyerMessage = buyerActionToMessage(
+    buyerResponse.action,
+    buyerResponse.message,
+    resolveBuyerMove(buyerResponse),
+  );
 
   // The buyer deterministically decided (buyerRules.ts) to accept the
   // merchant's previous offer — close on those terms. No new merchant
@@ -429,6 +462,7 @@ export async function runNegotiationTurn(
       unitPrice: merchantResult.unitPrice,
       deliveryDays: merchantResult.deliveryDays,
       message: merchantAgentResponse.message,
+      move: merchantAgentResponse.move,
     },
     nextMerchantResult: nextState.status === "COUNTERED" ? merchantResult : null,
   });

@@ -11,6 +11,15 @@
 // pricePerUnit / deliveryDays / messageText), so a later phase that
 // persists a transcript can map to it directly instead of inventing a
 // second representation of the same concept.
+//
+// Milestone 10: `move` is additive observability for a strategic decision
+// that was ALREADY made deterministically before this message was ever
+// built (see buyerMoveSelection.ts / merchantMoveSelection.ts) — it never
+// changes `type` or any negotiated term, and the LLM never sees or
+// chooses it. Reuses CandidateMoveType directly rather than inventing a
+// second, incompatible move enum.
+
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 
 export type NegotiationParticipant = "buyer" | "merchant";
 
@@ -31,4 +40,15 @@ export interface StructuredNegotiationMessage {
   deliveryDays: number | null;
   /** LLM-generated text for display only — never parsed for its content. */
   message: string;
+  /**
+   * Milestone 10: the deterministic strategic move that produced this
+   * message, when one was genuinely decided by the candidate-selection
+   * layer this round. Absent (not null) whenever no such decision was
+   * made for this message — the opening request, an ordinary accept, an
+   * ordinary reject, or a walk-away — matching exactly the set of cases
+   * BuyerAgentResponse.move/tradeMove and MerchantAgentResponse.move are
+   * already null/undefined for. Never set by, read from, or inferred by
+   * the LLM.
+   */
+  move?: CandidateMoveType;
 }

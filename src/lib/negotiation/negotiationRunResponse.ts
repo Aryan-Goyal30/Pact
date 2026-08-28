@@ -31,6 +31,11 @@ export function toMessageDTO(message: StructuredNegotiationMessage): Negotiation
     unitPrice: message.unitPrice,
     deliveryDays: message.deliveryDays,
     message: message.message,
+    // Milestone 10: additive observability field — carried through
+    // unchanged, never recomputed. Undefined here (the common case for
+    // request/accept/reject messages) is dropped entirely by
+    // JSON.stringify at the API boundary, so old consumers see no new key.
+    move: message.move,
   };
 }
 

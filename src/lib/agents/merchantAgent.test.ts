@@ -898,3 +898,99 @@ describe("runMerchantWalkAway", () => {
     expect(priceGap.message).not.toBe(repeated.message);
   });
 });
+
+// PACT V2 Milestone 10: move observability — MerchantAgentResponse.move
+// carries exactly the candidate merchantMoveSelection.ts already selected
+// (see applyMerchantConcession in merchantAgent.ts), never a recomputed
+// or inferred value. Every fixture below is reused verbatim from an
+// already-passing describe block elsewhere in this file (or, for the
+// no-op tie case, empirically probed the same way every other pinned
+// value in this codebase is) — nothing here is hand-derived.
+describe("Milestone 10: move observability (MerchantAgentResponse.move)", () => {
+  beforeEach(() => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+  });
+
+  it("a quantity-for-price trade round reports move === QUANTITY_FOR_PRICE", async () => {
+    const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+    const response = await runMerchantAgent(
+      abundant,
+      { sku: item.sku, quantity: 300, maxUnitPrice: 44100 },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+    );
+    expect(response.move).toBe("QUANTITY_FOR_PRICE");
+    expect(response.decision.unitPrice).toBe(44345);
+  });
+
+  it("a delivery-for-price trade round reports move === DELIVERY_FOR_PRICE", async () => {
+    const constrained: CatalogItemSnapshot = { ...item, availableQty: 15, maxDeliveryDays: 20 };
+    const response = await runMerchantAgent(
+      constrained,
+      { sku: item.sku, quantity: 100, maxUnitPrice: 45500, deliveryDeadlineDays: 12, deliveryFlexible: true },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 46000 },
+      undefined,
+      undefined,
+      8,
+    );
+    expect(response.move).toBe("DELIVERY_FOR_PRICE");
+    expect(response.decision.unitPrice).toBe(45500);
+    expect(response.decision.deliveryDays).toBe(12);
+  });
+
+  it("a HOLD round (scarce stock, genuine comparison winner) reports move === HOLD", async () => {
+    const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+    const response = await runMerchantAgent(
+      scarce,
+      { sku: item.sku, quantity: 300, maxUnitPrice: 44100 },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+    );
+    expect(response.move).toBe("HOLD");
+    expect(response.decision.unitPrice).toBe(45600);
+  });
+
+  it("an ordinary concession round reports move === CONCEDE", async () => {
+    const response = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+      { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      44000,
+    );
+    expect(response.move).toBe("CONCEDE");
+    expect(response.decision.unitPrice).toBe(45638);
+  });
+
+  it("a REJECTED outcome (non-negotiable item) never carries a move", async () => {
+    const nonNegotiable: CatalogItemSnapshot = { ...item, negotiationEnabled: false };
+    const response = await runMerchantAgent(
+      nonNegotiable,
+      { sku: item.sku, quantity: 10, maxUnitPrice: 1000 },
+      { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+    );
+    expect(response.decision.outcome).toBe("REJECTED");
+    expect(response.move).toBeUndefined();
+  });
+
+  it("a single-shot caller (no concessionContext) never carries a move — no candidate selection ran", async () => {
+    const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10, maxUnitPrice: 45000 });
+    expect(response.decision.outcome).toBe("COUNTER_OFFER");
+    expect(response.move).toBeUndefined();
+  });
+
+  // The early-return/no-op path identified in the Milestone 10 design
+  // review: applyMerchantConcession's own round-aware calculation lands
+  // on EXACTLY the same price evaluateNegotiationRequest's single-shot
+  // formula already produced (a genuine, reachable tie — round 1, no
+  // previousOfferUnitPrice yet), so the function returns `decision`
+  // unchanged rather than overriding it. A genuine candidate WAS still
+  // selected (CONCEDE) and must not be silently lost just because
+  // nothing needed to change numerically.
+  it("the no-op tie path (selected price already matches the engine's own baseline) still reports the genuinely selected move", async () => {
+    const response = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 10, maxUnitPrice: 44000 },
+      { round: 1, maxRounds: 6 }, // no previousOfferUnitPrice -> reachable tie
+    );
+    expect(response.decision.unitPrice).toBe(46000);
+    expect(response.move).toBe("CONCEDE");
+  });
+});

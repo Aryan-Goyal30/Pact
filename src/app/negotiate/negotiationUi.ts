@@ -6,6 +6,7 @@
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
 import type { PublicManifestProduct } from "@/types/manifest";
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 
 export type UrgencyFormValue = "low" | "medium" | "high";
 
@@ -286,4 +287,37 @@ const MESSAGE_TYPE_BADGE_CLASSES: Record<NegotiationMessageType, string> = {
 
 export function negotiationMessageTypeBadgeClass(type: NegotiationMessageType): string {
   return MESSAGE_TYPE_BADGE_CLASSES[type];
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 10: strategic move label — the smallest possible UI surface
+// for the deterministic move already selected server-side (see
+// candidateMove.ts / buyerMoveSelection.ts / merchantMoveSelection.ts).
+// Purely a label lookup, same shape as negotiationMessageTypeLabel/
+// negotiationMessageTypeBadgeClass above — never infers or recomputes a
+// move from price/quantity/delivery numbers itself.
+// ---------------------------------------------------------------------------
+
+const MOVE_LABELS: Record<CandidateMoveType, string> = {
+  HOLD: "Hold",
+  CONCEDE: "Concede",
+  QUANTITY_FOR_PRICE: "Quantity for Price",
+  DELIVERY_FOR_PRICE: "Delivery for Price",
+};
+
+/** Human-readable label for a strategic move. */
+export function negotiationMoveLabel(move: CandidateMoveType): string {
+  return MOVE_LABELS[move];
+}
+
+const MOVE_BADGE_CLASSES: Record<CandidateMoveType, string> = {
+  HOLD: "bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-300",
+  CONCEDE: "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300",
+  QUANTITY_FOR_PRICE: "bg-teal-100 text-teal-800 dark:bg-teal-900/40 dark:text-teal-300",
+  DELIVERY_FOR_PRICE: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300",
+};
+
+/** Badge color class for a strategic move — same convention as negotiationMessageTypeBadgeClass. */
+export function negotiationMoveBadgeClass(move: CandidateMoveType): string {
+  return MOVE_BADGE_CLASSES[move];
 }
