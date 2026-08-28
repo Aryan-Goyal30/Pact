@@ -12,6 +12,7 @@ import { getLlmProvider } from "@/lib/llm/provider";
 import { runMerchantAgent } from "@/lib/agents/merchantAgent";
 import * as walkAway from "@/lib/rules/walkAway";
 import { generateBuyerCandidates, selectBestBuyerCandidate } from "@/lib/rules/buyerMoveSelection";
+import { generateMerchantCandidates } from "@/lib/rules/merchantMoveSelection";
 
 // The LLM is mocked at the provider boundary — every other layer (buyer
 // agent, merchant agent, deterministic engine, state machine) runs for
@@ -1672,7 +1673,28 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
   // guaranteed to tie on price — a genuine, documented structural
   // finding, not a gap in this milestone's own selection logic. See the
   // final report's Limitations section.)
-  it("E: merchant picks quantity when stock is abundant, delivery when stock is constrained — same code path, situation decides", async () => {
+  //
+  // Milestone 12 update: this fixture's own previousBuyerQuantity AND
+  // previousBuyerDeliveryDays were ALWAYS both genuinely increased
+  // together (by original design, to prove "situation decides between
+  // the two solo trades") — which now ALSO satisfies the combined
+  // package's own eligibility. At abundant stock, the combined
+  // candidate genuinely beats the solo quantity trade on price (44745 >
+  // 44500 — a HIGHER, better-for-merchant price): its own baseline is
+  // GENUINELY blind to both dimensions, whereas the solo quantity
+  // trade's baseline still silently includes the legacy, always-on
+  // per-day delivery discount (resolveDeliveryTrade) whenever
+  // deliveryFlexible is set, unrelated to this round's actual delivery
+  // dynamics — a real, pre-existing inconsistency between the two solo
+  // evaluators' own baselines, only exposed now that a genuinely joint-
+  // blind baseline exists to compare against (see the Milestone 12
+  // report's Limitations section). At constrained stock, the combined
+  // candidate ties exactly with the solo delivery trade (both share the
+  // SAME already-blind baseline, and quantity contributes nothing at
+  // low stock), so the solo delivery candidate — generated first —
+  // keeps winning via the existing first-encountered tie-break,
+  // completely unchanged.
+  it("E: merchant picks the combined package when stock is abundant, delivery alone when stock is constrained — same code path, situation decides", async () => {
     const item: CatalogItemSnapshot = {
       sku: "LAPTOP-14-I5",
       listedPrice: 48000,
@@ -1715,16 +1737,22 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
 
     // Abundant stock: quantity is rewarded (extra units are easy to
     // fulfill), delivery is not (extra time has no operational value) —
-    // the merchant picks QUANTITY_FOR_PRICE.
-    expect(abundantResponse.decision.unitPrice).toBe(44500);
+    // the merchant picks the combined package, whose own reason
+    // correctly attributes the value to quantity alone.
+    expect(abundantResponse.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(abundantResponse.decision.unitPrice).toBe(44745);
     expect(
-      abundantResponse.decision.reasons.some((r) => r.includes("order size makes this quantity attractive")),
+      abundantResponse.decision.reasons.some((r) => r.includes("delivery window offered has little additional value")),
     ).toBe(true);
 
     // Constrained stock: the inverse — extra delivery time is genuinely
     // valuable, extra committed quantity is not — the merchant picks
-    // DELIVERY_FOR_PRICE instead, using the EXACT SAME candidate
+    // DELIVERY_FOR_PRICE alone (ties exactly with the combined
+    // candidate here, since quantity contributes nothing at low stock;
+    // delivery was generated first, so it keeps winning via the
+    // existing, unmodified tie-break), using the EXACT SAME candidate
     // generation/selection code path.
+    expect(constrainedResponse.move).toBe("DELIVERY_FOR_PRICE");
     expect(constrainedResponse.decision.unitPrice).toBe(44985);
     expect(
       constrainedResponse.decision.reasons.some((r) => r.includes("extra delivery time offered is genuinely valuable")),
@@ -1934,5 +1962,263 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
 
     expect(transcript[1].merchant.move).toBe("HOLD");
     expect(transcript[1].merchant.unitPrice).toBe(transcript[0].merchant.unitPrice); // genuinely repeated, not coincidence
+  });
+});
+
+// PACT V2 Milestone 12: combined quantity+delivery-for-price bargaining
+// — the first genuinely multi-dimensional buyer move, through the real
+// orchestrator (real BuyerConstraints, real CatalogItemSnapshot, real
+// computeLeverage(), real history) end to end. Fixture found by
+// empirically probing several representative leverage/stock
+// combinations (not hand-tuned to force a desired winner) — see the
+// Milestone 12 report for the calibration discipline this followed.
+describe("buyer-initiated combined quantity+delivery-for-price package through the real orchestrator", () => {
+  const item: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 45, // deliberately just under the combined ask's own quantity give (80), so the merchant's EXISTING partial-fulfillment path is exercised too — see the second test below.
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 15,
+    negotiationEnabled: true,
+  };
+  const listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 45,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 15,
+    negotiable: true,
+  };
+  const packageBuyerConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 40,
+    maxUnitPrice: 45400,
+    deliveryDeadlineDays: 8,
+    urgency: "high",
+    deliveryFlexible: true,
+  };
+
+  // The milestone's own worked example, made real: "I'll take 80 units
+  // and accept delivery in 12 days if you can do 43130" — both the
+  // quantity chip AND the delivery chip fire together, as ONE
+  // conditional move, and the negotiation still reaches a genuine
+  // AGREED close.
+  it("the buyer offers more quantity AND more delivery time together, the merchant evaluates the combined package, and they reach AGREED", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: packageBuyerConstraints },
+      10,
+    );
+
+    // Round 1: ordinary opening exchange — no trade yet.
+    expect(transcript[0].buyer.move).toBeUndefined();
+    expect(transcript[0].buyer.quantity).toBe(40);
+    expect(transcript[0].buyer.deliveryDays).toBe(8);
+
+    // Round 2: the buyer changes BOTH quantity AND delivery together, in
+    // the SAME round, as one conditional offer — never two independent
+    // field changes.
+    expect(transcript[1].buyer.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(transcript[1].buyer.quantity).toBe(80); // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
+    expect(transcript[1].buyer.deliveryDays).toBe(12); // 8 + round(8 * DELIVERY_TRADE_EXTENSION_FRACTION)
+    expect(transcript[1].buyer.unitPrice).toBe(43130);
+
+    // The merchant cannot actually supply 80 units (only 45 available) —
+    // the EXISTING partial-fulfillment path (Milestone 6, completely
+    // untouched) naturally caps the quantity half of the combined
+    // package to its own real stock, while still honoring the extended
+    // 12-day delivery date the buyer offered. No special-casing was
+    // needed for this interaction — it falls directly out of reusing
+    // the existing, unmodified engine.
+    expect(transcript[1].merchant.quantity).toBe(45);
+    expect(transcript[1].merchant.deliveryDays).toBe(12);
+
+    // Round 3: a genuine AGREED close on the merchant's own real,
+    // stock-capped terms — the buyer accepts once those terms actually
+    // satisfy its ceiling, never automatically.
+    expect(transcript[2].buyer.type).toBe("accept");
+    expect(finalState.status).toBe("AGREED");
+    expect(finalState.round).toBeGreaterThan(0);
+  });
+
+  // PACT V2 Milestone 12 CORRECTION: traces every layer of the real
+  // fixture above end to end, per the correction's own explicit
+  // requirement — BuyerAction.quantity, Merchant decision.offeredQuantity,
+  // the quantity actually passed into the merchant's trade evaluators,
+  // Merchant final offered quantity, Merchant final unit price, and final
+  // Agreement quantity.
+  it("traces every layer of quantity fidelity: buyer asks 80, merchant authorizes and prices against 45, never 80", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: packageBuyerConstraints },
+      10,
+    );
+
+    // 1. BuyerAction.quantity — the buyer's raw ask, honestly stated as
+    // what was asked (this is NOT the bug; a buyer proposing more than
+    // it knows the merchant has is expected and unchanged by this
+    // correction — see the Milestone 12 safety review).
+    expect(transcript[1].buyer.quantity).toBe(80);
+
+    // 2. Merchant decision.offeredQuantity / final offered quantity /
+    // final Agreement quantity — all three are the SAME authoritative
+    // number, set once by evaluateNegotiationRequest's stock cap
+    // (min(80, 45) = 45) and never touched by the candidate/pricing
+    // layer this correction changed. Unaffected by this correction
+    // (already correct before it) — confirmed still true after.
+    expect(transcript[1].merchant.quantity).toBe(45);
+    expect(finalState.status).toBe("AGREED");
+
+    // 3 & 4. What the merchant's PRICE evaluation actually used, and the
+    // resulting price. In this exact real trajectory, the buyer's round-2
+    // ask (43130) is below the merchant's own floor (44000) — every
+    // trade evaluator's floor check fires first (a check on unitPrice,
+    // never quantity), so CONCEDE wins this specific round and no trade
+    // candidate's own quantity field is part of the observable output
+    // here. This is a real, honest finding, not a gap in the fix — see
+    // the companion test below, which raises only the price (keeping
+    // every other real input from this exact round identical) to make
+    // the evaluator's own quantity input directly observable.
+    expect(transcript[1].merchant.move).toBe("CONCEDE");
+  });
+
+  // The companion trace: the SAME real function
+  // (generateMerchantCandidates), fed the SAME real round-2 history
+  // (previousBuyerQuantity 40, previousBuyerDeliveryDays 8, round 2 of
+  // 10, previousOfferUnitPrice 45445 — all copied verbatim from the
+  // fixture above), with ONLY request.maxUnitPrice raised from 43130 to
+  // 44900 so the trade evaluators clear the floor and their own
+  // ACCEPT/COUNTER path — and therefore their own recorded quantity —
+  // becomes directly observable. This is what actually proves the fix:
+  // BEFORE this correction, both QUANTITY_FOR_PRICE and
+  // QUANTITY_AND_DELIVERY_FOR_PRICE would have carried quantity: 80
+  // (request.quantity); after it, both correctly carry 45
+  // (authorizedQuantity) — verified directly, not inferred.
+  it("the evaluator itself receives and records the authorized quantity (45), never the raw ask (80), once the trade path is observable", () => {
+    const authorizedQuantity = 45; // min(request.quantity=80, item.availableQty=45)
+    const { candidates } = generateMerchantCandidates(
+      item,
+      {
+        sku: item.sku,
+        quantity: 80, // the buyer's real round-2 ask
+        maxUnitPrice: 44900, // raised above the floor only to make the ACCEPT/COUNTER path observable
+        deliveryDeadlineDays: 12,
+        deliveryFlexible: true,
+      },
+      { round: 2, maxRounds: 10, previousOfferUnitPrice: 45445 }, // the real round-1 merchant price
+      43130, // priorBuyerUnitPrice: the real round-1 buyer price
+      40, // previousBuyerQuantity: the real round-1 buyer quantity
+      8, // previousBuyerDeliveryDays: the real round-1 buyer delivery
+      authorizedQuantity,
+    );
+
+    const quantityTrade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
+    const combinedTrade = candidates.find((c) => c.move === "QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(quantityTrade).toBeDefined();
+    expect(combinedTrade).toBeDefined();
+    expect(quantityTrade!.quantity).toBe(45); // NOT 80
+    expect(combinedTrade!.quantity).toBe(45); // NOT 80
+    // Both ACCEPT the buyer's own (now floor-clearing) ask outright —
+    // confirms the fix didn't accidentally break the evaluators'
+    // real ACCEPT/COUNTER logic.
+    expect(quantityTrade!.unitPrice).toBe(44900);
+    expect(combinedTrade!.unitPrice).toBe(44900);
+  });
+
+  // Milestone 12 section 15: a successful combined package consumes
+  // BOTH chips at once — reusing the EXISTING, unmodified diff-based
+  // history detection (quantityTradeAlreadyUsed / deliveryTradeAlreadyUsed
+  // in runNegotiationToCompletion, and hasBuyerProposedQuantityAbove /
+  // hasBuyerProposedDeliveryDaysAbove in negotiationSessionRepository.ts)
+  // — no new tracking mechanism was added. Proven directly: after the
+  // combined round, the SAME real candidate pool
+  // (generateBuyerCandidates) that produced it, now told both chips are
+  // used (exactly as the orchestrator's own history scan would report),
+  // no longer offers ANY of the three trade candidates.
+  it("after a combined package fires, neither solo chip nor the combined chip is offered again (real candidate pool, real history flags)", () => {
+    const candidatesAfter = generateBuyerCandidates(
+      packageBuyerConstraints,
+      44577, // the real round-2 merchant offer from the fixture above
+      45,
+      { round: 3, maxRounds: 10 },
+      {
+        previousBuyerUnitPrice: 43130,
+        leverageScore: 65,
+        // Exactly what the orchestrator's own real history-scan
+        // functions would report after the round-2 transcript above
+        // (buyer.quantity 80 > original 40, buyer.deliveryDays 12 > original 8).
+        quantityTradeAlreadyUsed: true,
+        deliveryTradeAlreadyUsed: true,
+      },
+    );
+    expect(candidatesAfter.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(false);
+    expect(candidatesAfter.some((c) => c.move === "DELIVERY_FOR_PRICE")).toBe(false);
+    expect(candidatesAfter.some((c) => c.move === "QUANTITY_AND_DELIVERY_FOR_PRICE")).toBe(false);
+    // Only the ordinary HOLD/CONCEDE candidate remains.
+    expect(candidatesAfter).toHaveLength(1);
+  });
+});
+
+// PACT V2 Milestone 12 section 17: a regression guard, not a redesign —
+// arePositionsRepeated (walkAway.ts) is untouched and compares ONLY
+// unitPrice round-over-round, never quantity/deliveryDays. This
+// fixture's own real trajectory turned out to demonstrate the EXACT
+// theoretical risk the Milestone 12 design review flagged: the buyer's
+// combined-package price ask clamps to its own target (the same value
+// its round-1 OPENING request happened to already state), so
+// buyer.unitPrice genuinely REPEATS round-over-round despite quantity
+// and delivery both genuinely changing. This is a real, observed case,
+// not a hypothetical — and it does NOT cause a false walk-away, because
+// arePositionsRepeated requires BOTH sides to tie, and the merchant's
+// own price (45445 -> 44577) never does. No change to walkAway.ts was
+// needed; this test documents and locks in why.
+describe("Milestone 12: combined package round never falsely triggers repeated-position walk-away", () => {
+  it("the buyer's price can coincidentally repeat (target-clamped) on a combined round, but the merchant's own price never does, so no false walk-away fires", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 45,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 15,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 45,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 15,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 40,
+      maxUnitPrice: 45400,
+      deliveryDeadlineDays: 8,
+      urgency: "high",
+      deliveryFlexible: true,
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      10,
+    );
+
+    // The buyer's own price genuinely repeats (both 43130 — the round-2
+    // combined ask clamps to the same target its round-1 opening request
+    // already stated), even though quantity (40 -> 80) and delivery
+    // (8 -> 12) both genuinely changed.
+    expect(transcript[1].buyer.unitPrice).toBe(transcript[0].buyer.unitPrice);
+    // The merchant's own price does NOT repeat — this is what actually
+    // prevents arePositionsRepeated from firing (it requires BOTH sides
+    // to tie), not anything about quantity/delivery.
+    expect(transcript[1].merchant.unitPrice).not.toBe(transcript[0].merchant.unitPrice);
+    // The negotiation reached a genuine AGREED close — it was never
+    // incorrectly diverted into an EXPIRED walk-away by a false
+    // repeated-position detection.
+    expect(finalState.status).toBe("AGREED");
   });
 });

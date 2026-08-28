@@ -72,14 +72,20 @@ describe("generateBuyerCandidates — adapters map existing decisions correctly"
 });
 
 describe("generateBuyerCandidates — all eligible candidates are generated at once (no short-circuiting)", () => {
-  it("when both trades and the ordinary decision are eligible, all three appear in the same candidate list", () => {
+  it("when both solo trades, the combined package, and the ordinary decision are ALL eligible, all four appear in the same candidate list", () => {
+    // Milestone 12: openStrategy's fixture (deliveryFlexible, both chips
+    // unused, a real price gap, leverage defined, quantity not already
+    // short-supplied) satisfies the combined package's own eligibility
+    // too — a fourth, genuinely independent candidate, not a
+    // replacement for either solo trade.
     const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy);
-    expect(candidates).toHaveLength(3);
+    expect(candidates).toHaveLength(4);
     // Exactly one ordinary candidate (HOLD or CONCEDE — whichever
-    // decideBuyerConcessionMove picked this round), plus both trades.
+    // decideBuyerConcessionMove picked this round), plus all three trades.
     expect(candidates.filter((c) => c.move === "HOLD" || c.move === "CONCEDE")).toHaveLength(1);
     expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(true);
     expect(candidates.some((c) => c.move === "DELIVERY_FOR_PRICE")).toBe(true);
+    expect(candidates.some((c) => c.move === "QUANTITY_AND_DELIVERY_FOR_PRICE")).toBe(true);
   });
 
   it("quantity trade being generated first in code does not automatically make it win — a cheaper ordinary/HOLD candidate still beats it", () => {

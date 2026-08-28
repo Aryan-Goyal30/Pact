@@ -77,7 +77,11 @@ const TERMINAL_STATUSES: NegotiationStatus[] = ["AGREED", "REJECTED", "EXPIRED"]
  * of the two is actually populated.
  */
 function resolveBuyerMove(response: Pick<BuyerAgentResponse, "move" | "tradeMove">): CandidateMoveType | undefined {
-  if (response.tradeMove === "QUANTITY_FOR_PRICE" || response.tradeMove === "DELIVERY_FOR_PRICE") {
+  if (
+    response.tradeMove === "QUANTITY_FOR_PRICE" ||
+    response.tradeMove === "DELIVERY_FOR_PRICE" ||
+    response.tradeMove === "QUANTITY_AND_DELIVERY_FOR_PRICE"
+  ) {
     return response.tradeMove;
   }
   if (response.move === "HOLD" || response.move === "CONCEDE") {

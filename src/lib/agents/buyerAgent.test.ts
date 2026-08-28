@@ -652,12 +652,20 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     expect(response.action.deliveryDays).toBe(8);
   });
 
-  // Mutual exclusivity from the BUYER side (the merchant-side defensive
-  // mirror is tested in merchantAgent.test.ts): when the quantity chip IS
-  // available, it is tried first and the delivery chip never engages in
-  // the same round — this is the documented, deliberate waterfall
-  // ordering (see buyerAgent.ts), not an accident.
-  it("never fires the delivery chip in the same round the quantity chip fires", async () => {
+  // Milestone 12: when BOTH chips are simultaneously eligible (the
+  // merchant is no longer short-supplying the original request, AND
+  // delivery flexibility was stated), the buyer no longer fires just
+  // one of the two solo trades in isolation — the combined
+  // quantity+delivery package (buyerQuantityAndDeliveryTrade.ts) is now
+  // ALSO generated as a third candidate, and it structurally beats
+  // either solo trade on price (composing two sub-1 discount fractions
+  // sequentially always yields a lower price than applying either
+  // alone), so it wins via the existing, unmodified compareBuyerPackages
+  // — never a new priority rule. This was "never fires the delivery
+  // chip in the same round the quantity chip fires" pre-Milestone-12,
+  // when only two solo trades existed; now a combined move is the
+  // genuinely best available candidate in this exact scenario.
+  it("fires the combined quantity+delivery package when both chips are simultaneously eligible", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
     const fullySupplied: NegotiationResult = { ...merchantResult, offeredQuantity: 40 }; // quantity chip now eligible
 
@@ -669,8 +677,14 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
       { leverageScore: 26, quantityTradeAlreadyUsed: false, deliveryTradeAlreadyUsed: false },
     );
 
-    expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
-    expect(response.action.deliveryDays).toBe(8); // unchanged — delivery chip never consulted this round
+    expect(response.tradeMove).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(response.action).toEqual({
+      type: "counter_offer",
+      sku: "LAPTOP-14-I5",
+      quantity: 80, // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
+      unitPrice: 43947,
+      deliveryDays: 12, // 8 + round(8 * DELIVERY_TRADE_EXTENSION_FRACTION)
+    });
   });
 
   // LLM message contains all required conditional-trade numbers.

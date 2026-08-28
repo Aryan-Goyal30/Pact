@@ -595,31 +595,46 @@ describe("runMerchantAgent", () => {
       }
     });
 
-    // "quantity trade and delivery trade do not both fire in one round" —
-    // the merchant-side defensive mirror of buyerAgent.ts's own waterfall:
-    // when BOTH a genuine quantity increase and a genuine delivery
-    // extension are (implausibly) signaled in the same call, quantity
-    // takes priority and the delivery evaluator is never even consulted.
-    it("never evaluates both trade dimensions in the same round — quantity takes priority", async () => {
+    // Milestone 12: when BOTH a genuine quantity increase AND a genuine
+    // delivery extension are signaled together in the same round, the
+    // merchant no longer evaluates them as two competing, mutually
+    // exclusive solo trades — the combined package
+    // (merchantPackageTradeEvaluator.ts) is now ALSO generated as a
+    // third candidate and, at abundant stock, correctly wins (its own
+    // quantity term is real value; its own delivery term contributes
+    // nothing, mirroring evaluateMerchantDeliveryTrade's own
+    // abundant-stock behavior exactly). This was "quantity takes
+    // priority" pre-Milestone-12, when only two solo trades existed and
+    // quantity's own price happened to win the comparison; now the
+    // combined package is the genuinely best available candidate.
+    it("evaluates BOTH trade dimensions together as one combined package when both genuinely increase in the same round", async () => {
       mockedGenerateAgentMessage.mockResolvedValue("...");
-      const constrained: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000, maxDeliveryDays: 20 };
       const bulkRequest = { ...request, quantity: 350 }; // >= LARGE_ORDER_QUANTITY_THRESHOLD -> quantity trade engages
 
       const response = await runMerchantAgent(
-        constrained,
+        abundant,
         bulkRequest,
         concessionContext,
         undefined,
-        300, // genuine quantity increase too
-        previousBuyerDeliveryDays, // AND a genuine delivery increase
+        300, // genuine quantity increase
+        previousBuyerDeliveryDays, // AND a genuine delivery increase, together
       );
 
-      expect(response.decision.reasons.some((r) => r.includes("increased its requested quantity"))).toBe(
-        true,
-      );
+      expect(response.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+      expect(response.decision.unitPrice).toBe(44875);
       expect(
-        response.decision.reasons.some((r) => r.includes("offered a longer delivery window")),
-      ).toBe(false);
+        response.decision.reasons.some(
+          (r) => r.includes("increased its requested quantity") && r.includes("offered a longer delivery window"),
+        ),
+      ).toBe(true);
+      // Abundant stock: the combined evaluator's own reason correctly
+      // attributes the value to quantity alone, mirroring
+      // evaluateMerchantDeliveryTrade's own "no real operational value"
+      // finding for abundant stock, now expressed jointly.
+      expect(
+        response.decision.reasons.some((r) => r.includes("delivery window offered has little additional value")),
+      ).toBe(true);
     });
   });
 

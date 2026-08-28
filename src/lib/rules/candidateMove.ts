@@ -18,7 +18,18 @@
 // interface. Not implemented in this milestone; see the Milestone 8
 // design review for why.
 
-export type CandidateMoveType = "HOLD" | "CONCEDE" | "QUANTITY_FOR_PRICE" | "DELIVERY_FOR_PRICE";
+export type CandidateMoveType =
+  | "HOLD"
+  | "CONCEDE"
+  | "QUANTITY_FOR_PRICE"
+  | "DELIVERY_FOR_PRICE"
+  // Milestone 12: the first genuinely multi-dimensional move — both
+  // quantity and deliveryDays are populated together on the same
+  // candidate, exactly the shape those two fields were already left
+  // independently optional to support (see this file's own doc comment,
+  // written at Milestone 9). No shape change was needed, only this one
+  // new value.
+  | "QUANTITY_AND_DELIVERY_FOR_PRICE";
 
 export interface CandidateMove {
   move: CandidateMoveType;

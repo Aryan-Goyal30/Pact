@@ -130,6 +130,11 @@ describe("Milestone 11: OLD (two-tier filter+reduce) vs NEW (package comparator)
   it.each([...namedScenarios, ...sweepScenarios])(
     "$label",
     ({ item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays }) => {
+      // Milestone 12: the same authoritative, stock-capped quantity
+      // applyMerchantConcession would derive from evaluateNegotiationRequest's
+      // own decision.offeredQuantity — reconstructed here the same way
+      // checkQuantityAvailable computes it, not re-derived independently.
+      const authorizedQuantity = Math.min(request.quantity, item.availableQty);
       const { candidates } = generateMerchantCandidates(
         item,
         request,
@@ -137,6 +142,7 @@ describe("Milestone 11: OLD (two-tier filter+reduce) vs NEW (package comparator)
         priorBuyerUnitPrice,
         previousBuyerQuantity,
         previousBuyerDeliveryDays,
+        authorizedQuantity,
       );
 
       const oldWinner = oldSelectBestMerchantCandidate(candidates);
@@ -146,7 +152,19 @@ describe("Milestone 11: OLD (two-tier filter+reduce) vs NEW (package comparator)
     },
   );
 
-  it("E: both OLD and NEW selectors independently flip from quantity to delivery as stock changes, not merely 'the same as each other'", () => {
+  // Milestone 12 update: this fixture's item/request shape ALSO
+  // satisfies the new combined package's own eligibility (both
+  // dimensions genuinely increase together) — oldSelectBestMerchantCandidate
+  // uses the SAME, now-widened isTradeCandidate this file imports from
+  // merchantMoveSelection.ts (by design — see that export's own doc
+  // comment: never a second, independently-drifting definition), so
+  // "OLD" here means "the pre-Milestone-11 comparison ALGORITHM,"
+  // applied to today's real candidate set — not "frozen at exactly
+  // Milestone 9's own candidate types forever." Both OLD and NEW still
+  // independently agree with EACH OTHER (the actual equivalence
+  // property this file exists to prove) on genuinely different winners
+  // as stock changes — now combined-at-abundant vs delivery-at-constrained.
+  it("E: both OLD and NEW selectors independently flip from the combined package to solo delivery as stock changes, not merely 'the same as each other'", () => {
     const abundant = namedScenarios[0];
     const constrained = namedScenarios[1];
 
@@ -157,6 +175,7 @@ describe("Milestone 11: OLD (two-tier filter+reduce) vs NEW (package comparator)
       abundant.priorBuyerUnitPrice,
       abundant.previousBuyerQuantity,
       abundant.previousBuyerDeliveryDays,
+      Math.min(abundant.request.quantity, abundant.item.availableQty),
     ).candidates;
     const constrainedCandidates = generateMerchantCandidates(
       constrained.item,
@@ -165,10 +184,11 @@ describe("Milestone 11: OLD (two-tier filter+reduce) vs NEW (package comparator)
       constrained.priorBuyerUnitPrice,
       constrained.previousBuyerQuantity,
       constrained.previousBuyerDeliveryDays,
+      Math.min(constrained.request.quantity, constrained.item.availableQty),
     ).candidates;
 
-    expect(oldSelectBestMerchantCandidate(abundantCandidates).move).toBe("QUANTITY_FOR_PRICE");
-    expect(selectBestMerchantCandidate(abundantCandidates).move).toBe("QUANTITY_FOR_PRICE");
+    expect(oldSelectBestMerchantCandidate(abundantCandidates).move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(selectBestMerchantCandidate(abundantCandidates).move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
     expect(oldSelectBestMerchantCandidate(constrainedCandidates).move).toBe("DELIVERY_FOR_PRICE");
     expect(selectBestMerchantCandidate(constrainedCandidates).move).toBe("DELIVERY_FOR_PRICE");
   });

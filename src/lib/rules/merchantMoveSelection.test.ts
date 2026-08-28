@@ -38,7 +38,7 @@ const concessionContext: MerchantConcessionContext = { round: 2, maxRounds: 6, p
 
 describe("generateMerchantCandidates — adapters map existing decisions correctly", () => {
   it("the ordinary concession (computeMerchantConcessionPrice) always adapts into a CONCEDE candidate", () => {
-    const { candidates } = generateMerchantCandidates(item, req(), concessionContext, null, null, null);
+    const { candidates } = generateMerchantCandidates(item, req(), concessionContext, null, null, null, 10);
     const ordinary = candidates.find((c) => c.move === "CONCEDE");
     expect(ordinary).toBeDefined();
     expect(ordinary!.unitPrice).toBeGreaterThan(item.minPrice);
@@ -50,7 +50,7 @@ describe("generateMerchantCandidates — adapters map existing decisions correct
   it("an ACCEPT/COUNTER quantity trade verdict (evaluateMerchantTrade) adapts into a QUANTITY_FOR_PRICE candidate carrying the requested quantity", () => {
     const bulk = req({ quantity: 300 }); // LARGE_ORDER_QUANTITY_THRESHOLD
     const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
-    const { candidates } = generateMerchantCandidates(abundant, bulk, concessionContext, null, null, null);
+    const { candidates } = generateMerchantCandidates(abundant, bulk, concessionContext, null, null, null, 300);
     const trade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
     expect(trade).toBeDefined();
     expect(trade!.quantity).toBe(300);
@@ -67,6 +67,7 @@ describe("generateMerchantCandidates — adapters map existing decisions correct
       null,
       null,
       8, // genuine round-over-round extension (8 -> 12)
+      10,
     );
     const trade = candidates.find((c) => c.move === "DELIVERY_FOR_PRICE");
     expect(trade).toBeDefined();
@@ -84,12 +85,13 @@ describe("generateMerchantCandidates — adapters map existing decisions correct
       null,
       null,
       null,
+      15, // partial fulfillment: only 15 of 300 available
     );
     expect(quantityCandidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(false);
   });
 
   it("evaluateBuyerReciprocity's own reason is re-exposed as reciprocityReason, unchanged", () => {
-    const { reciprocityReason } = generateMerchantCandidates(item, req(), concessionContext, 43000, null, null);
+    const { reciprocityReason } = generateMerchantCandidates(item, req(), concessionContext, 43000, null, null, 10);
     expect(reciprocityReason.length).toBeGreaterThan(0);
   });
 });
@@ -104,6 +106,7 @@ describe("generateMerchantCandidates — all eligible candidates generated (no s
       null,
       150, // genuine quantity increase
       8, // genuine delivery increase, simultaneously
+      300,
     );
     expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(true);
     // Abundant stock withholds the delivery discount (ABUNDANT_STOCK_DELIVERY_TRADE_MULTIPLIER = 0,
@@ -168,24 +171,24 @@ describe("selectBestMerchantCandidate — order-independent comparison, asymmetr
 
 describe("merchant HOLD candidate — real, gated on stock scarcity (not leverage, not reciprocity)", () => {
   it("is absent for medium/abundant stock even with a real previousOfferUnitPrice", () => {
-    const medium = generateMerchantCandidates(item, req(), concessionContext, null, null, null);
+    const medium = generateMerchantCandidates(item, req(), concessionContext, null, null, null, 10);
     expect(medium.candidates.some((c) => c.move === "HOLD")).toBe(false);
 
     const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
-    const abundantResult = generateMerchantCandidates(abundant, req(), concessionContext, null, null, null);
+    const abundantResult = generateMerchantCandidates(abundant, req(), concessionContext, null, null, null, 10);
     expect(abundantResult.candidates.some((c) => c.move === "HOLD")).toBe(false);
   });
 
   it("is present for low (scarce) stock when the ordinary concession still has real room to move", () => {
     const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
-    const { candidates } = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null);
+    const { candidates } = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null, 10);
     expect(candidates.some((c) => c.move === "HOLD")).toBe(true);
   });
 
   it("is withheld even under scarce stock when the ordinary concession is already floor-clamped (never overrides the floor)", () => {
     const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
     const extremeAsk = req({ maxUnitPrice: 1 }); // forces the ordinary concession to item.minPrice
-    const { candidates } = generateMerchantCandidates(scarce, extremeAsk, concessionContext, null, null, null);
+    const { candidates } = generateMerchantCandidates(scarce, extremeAsk, concessionContext, null, null, null, 10);
     expect(candidates.some((c) => c.move === "HOLD")).toBe(false);
   });
 
@@ -195,7 +198,83 @@ describe("merchant HOLD candidate — real, gated on stock scarcity (not leverag
     // — there is no leverage input this test could even vary. HOLD's
     // gate is entirely resolveMerchantStockPressure(item) (a static,
     // catalog-derived signal) plus the floor-safety check above.
-    expect(generateMerchantCandidates.length).toBe(6); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays — no leverage slot
+    expect(generateMerchantCandidates.length).toBe(7); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays, authorizedQuantity — no leverage slot
+  });
+});
+
+// PACT V2 Milestone 12 CORRECTION: merchant package/trade pricing must
+// reflect the actual authorized (stock-capped) quantity, not the buyer's
+// raw ask, wherever they diverge (partial fulfillment). This describe
+// block is the required regression proof for both quantity paths — see
+// merchantPackageTradeEvaluator.test.ts's own correction tests for the
+// combined evaluator's price-level finding (no material price
+// sensitivity to quantity magnitude in the current formula).
+describe("Milestone 12 correction: candidates carry the authorized (not raw-asked) quantity", () => {
+  // C: the solo quantity trade. IMPORTANT finding from this correction's
+  // own implementation: evaluateMerchantTrade's own internal
+  // hasQuantityLeverage(proposal.quantity) threshold gate means its
+  // PRICING INPUT must stay `request.quantity` (substituting the capped
+  // quantity there was tried and found to regress a correctly-calibrated
+  // HOLD into a misleading COUNTER — see merchantMoveSelection.ts's own
+  // comment at this call site). What this correction actually fixes for
+  // the solo path is narrower but real: the WINNING CANDIDATE's own
+  // `.quantity` field — what the merchant's message ultimately implies
+  // it's offering — now reflects the authorized amount, not the raw ask.
+  it("C: the solo QUANTITY_FOR_PRICE candidate carries the authorized quantity when the merchant is partially constrained", () => {
+    const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 }; // high stock pressure -> genuine ACCEPT/COUNTER verdict
+    const bulkRequest = req({ quantity: 300 });
+    const { candidates } = generateMerchantCandidates(
+      abundant,
+      bulkRequest,
+      concessionContext,
+      null,
+      150, // genuine round-over-round increase
+      null,
+      120, // authorizedQuantity: a hypothetical partial-fulfillment cap below the 300 asked
+    );
+    const trade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
+    expect(trade).toBeDefined();
+    expect(trade!.quantity).toBe(120); // NOT 300 — the authorized amount, not the raw ask
+  });
+
+  it("the combined QUANTITY_AND_DELIVERY_FOR_PRICE candidate also carries the authorized quantity, and the evaluator itself receives it (traced via the candidate's own price)", () => {
+    const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+    const { candidates } = generateMerchantCandidates(
+      abundant,
+      req({ quantity: 300, deliveryDeadlineDays: 12 }),
+      concessionContext,
+      null,
+      150,
+      8,
+      45, // authorizedQuantity: e.g. a hypothetical partial-fulfillment cap
+    );
+    const combined = candidates.find((c) => c.move === "QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(combined).toBeDefined();
+    expect(combined!.quantity).toBe(45); // NOT 300
+  });
+
+  // D: the hard inventory cap itself is untouched by this correction —
+  // generateMerchantCandidates never decides offeredQuantity (that's
+  // negotiationEngine.ts's job, upstream and unaffected); this just
+  // confirms the parameter this correction added is never itself
+  // capable of exceeding what the caller (applyMerchantConcession)
+  // already authorized.
+  it("D: authorizedQuantity is exactly what every quantity-carrying candidate uses — never re-derived, never exceeded", () => {
+    const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+    const { candidates } = generateMerchantCandidates(
+      abundant,
+      req({ quantity: 300, deliveryDeadlineDays: 12 }),
+      concessionContext,
+      null,
+      150,
+      8,
+      45,
+    );
+    for (const candidate of candidates) {
+      if (candidate.quantity !== undefined) {
+        expect(candidate.quantity).toBeLessThanOrEqual(45);
+      }
+    }
   });
 });
 
@@ -207,7 +286,7 @@ describe("realistic: merchant HOLD wins by genuine comparison in a real runMerch
     const scarce: CatalogItemSnapshot = { ...item, availableQty: 15, maxDeliveryDays: 12 };
     const bulkRequest = req({ quantity: 300, maxUnitPrice: 44100, deliveryFlexible: undefined });
     const ctx: MerchantConcessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 };
-    const { candidates } = generate(scarce, bulkRequest, ctx, null, null, null);
+    const { candidates } = generate(scarce, bulkRequest, ctx, null, null, null, 15); // partial fulfillment: only 15 of 300 available
     const hold = candidates.find((c) => c.move === "HOLD");
     const nonTrade = candidates.filter((c) => c.move === "HOLD" || c.move === "CONCEDE");
     expect(hold).toBeDefined();

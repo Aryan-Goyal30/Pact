@@ -303,6 +303,9 @@ const MOVE_LABELS: Record<CandidateMoveType, string> = {
   CONCEDE: "Concede",
   QUANTITY_FOR_PRICE: "Quantity for Price",
   DELIVERY_FOR_PRICE: "Delivery for Price",
+  // Milestone 12: the first combined move — same lookup-table pattern,
+  // not a UI redesign.
+  QUANTITY_AND_DELIVERY_FOR_PRICE: "Quantity + Delivery for Price",
 };
 
 /** Human-readable label for a strategic move. */
@@ -315,6 +318,7 @@ const MOVE_BADGE_CLASSES: Record<CandidateMoveType, string> = {
   CONCEDE: "bg-sky-100 text-sky-800 dark:bg-sky-900/40 dark:text-sky-300",
   QUANTITY_FOR_PRICE: "bg-teal-100 text-teal-800 dark:bg-teal-900/40 dark:text-teal-300",
   DELIVERY_FOR_PRICE: "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/40 dark:text-indigo-300",
+  QUANTITY_AND_DELIVERY_FOR_PRICE: "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300",
 };
 
 /** Badge color class for a strategic move — same convention as negotiationMessageTypeBadgeClass. */

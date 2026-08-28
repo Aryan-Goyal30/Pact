@@ -37,6 +37,7 @@ import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiatio
 import type { BuyerMove } from "@/lib/rules/buyerMoveSelector";
 import type { BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
 import type { BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
+import type { BuyerPackageTradeMove } from "@/lib/rules/buyerQuantityAndDeliveryTrade";
 import { generateBuyerCandidates, selectBestBuyerCandidate } from "@/lib/rules/buyerMoveSelection";
 import {
   evaluateQuantitySufficiency,
@@ -88,7 +89,7 @@ export interface BuyerAgentResponse {
    * candidate with the better price wins), not merely "whichever rule
    * ran first."
    */
-  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | null;
+  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove | null;
   /**
    * Milestone 6: the buyer's explicit, factor-based judgment of whether
    * the offered QUANTITY is actually sufficient — a separate question
@@ -203,7 +204,7 @@ function buildResponseToMerchantOffer(
   validation: BuyerValidationResult;
   move: BuyerMove | null;
   moveReason: string | null;
-  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | null;
+  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove | null;
   sufficiency: QuantitySufficiencyDecision | null;
 } {
   if (
@@ -348,7 +349,10 @@ function buildResponseToMerchantOffer(
   );
   const selected = selectBestBuyerCandidate(candidates, constraints, proposal.quantity, proposal.deliveryDays);
 
-  const isTradeMove = selected.move === "QUANTITY_FOR_PRICE" || selected.move === "DELIVERY_FOR_PRICE";
+  const isTradeMove =
+    selected.move === "QUANTITY_FOR_PRICE" ||
+    selected.move === "DELIVERY_FOR_PRICE" ||
+    selected.move === "QUANTITY_AND_DELIVERY_FOR_PRICE";
 
   return {
     action: {
@@ -366,7 +370,9 @@ function buildResponseToMerchantOffer(
     move: isTradeMove ? null : (selected.move as BuyerMove),
     moveReason:
       !isTradeMove && sufficiency ? `${sufficiency.reason} ${selected.reason}` : selected.reason,
-    tradeMove: isTradeMove ? (selected.move as BuyerTradeMove | BuyerDeliveryTradeMove) : "NO_TRADE",
+    tradeMove: isTradeMove
+      ? (selected.move as BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove)
+      : "NO_TRADE",
     sufficiency,
   };
 }
@@ -475,7 +481,7 @@ export async function runBuyerAgent(
       systemPrompt: BUYER_SYSTEM_PROMPT,
       context,
       instruction:
-        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"). If strategicReasons describes the buyer accepting a later delivery date in exchange for a better price, phrase that condition instead (e.g. \"I can accept 10-day delivery if you can do 43000 each.\"), still using only the exact numbers given.",
+        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"). If strategicReasons describes the buyer accepting a later delivery date in exchange for a better price, phrase that condition instead (e.g. \"I can accept 10-day delivery if you can do 43000 each.\"). If strategicReasons describes the buyer offering BOTH more quantity AND a later delivery date together in exchange for a better price, phrase it as one combined condition (e.g. \"I'll take 200 units and accept 12-day delivery if you can do 43000 each.\"), never as two separate sentences or unrelated changes — still using only the exact numbers given.",
     });
     const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
     if (check.valid) {

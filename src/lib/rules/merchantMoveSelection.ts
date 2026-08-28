@@ -42,6 +42,7 @@ import {
 } from "@/lib/rules/negotiationStrategy";
 import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
 import { evaluateMerchantDeliveryTrade } from "@/lib/rules/merchantDeliveryTradeEvaluator";
+import { evaluateMerchantPackageTrade } from "@/lib/rules/merchantPackageTradeEvaluator";
 import { evaluateBuyerReciprocity } from "@/lib/rules/merchantReciprocity";
 import type { CandidateMove } from "@/lib/rules/candidateMove";
 
@@ -87,6 +88,28 @@ export function generateMerchantCandidates(
   priorBuyerUnitPrice: number | null | undefined,
   previousBuyerQuantity: number | null | undefined,
   previousBuyerDeliveryDays: number | null | undefined,
+  /**
+   * Milestone 12 correction: the merchant's own actual, authoritative,
+   * stock-capped quantity for THIS round — evaluateNegotiationRequest's
+   * `decision.offeredQuantity` (negotiationEngine.ts's checkQuantityAvailable
+   * already computed `min(request.quantity, item.availableQty)` before this
+   * function was ever called). Used ONLY as the quantity fed into the
+   * quantity-driven PRICING evaluators (evaluateMerchantTrade,
+   * evaluateMerchantPackageTrade) and the quantity carried on their
+   * resulting candidates — never as an eligibility signal. Eligibility
+   * ("is a quantity trade even worth considering this round") stays keyed
+   * on `request.quantity`/`quantityIncreasedFromPrior` exactly as before:
+   * whether the buyer's ASK was large or genuinely increased is a
+   * request-side question the merchant can answer regardless of what it
+   * can actually supply. What the merchant should NOT do is PRICE a
+   * discount as though it were granting the buyer's raw ask when partial
+   * fulfillment means it can only ever grant `authorizedQuantity` —
+   * that was the actual pricing-fidelity bug this parameter fixes. Never
+   * affects the hard inventory cap itself (decision.offeredQuantity,
+   * already computed and already authoritative before this function
+   * runs) — this only makes the PRICE math consistent with it.
+   */
+  authorizedQuantity: number,
 ): MerchantCandidateResult {
   const trade =
     request.deliveryDeadlineDays !== undefined
@@ -156,6 +179,30 @@ export function generateMerchantCandidates(
     request.quantity > previousBuyerQuantity;
 
   if (hasQuantityLeverage(request.quantity) || quantityIncreasedFromPrior) {
+    // Milestone 12 correction, refined: evaluateMerchantTrade's `quantity`
+    // input is used for TWO different things internally — its own
+    // hasQuantityLeverage(proposal.quantity) threshold gate (deciding
+    // whether this ask is even large enough to be considered a bulk deal
+    // at all, mirroring the OUTER gate immediately above) and, once past
+    // that gate, the actual price formula, which depends only on
+    // resolveMerchantStockPressure(item) — NEVER on the quantity number
+    // itself. Substituting authorizedQuantity here was tried and found,
+    // empirically, to be a real regression: it fed the STOCK-CAPPED
+    // number into the THRESHOLD gate too, so a genuinely bulk-sized ask
+    // against scarce stock (e.g. 300 requested, 15 fulfillable) stopped
+    // being recognized as a bulk deal at all — silently downgrading a
+    // correctly-calibrated HOLD ("inventory is limited, so the larger
+    // order does not currently justify an additional discount") into a
+    // misleading COUNTER ("the requested quantity is not large enough"),
+    // which is simply false — the request WAS large; the merchant just
+    // can't extend a bulk discount for it. So `request.quantity` stays
+    // here, unchanged, exactly as before this correction: it is the
+    // correct input for "is this being negotiated as a bulk deal," and,
+    // per the formula above, provably has NO effect on the resulting
+    // PRICE either way. Only the quantity actually RECORDED on the
+    // resulting candidate (below) reflects what the merchant can really
+    // offer — that field, not this evaluator input, was the fidelity
+    // problem this correction fixes.
     const quantityEvaluation = evaluateMerchantTrade(
       item,
       { quantity: request.quantity, unitPrice: request.maxUnitPrice },
@@ -165,7 +212,7 @@ export function generateMerchantCandidates(
       candidates.push({
         move: "QUANTITY_FOR_PRICE",
         unitPrice: quantityEvaluation.unitPrice,
-        quantity: request.quantity,
+        quantity: authorizedQuantity,
         reason: quantityEvaluation.reason,
       });
     } else {
@@ -230,6 +277,56 @@ export function generateMerchantCandidates(
     }
   }
 
+  // Milestone 12: the combined quantity+delivery package — evaluated as
+  // ONE economic proposal (merchantPackageTradeEvaluator.ts), never by
+  // calling evaluateMerchantTrade/evaluateMerchantDeliveryTrade above
+  // and stacking their two independent outputs (see that module's own
+  // header comment for why). Only recognized when BOTH dimensions
+  // genuinely increased together in THIS SAME round
+  // (quantityIncreasedFromPrior && deliveryIncreasedFromPrior) — a
+  // deliberate, joint buyer move, never an absolute-bulk-threshold
+  // shortcut (unlike the solo quantity trade's own hasQuantityLeverage
+  // fallback) and never two coincidentally-unrelated single-dimension
+  // signals from different rounds.
+  if (quantityIncreasedFromPrior && deliveryIncreasedFromPrior) {
+    // Genuinely blind to BOTH dimensions — neither solo evaluator's own
+    // "blind" baseline above excludes both factors at once.
+    const jointBlindBaseline = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
+      ...concessionContext,
+      reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
+    });
+    // Milestone 12 correction: same discipline as the solo quantity
+    // block above — eligibility (checked before this block) stays keyed
+    // on the buyer's raw ask; PRICE evaluation uses authorizedQuantity
+    // so the combined package's discount is sized to what the merchant
+    // can actually deliver, not to a quantity that may exceed real stock.
+    const packageEvaluation = evaluateMerchantPackageTrade(
+      item,
+      {
+        quantity: authorizedQuantity,
+        extraDays: trade.deliveryDays - item.standardDeliveryDays,
+        unitPrice: request.maxUnitPrice,
+      },
+      { jointBlindBaselinePrice: jointBlindBaseline },
+    );
+    if (packageEvaluation.verdict === "ACCEPT" || packageEvaluation.verdict === "COUNTER") {
+      candidates.push({
+        move: "QUANTITY_AND_DELIVERY_FOR_PRICE",
+        unitPrice: packageEvaluation.unitPrice,
+        quantity: authorizedQuantity,
+        deliveryDays: trade.deliveryDays,
+        reason: packageEvaluation.reason,
+      });
+    }
+    // HOLD/REJECT verdict: deliberately NOT merged into candidates[0]
+    // here, unlike the two solo evaluators above — candidates[0] has
+    // already potentially been overwritten by either or both of those,
+    // and a package-level HOLD/REJECT reason merged on top would risk
+    // an incoherent, triple-stacked reason string. The solo evaluators'
+    // own reasons (already merged above, if applicable) remain
+    // sufficient explanation when the combined form isn't worth it.
+  }
+
   return { candidates, deliveryDays: trade.deliveryDays, reciprocityReason: reciprocity.reason };
 }
 
@@ -258,7 +355,20 @@ export function scoreMerchantCandidate(candidate: CandidateMove): number {
  * independently-drifting definition of "is this a trade."
  */
 export function isTradeCandidate(candidate: CandidateMove): boolean {
-  return candidate.move === "QUANTITY_FOR_PRICE" || candidate.move === "DELIVERY_FOR_PRICE";
+  return (
+    candidate.move === "QUANTITY_FOR_PRICE" ||
+    candidate.move === "DELIVERY_FOR_PRICE" ||
+    // Milestone 12: the combined package is a trade too — its own
+    // evaluator (merchantPackageTradeEvaluator.ts) already vetted it as
+    // ACCEPT/COUNTER before it was ever added as a candidate, exactly
+    // like the two solo trades. Without this, the combined candidate
+    // would be misclassified into the non-trade tier and lose the
+    // trade-tier's unconditional priority — this is the one place
+    // recognizing the new move type is required for correctness; the
+    // comparison ALGORITHM itself (compareMerchantPackages, below) is
+    // unchanged.
+    candidate.move === "QUANTITY_AND_DELIVERY_FOR_PRICE"
+  );
 }
 
 /**

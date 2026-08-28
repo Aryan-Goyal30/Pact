@@ -76,7 +76,14 @@ export interface MerchantTradeEvaluation {
  * every currently-passing medium-stock test is unaffected regardless of
  * whether it goes through this function or the old flat branch).
  */
-const ABUNDANT_STOCK_TRADE_MULTIPLIER = 1.75;
+// Exported (Milestone 12) so merchantPackageTradeEvaluator.ts can reuse
+// this exact, already-calibrated multiplier for the combined
+// quantity+delivery package's own quantity term — never a duplicated or
+// re-derived value. This is the one unavoidable touch to this file the
+// Milestone 12 design review anticipated ("unless a concrete integration
+// issue requires a minimal adjustment"): the constant itself, and every
+// other line in this file, are completely unchanged.
+export const ABUNDANT_STOCK_TRADE_MULTIPLIER = 1.75;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);

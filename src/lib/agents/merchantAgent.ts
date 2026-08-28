@@ -193,6 +193,12 @@ function applyMerchantConcession(
     priorBuyerUnitPrice,
     previousBuyerQuantity,
     previousBuyerDeliveryDays,
+    // Milestone 12 correction: `decision` is evaluateNegotiationRequest's
+    // own, already-computed, stock-capped result — its outcome is
+    // guaranteed COUNTER_OFFER or PARTIAL_FULFILLMENT here (the guard
+    // clause above already returned early otherwise), so offeredQuantity
+    // is guaranteed non-null (only REJECTED ever sets it null).
+    decision.offeredQuantity as number,
   );
   const selected = selectBestMerchantCandidate(candidates);
 
@@ -236,6 +242,11 @@ function applyMerchantConcession(
       ...(selected.move === "DELIVERY_FOR_PRICE" && deliveryIncreasedFromPrior
         ? [
             `The buyer offered a longer delivery window (from ${previousBuyerDeliveryDays} to ${trade.deliveryDays} days) in exchange for a better price, so the merchant evaluated the full package instead of price alone.`,
+          ]
+        : []),
+      ...(selected.move === "QUANTITY_AND_DELIVERY_FOR_PRICE" && quantityIncreasedFromPrior && deliveryIncreasedFromPrior
+        ? [
+            `The buyer increased its requested quantity from ${previousBuyerQuantity} to ${request.quantity} and offered a longer delivery window (from ${previousBuyerDeliveryDays} to ${trade.deliveryDays} days) together, in exchange for a better price, so the merchant evaluated the complete combined package as one proposal.`,
           ]
         : []),
       selected.reason,

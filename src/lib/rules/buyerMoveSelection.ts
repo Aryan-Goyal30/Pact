@@ -30,6 +30,7 @@ import type { BuyerConcessionContext, BuyerConstraints } from "@/lib/rules/buyer
 import { decideBuyerConcessionMove } from "@/lib/rules/buyerMoveSelector";
 import { decideBuyerQuantityTrade } from "@/lib/rules/buyerQuantityTrade";
 import { decideBuyerDeliveryTrade } from "@/lib/rules/buyerDeliveryTrade";
+import { decideBuyerQuantityAndDeliveryTrade } from "@/lib/rules/buyerQuantityAndDeliveryTrade";
 import { evaluateQuantitySufficiency } from "@/lib/rules/buyerQuantitySufficiency";
 import type { CandidateMove } from "@/lib/rules/candidateMove";
 
@@ -111,6 +112,33 @@ export function generateBuyerCandidates(
       unitPrice: deliveryDecision.unitPrice as number,
       deliveryDays: deliveryDecision.deliveryDays as number,
       reason: deliveryDecision.reason,
+    });
+  }
+
+  // Milestone 12: the combined quantity+delivery package — its own
+  // eligibility gate (the intersection of the two solo trades' gates,
+  // see buyerQuantityAndDeliveryTrade.ts) decides whether it's even
+  // constructible this round; it is generated here as a THIRD,
+  // independent candidate alongside the two solo trades and the ordinary
+  // decision, never as a replacement for either, and never with any
+  // priority over them — selectBestBuyerCandidate (unchanged) decides
+  // whether it's actually the buyer's best move.
+  const packageDecision = decideBuyerQuantityAndDeliveryTrade(
+    constraints,
+    merchantOfferUnitPrice,
+    merchantOfferedQuantity,
+    concessionContext,
+    strategyContext?.leverageScore,
+    strategyContext?.quantityTradeAlreadyUsed ?? false,
+    strategyContext?.deliveryTradeAlreadyUsed ?? false,
+  );
+  if (packageDecision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+    candidates.push({
+      move: "QUANTITY_AND_DELIVERY_FOR_PRICE",
+      unitPrice: packageDecision.unitPrice as number,
+      quantity: packageDecision.quantity as number,
+      deliveryDays: packageDecision.deliveryDays as number,
+      reason: packageDecision.reason,
     });
   }
 
