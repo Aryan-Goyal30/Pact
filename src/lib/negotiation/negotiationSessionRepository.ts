@@ -216,3 +216,24 @@ export async function hasBuyerProposedQuantityAbove(
   });
   return row !== null;
 }
+
+/**
+ * Milestone 7: whether the buyer has EVER proposed a delivery window
+ * later than its original stated deadline anywhere in this session's
+ * history — i.e. whether the delivery-for-price bargaining chip
+ * (buyerDeliveryTrade.ts) has already been used. Tracked entirely
+ * independently from hasBuyerProposedQuantityAbove — using one chip must
+ * never consume the other. Same full-history-scan discipline as that
+ * function (a single-round lookback could "forget" a trade used
+ * earlier), and reuses the existing NegotiationMessage.deliveryDays
+ * column — no schema change.
+ */
+export async function hasBuyerProposedDeliveryDaysAbove(
+  sessionId: string,
+  originalDeliveryDeadlineDays: number,
+): Promise<boolean> {
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "buyer", deliveryDays: { gt: originalDeliveryDeadlineDays } },
+  });
+  return row !== null;
+}

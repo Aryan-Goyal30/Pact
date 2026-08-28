@@ -464,6 +464,165 @@ describe("runMerchantAgent", () => {
     });
   });
 
+  // PACT V2 Milestone 7: buyer-initiated delivery-for-price bargaining,
+  // from the MERCHANT's side. The merchant recognizes a genuine
+  // round-over-round delivery EXTENSION (previousBuyerDeliveryDays) and
+  // evaluates it via its own dedicated module
+  // (merchantDeliveryTradeEvaluator.ts), never merchantTradeEvaluator.ts
+  // (quantity's own file, deliberately untouched by this milestone).
+  // Exact values verified empirically, not hand-derived.
+  describe("delivery-for-price trade recognition (Milestone 7)", () => {
+    const request = {
+      sku: item.sku,
+      quantity: 10,
+      maxUnitPrice: 44700,
+      deliveryDeadlineDays: 12, // extended from a prior 8-day ask
+      deliveryFlexible: true,
+    };
+    const concessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 46000 };
+    const previousBuyerDeliveryDays = 8;
+
+    // "different Merchant states produce different delivery-trade evaluations"
+    it("a constrained-stock merchant recognizes the extension and grants a real discount", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const constrained: CatalogItemSnapshot = { ...item, availableQty: 15 };
+
+      const response = await runMerchantAgent(
+        constrained,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        previousBuyerDeliveryDays,
+      );
+
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+      expect(response.decision.deliveryDays).toBe(12);
+      expect(response.decision.unitPrice).toBe(45055);
+      expect(
+        response.decision.reasons.some((r) => r.includes("offered a longer delivery window (from 8 to 12")),
+      ).toBe(true);
+      expect(response.decision.reasons.some((r) => r.includes("genuinely valuable"))).toBe(true);
+    });
+
+    it("the IDENTICAL proposal against abundant stock produces a materially worse price than constrained stock", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const constrained: CatalogItemSnapshot = { ...item, availableQty: 15 };
+      const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+
+      const constrainedResponse = await runMerchantAgent(
+        constrained,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        previousBuyerDeliveryDays,
+      );
+      const abundantResponse = await runMerchantAgent(
+        abundant,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        previousBuyerDeliveryDays,
+      );
+
+      expect(constrainedResponse.decision.unitPrice!).toBeLessThan(abundantResponse.decision.unitPrice!);
+      expect(
+        abundantResponse.decision.reasons.some((r) => r.includes("no real operational value")),
+      ).toBe(true);
+    });
+
+    it("never grants a delivery-traded price below minPrice, however generous the extension", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const constrained: CatalogItemSnapshot = { ...item, availableQty: 15 };
+
+      const response = await runMerchantAgent(
+        constrained,
+        { ...request, maxUnitPrice: 1 },
+        concessionContext,
+        undefined,
+        undefined,
+        previousBuyerDeliveryDays,
+      );
+
+      expect(response.decision.unitPrice).toBe(item.minPrice);
+    });
+
+    it("still counters rather than caving outright, even for a recognized genuine extension", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const medium: CatalogItemSnapshot = { ...item, availableQty: 300 };
+
+      const response = await runMerchantAgent(
+        medium,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        previousBuyerDeliveryDays,
+      );
+
+      expect(response.decision.outcome).toBe("COUNTER_OFFER");
+      expect(response.decision.unitPrice!).toBeGreaterThan(request.maxUnitPrice);
+    });
+
+    // "delivery trade does not fire when unnecessary"
+    it("does not engage the delivery evaluator when the delivery ask did not actually increase", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const constrained: CatalogItemSnapshot = { ...item, availableQty: 15 };
+
+      const sameAsLastRound = await runMerchantAgent(
+        constrained,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        12, // identical to request.deliveryDeadlineDays -> no increase
+      );
+      const noHistory = await runMerchantAgent(
+        constrained,
+        request,
+        concessionContext,
+        undefined,
+        undefined,
+        null,
+      );
+
+      for (const response of [sameAsLastRound, noHistory]) {
+        expect(
+          response.decision.reasons.some((r) => r.includes("offered a longer delivery window")),
+        ).toBe(false);
+      }
+    });
+
+    // "quantity trade and delivery trade do not both fire in one round" —
+    // the merchant-side defensive mirror of buyerAgent.ts's own waterfall:
+    // when BOTH a genuine quantity increase and a genuine delivery
+    // extension are (implausibly) signaled in the same call, quantity
+    // takes priority and the delivery evaluator is never even consulted.
+    it("never evaluates both trade dimensions in the same round — quantity takes priority", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const constrained: CatalogItemSnapshot = { ...item, availableQty: 5000 };
+      const bulkRequest = { ...request, quantity: 350 }; // >= LARGE_ORDER_QUANTITY_THRESHOLD -> quantity trade engages
+
+      const response = await runMerchantAgent(
+        constrained,
+        bulkRequest,
+        concessionContext,
+        undefined,
+        300, // genuine quantity increase too
+        previousBuyerDeliveryDays, // AND a genuine delivery increase
+      );
+
+      expect(response.decision.reasons.some((r) => r.includes("increased its requested quantity"))).toBe(
+        true,
+      );
+      expect(
+        response.decision.reasons.some((r) => r.includes("offered a longer delivery window")),
+      ).toBe(false);
+    });
+  });
+
   // PACT V2 Milestone 1: the merchant's conditional quantity <-> price
   // trade evaluator (merchantTradeEvaluator.ts), flowing through the
   // real agent rather than just its own isolated unit tests.

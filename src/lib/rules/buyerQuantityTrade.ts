@@ -59,8 +59,13 @@ function clamp(value: number, min: number, max: number): number {
  * 1.0 (today's plain discount, unchanged); a strong buyer (100) asks for
  * up to 1.5x the ordinary discount; a weak buyer (0) still tries, but
  * only asks for 0.5x — a real, reachable, non-zero ask either way.
+ *
+ * Exported so buyerDeliveryTrade.ts (Milestone 7) can reuse the exact
+ * same leverage-sizing curve for its own price ask, rather than
+ * duplicating it — this is generic to "how hard should the buyer push,"
+ * not specific to quantity at all.
  */
-function resolveLeverageAskMultiplier(buyerLeverageScore: number): number {
+export function resolveLeverageAskMultiplier(buyerLeverageScore: number): number {
   return clamp(0.5 + buyerLeverageScore / 100, 0.5, 1.5);
 }
 

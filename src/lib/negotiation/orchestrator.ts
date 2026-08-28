@@ -158,6 +158,24 @@ export async function runNegotiationTurn(
    * exactly as if this option didn't exist.
    */
   quantityTradeAlreadyUsed?: boolean,
+  /**
+   * Milestone 7: the buyer's own delivery-day ask from ONE ROUND BEFORE
+   * this one — lets the merchant recognize a genuine round-over-round
+   * delivery extension (buyerAgent.ts's delivery-for-price trade), and
+   * lets the buyer's own acceptance ceiling widen when the merchant
+   * mirrors back a later date the buyer itself already offered. Optional
+   * and additive: omitting it reproduces exactly today's (pre-Milestone-7)
+   * behavior. Tracked entirely independently from previousBuyerQuantity /
+   * quantityTradeAlreadyUsed.
+   */
+  previousBuyerDeliveryDays?: number | null,
+  /**
+   * Milestone 7: whether the buyer has already used its delivery-for-price
+   * bargaining chip earlier in this same negotiation — derived by the
+   * caller from actual negotiation history, mirroring
+   * quantityTradeAlreadyUsed exactly, for the delivery dimension.
+   */
+  deliveryTradeAlreadyUsed?: boolean,
 ): Promise<NegotiationTurnResult> {
   if (TERMINAL_STATUSES.includes(state.status)) {
     throw new Error(
@@ -259,6 +277,8 @@ export async function runNegotiationTurn(
       leverageScore: buyerLeverageScore,
       quantityTradeAlreadyUsed,
       previousBuyerQuantity,
+      deliveryTradeAlreadyUsed,
+      previousBuyerDeliveryDays,
     },
   );
   const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
@@ -339,6 +359,9 @@ export async function runNegotiationTurn(
     // quantity increase (buyerResponse.action.quantity, above) even
     // below the flat bulk-order threshold.
     previousBuyerQuantity,
+    // Milestone 7: lets the merchant recognize a genuine round-over-round
+    // delivery extension (buyerResponse.action.deliveryDays, above).
+    previousBuyerDeliveryDays,
   );
   const merchantResult = merchantAgentResponse.decision;
 
@@ -452,6 +475,15 @@ export async function runNegotiationToCompletion(
     const quantityTradeAlreadyUsed = transcript.some(
       (t) => t.buyer.quantity !== null && t.buyer.quantity > context.buyerConstraints.quantity,
     );
+    // Milestone 7: same full-history-scan discipline as the quantity
+    // chip, tracked entirely independently — see
+    // hasBuyerProposedDeliveryDaysAbove's own doc comment
+    // (negotiationSessionRepository.ts) for why a single-round lookback
+    // would be unreliable here too.
+    const previousBuyerDeliveryDays = transcript[transcript.length - 1]?.buyer.deliveryDays ?? null;
+    const deliveryTradeAlreadyUsed = transcript.some(
+      (t) => t.buyer.deliveryDays !== null && t.buyer.deliveryDays > context.buyerConstraints.deliveryDeadlineDays,
+    );
     const turn = await runNegotiationTurn(
       context,
       state,
@@ -460,6 +492,8 @@ export async function runNegotiationToCompletion(
       priorMerchantUnitPrice,
       previousBuyerQuantity,
       quantityTradeAlreadyUsed,
+      previousBuyerDeliveryDays,
+      deliveryTradeAlreadyUsed,
     );
     transcript.push(turn);
     state = turn.state;

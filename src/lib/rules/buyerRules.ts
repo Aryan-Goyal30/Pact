@@ -112,12 +112,27 @@ export function isPriceAcceptable(
   return proposal.unitPrice <= constraints.maxUnitPrice;
 }
 
-/** Is the proposed delivery time at or before the buyer's deadline? */
+/**
+ * Is the proposed delivery time at or before what the buyer is actually
+ * willing to accept?
+ *
+ * `maxAcceptableDeliveryDays` defaults to `constraints.deliveryDeadlineDays`
+ * (the buyer's original deadline) when omitted — exactly the
+ * pre-Milestone-7 behavior every existing caller relies on. Milestone 7's
+ * delivery-for-price trade lets the buyer deliberately offer a LATER date
+ * than its original deadline in exchange for a better price (see
+ * buyerDeliveryTrade.ts); once it has, the merchant's own offer mirroring
+ * that later date must not be rejected here as "too slow" — the caller
+ * (buyerAgent.ts) passes the buyer's own most recent ask as the ceiling
+ * in that case. Mirrors isQuantityAcceptable's own Milestone 5 fix
+ * exactly, for the delivery dimension.
+ */
 export function isDeliveryAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableDeliveryDays: number = constraints.deliveryDeadlineDays,
 ): boolean {
-  return proposal.deliveryDays <= constraints.deliveryDeadlineDays;
+  return proposal.deliveryDays <= maxAcceptableDeliveryDays;
 }
 
 export type BuyerValidationOutcome = "ACCEPTABLE" | "UNACCEPTABLE";
@@ -134,11 +149,14 @@ export interface BuyerValidationResult {
  *
  * `maxAcceptableQuantity` — see isQuantityAcceptable — defaults to
  * `constraints.quantity`, exactly the pre-Milestone-5 behavior.
+ * `maxAcceptableDeliveryDays` — see isDeliveryAcceptable — defaults to
+ * `constraints.deliveryDeadlineDays`, exactly the pre-Milestone-7 behavior.
  */
 export function validateMerchantProposal(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
   maxAcceptableQuantity: number = constraints.quantity,
+  maxAcceptableDeliveryDays: number = constraints.deliveryDeadlineDays,
 ): BuyerValidationResult {
   const reasons: string[] = [];
 
@@ -155,9 +173,9 @@ export function validateMerchantProposal(
       `Offered unit price ${proposal.unitPrice} exceeds the buyer's maximum of ${constraints.maxUnitPrice}.`,
     );
   }
-  if (!isDeliveryAcceptable(constraints, proposal)) {
+  if (!isDeliveryAcceptable(constraints, proposal, maxAcceptableDeliveryDays)) {
     reasons.push(
-      `Offered delivery of ${proposal.deliveryDays} day(s) exceeds the buyer's deadline of ${constraints.deliveryDeadlineDays} day(s).`,
+      `Offered delivery of ${proposal.deliveryDays} day(s) exceeds the buyer's deadline of ${maxAcceptableDeliveryDays} day(s).`,
     );
   }
 

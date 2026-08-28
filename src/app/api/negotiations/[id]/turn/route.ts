@@ -2,6 +2,7 @@ import { findCatalogItemBySku } from "@/lib/rules/catalogRepository";
 import { getPublicManifest } from "@/lib/manifest";
 import { runNegotiationTurn } from "@/lib/negotiation/orchestrator";
 import {
+  hasBuyerProposedDeliveryDaysAbove,
   hasBuyerProposedQuantityAbove,
   loadLatestTurn,
   loadMerchantUnitPriceAtRound,
@@ -153,6 +154,12 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       id,
       loaded.buyerConstraints.quantity,
     );
+    // Milestone 7: same pattern, for the delivery chip — tracked
+    // entirely independently from the quantity chip.
+    const deliveryTradeAlreadyUsed = await hasBuyerProposedDeliveryDaysAbove(
+      id,
+      loaded.buyerConstraints.deliveryDeadlineDays,
+    );
     const turn = await runNegotiationTurn(
       { item, manifestProduct, buyerConstraints: loaded.buyerConstraints },
       loaded.state,
@@ -161,6 +168,8 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       priorMerchantUnitPrice,
       previousTurn?.buyer.quantity ?? null,
       quantityTradeAlreadyUsed,
+      previousTurn?.buyer.deliveryDays ?? null,
+      deliveryTradeAlreadyUsed,
     );
 
     const { turnNumber } = await persistNegotiationTurn(id, turn);

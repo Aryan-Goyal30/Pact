@@ -541,6 +541,166 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
   });
 });
 
+// PACT V2 Milestone 7: buyer-initiated delivery-for-price bargaining,
+// wired through the real runBuyerAgent (not just buyerDeliveryTrade.ts's
+// own isolated unit tests) — proves the plumbing (strategyContext.leverageScore
+// + deliveryTradeAlreadyUsed) actually reaches the decision, that it
+// stays independent of the quantity chip, and that the LLM boundary
+// safely communicates the conditional trade. Fixture mirrors the real
+// orchestrator's own golden trajectory (see orchestrator.test.ts) — not
+// hand-derived.
+describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
+  const deliveryTradeConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 40,
+    maxUnitPrice: 45500,
+    deliveryDeadlineDays: 8,
+    urgency: "high",
+    deliveryFlexible: true,
+  };
+  const merchantResult: NegotiationResult = {
+    outcome: "PARTIAL_FULFILLMENT",
+    sku: "LAPTOP-14-I5",
+    requestedQuantity: 40,
+    offeredQuantity: 30, // supply-constrained -> the quantity chip is unavailable, isolating delivery cleanly
+    unitPrice: 46209,
+    deliveryDays: 8,
+    reasons: [],
+  };
+
+  it("proposes DELIVERY_FOR_PRICE when the quantity chip is unavailable but delivery flexibility was stated", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: false },
+    );
+
+    expect(response.tradeMove).toBe("DELIVERY_FOR_PRICE");
+    expect(response.action).toEqual({
+      type: "counter_offer",
+      sku: "LAPTOP-14-I5",
+      quantity: 30, // still adopts the merchant's supply-constrained quantity
+      unitPrice: 44625,
+      deliveryDays: 12, // 8 + round(8 * 0.5)
+    });
+    expect(response.strategicReasons.some((r) => r.includes("accept delivery in 12 days"))).toBe(true);
+  });
+
+  it("does not trade delivery when the buyer never indicated flexibility", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const inflexible: BuyerConstraints = { ...deliveryTradeConstraints, deliveryFlexible: false };
+
+    const response = await runBuyerAgent(
+      inflexible,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: false },
+    );
+
+    expect(response.tradeMove).toBe("NO_TRADE");
+    expect(response.action.deliveryDays).toBe(8); // unchanged — no trade attempted
+  });
+
+  it("does not trade delivery once the chip has already been used, even at otherwise-favorable leverage", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: true },
+    );
+
+    expect(response.tradeMove).toBe("NO_TRADE");
+    expect(response.action.deliveryDays).toBe(8);
+  });
+
+  // Mutual exclusivity from the BUYER side (the merchant-side defensive
+  // mirror is tested in merchantAgent.test.ts): when the quantity chip IS
+  // available, it is tried first and the delivery chip never engages in
+  // the same round — this is the documented, deliberate waterfall
+  // ordering (see buyerAgent.ts), not an accident.
+  it("never fires the delivery chip in the same round the quantity chip fires", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const fullySupplied: NegotiationResult = { ...merchantResult, offeredQuantity: 40 }; // quantity chip now eligible
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      fullySupplied,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, quantityTradeAlreadyUsed: false, deliveryTradeAlreadyUsed: false },
+    );
+
+    expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
+    expect(response.action.deliveryDays).toBe(8); // unchanged — delivery chip never consulted this round
+  });
+
+  // LLM message contains all required conditional-trade numbers.
+  it("passes through an LLM message that correctly states the delivery trade's terms", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      "For 30 units, I can accept delivery in 12 days if you can bring the price down to 44625 each.",
+    );
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: false },
+    );
+
+    expect(response.message).toBe(
+      "For 30 units, I can accept delivery in 12 days if you can bring the price down to 44625 each.",
+    );
+  });
+
+  // Invalid Gemini conditional message falls back deterministically.
+  it("falls back to a deterministic message when the LLM's conditional-trade text omits the required price", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("I can wait longer if you help on price.");
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: false },
+    );
+
+    // The structured decision itself is completely unaffected...
+    expect(response.action.deliveryDays).toBe(12);
+    expect(response.action.unitPrice).toBe(44625);
+    // ...but the fallback caption states the real numbers, not the vague LLM text.
+    expect(response.message).toContain("12");
+    expect(response.message).toContain("44625");
+    expect(response.message).not.toContain("help on price");
+  });
+
+  it("falls back to a deterministic message when the LLM invents a conditional-trade delivery window not in the context", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("I can wait 999 days if you can do 1 each.");
+
+    const response = await runBuyerAgent(
+      deliveryTradeConstraints,
+      manifestProduct,
+      merchantResult,
+      { round: 2, maxRounds: 10 },
+      { leverageScore: 26, deliveryTradeAlreadyUsed: false },
+    );
+
+    expect(response.action.deliveryDays).toBe(12); // structured value unaffected
+    expect(response.message).not.toContain("999");
+    expect(response.message).not.toContain("1 each");
+    expect(response.message).toContain("12");
+    expect(response.message).toContain("44625");
+  });
+});
+
 // PACT V2 Milestone 6: quantity SUFFICIENCY — a separate question from
 // buyerQuantityTrade.ts's bargaining chip. Proves the plumbing through
 // the real runBuyerAgent, not just buyerQuantitySufficiency.ts's own

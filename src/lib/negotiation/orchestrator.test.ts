@@ -1203,6 +1203,148 @@ describe("buyer-initiated quantity-for-price trade through the real orchestrator
   });
 });
 
+// PACT V2 Milestone 7: buyer-initiated delivery-for-price bargaining,
+// Direction A — the buyer offers a LATER delivery date in exchange for a
+// better price. Fixture found by empirically probing several
+// representative scenarios (see the Milestone 7 calibration review),
+// not hand-derived, and deliberately supply-constrains quantity (30
+// available against a 40-unit request) so the quantity chip is
+// unavailable and this cleanly isolates the delivery mechanic.
+describe("buyer-initiated delivery-for-price trade through the real orchestrator", () => {
+  const item: CatalogItemSnapshot = {
+    sku: "LAPTOP-14-I5",
+    listedPrice: 48000,
+    minPrice: 44000,
+    availableQty: 30,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 15,
+    negotiationEnabled: true,
+  };
+  const listing: PublicManifestProduct = {
+    sku: "LAPTOP-14-I5",
+    name: "14-inch Business Laptop (i5, 16GB RAM)",
+    description: "Mid-range business laptop suitable for office use.",
+    listedPrice: 48000,
+    availableQuantity: 30,
+    standardDeliveryDays: 5,
+    maxDeliveryDays: 15,
+    negotiable: true,
+  };
+  const deliveryTradeBuyerConstraints: BuyerConstraints = {
+    sku: "LAPTOP-14-I5",
+    quantity: 40,
+    maxUnitPrice: 45500,
+    deliveryDeadlineDays: 8,
+    urgency: "high",
+    deliveryFlexible: true,
+  };
+
+  // The golden behavioral scenario (section 14/17 of the Milestone 7
+  // spec): the buyer changes DELIVERY specifically to negotiate price
+  // (both move together in the same round, not independently), the
+  // merchant evaluates the resulting package instead of blindly moving
+  // price alone, and the negotiation still reaches a genuine AGREED close.
+  it("the buyer offers a later delivery date specifically to seek a better price, the merchant evaluates the package, and they still reach AGREED", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: deliveryTradeBuyerConstraints },
+      10,
+    );
+
+    // Round 1: ordinary opening exchange (a genuine partial fulfillment
+    // — stock (30) is short of the 40 requested — no delivery trade yet;
+    // the legacy resolveDeliveryTrade already honors the buyer's own
+    // 8-day deadline, since there's no PRIOR round to diff against).
+    expect(transcript[0].buyer.deliveryDays).toBe(8);
+    expect(transcript[0].merchant.type).toBe("counter_offer");
+    expect(transcript[0].merchant.quantity).toBe(30); // partial fulfillment, unrelated to this milestone
+    expect(transcript[0].merchant.deliveryDays).toBe(8);
+    expect(transcript[0].merchant.unitPrice).toBe(46209);
+
+    // Round 2: the buyer changes DELIVERY specifically to negotiate price
+    // — quantity chip is unavailable here (merchant already short-supplying
+    // the original request), so this cleanly isolates the delivery move.
+    expect(transcript[1].buyer.deliveryDays).toBe(12); // 8 + round(8 * 0.5)
+    expect(transcript[1].buyer.quantity).toBe(30); // unchanged — this round's move is delivery, not quantity
+    expect(transcript[1].buyer.unitPrice).toBe(44625);
+    // The merchant evaluated the whole package: the countered price
+    // reflects a real stock-driven delivery discount on top of the
+    // baseline, and honors the buyer's own extended date.
+    expect(transcript[1].merchant.type).toBe("counter_offer");
+    expect(transcript[1].merchant.deliveryDays).toBe(12);
+    expect(transcript[1].merchant.unitPrice).toBe(45081);
+
+    // Round 3: a genuine AGREED close — the trade did not force
+    // agreement on its own.
+    expect(transcript[2].buyer.type).toBe("accept");
+    expect(transcript[2].buyer.unitPrice).toBe(45081);
+    expect(finalState.status).toBe("AGREED");
+
+    // The delivery chip is never used a second time.
+    const buyerDeliveryDays = transcript.map((t) => t.buyer.deliveryDays);
+    expect(buyerDeliveryDays.filter((d) => d === 12)).toHaveLength(2); // round 2's trade, then round 3 mirrors it back
+    expect(buyerDeliveryDays.every((d) => d === 8 || d === 12)).toBe(true); // never a third, escalating value
+  });
+
+  // Counterfactual proving the trade materially changed the merchant's
+  // response, not merely "a different number happened to come out."
+  it("the delivery trade materially changes the merchant's response compared to an ordinary (non-traded) counter", async () => {
+    const { transcript: traded } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: deliveryTradeBuyerConstraints },
+      10,
+    );
+
+    const withoutTrade = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 30, maxUnitPrice: 44625, deliveryDeadlineDays: 8, deliveryFlexible: true },
+      { round: 2, maxRounds: 10, previousOfferUnitPrice: 46209 },
+    );
+
+    // Same round, same merchant offer anchor, same buyer price — only
+    // the delivery window differs (8, not traded, vs 12, traded) — and
+    // yet the merchant's price differs materially.
+    expect(traded[1].merchant.unitPrice!).toBeLessThan(withoutTrade.decision.unitPrice!);
+  });
+
+  // Quantity trade and delivery trade never both fire in the same round
+  // — the orchestrator-level confirmation of the waterfall already
+  // proven at the unit and agent levels (buyerAgent.test.ts /
+  // merchantAgent.test.ts).
+  it("never trades both quantity and delivery in the same round", async () => {
+    const { transcript } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints: deliveryTradeBuyerConstraints },
+      10,
+    );
+
+    for (const turn of transcript) {
+      const quantityMoved = turn.buyer.quantity !== null && turn.buyer.quantity > deliveryTradeBuyerConstraints.quantity;
+      const deliveryMoved =
+        turn.buyer.deliveryDays !== null && turn.buyer.deliveryDays > deliveryTradeBuyerConstraints.deliveryDeadlineDays;
+      expect(quantityMoved && deliveryMoved).toBe(false);
+    }
+  });
+
+  // Impossible negotiation still walks away — the delivery-trade
+  // machinery being fully wired in (previousBuyerDeliveryDays threaded,
+  // deliveryTradeAlreadyUsed derived every round) never interferes with
+  // Milestone 2's structural walk-away check.
+  it("an impossible budget still closes as an early walk-away with the delivery-trade machinery fully wired in", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item,
+        manifestProduct: listing,
+        buyerConstraints: { ...deliveryTradeBuyerConstraints, maxUnitPrice: 30000 }, // below item.minPrice (44000)
+      },
+      6,
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+    expect(transcript.length).toBeLessThan(6);
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("reject");
+    expect(closingTurn.merchant.type).toBe("reject");
+  });
+});
+
 // PACT V2 Milestone 6: the two real browser scenarios from the
 // Milestone 5 browser-failure review, promoted to permanent
 // INTEGRATION regression fixtures — exact real-world inputs (the same

@@ -222,8 +222,12 @@ export interface DeliveryTradeResult {
   traded: boolean;
 }
 
-const DELIVERY_TRADE_DISCOUNT_PER_DAY_FRACTION = 0.01;
-const MAX_DELIVERY_TRADE_DISCOUNT_FRACTION = 0.15;
+// Exported so merchantDeliveryTradeEvaluator.ts (Milestone 7) can reuse
+// the exact same per-day rate at its "medium stock" tier — the SAME
+// baseline resolveDeliveryTrade already uses for every stock level —
+// rather than duplicating the numbers.
+export const DELIVERY_TRADE_DISCOUNT_PER_DAY_FRACTION = 0.01;
+export const MAX_DELIVERY_TRADE_DISCOUNT_FRACTION = 0.15;
 
 /**
  * A buyer who has explicitly signaled delivery flexibility, and whose
@@ -234,6 +238,50 @@ const MAX_DELIVERY_TRADE_DISCOUNT_FRACTION = 0.15;
  * hold, so no existing caller (none of which set buyerFlexible) is
  * affected.
  */
+// ---------------------------------------------------------------------------
+// Delivery-for-price bargaining — PACT V2 Milestone 7. resolveDeliveryTrade
+// below (pre-existing) remains legacy infrastructure: an automatic,
+// flat, merchant-state-blind discount applied whenever the buyer has
+// simply FLAGGED flexibility, unchanged by this milestone — see
+// merchantDeliveryTradeEvaluator.ts, which is what actually decides
+// whether a DELIBERATE round-over-round delivery move is worth it to
+// THIS merchant. These constants feed that evaluator and
+// buyerDeliveryTrade.ts, not resolveDeliveryTrade.
+// ---------------------------------------------------------------------------
+
+/** How much longer a delivery the buyer offers, as a fraction of its own stated deadline, when it uses its (single-use) delivery-for-price bargaining chip. */
+export const DELIVERY_TRADE_EXTENSION_FRACTION = 0.5;
+
+/** Extra fractional discount, on top of the buyer's ordinary round-aware concession ask, requested in exchange for that additional delivery slack. */
+export const DELIVERY_TRADE_PRICE_ASK_DISCOUNT = 0.02;
+
+/**
+ * Merchant-side multiplier on the per-day delivery discount when stock is
+ * genuinely CONSTRAINED (low) — deliberately the INVERSE of quantity's
+ * own stock-pressure signal (ABUNDANT_STOCK_TRADE_MULTIPLIER in
+ * merchantTradeEvaluator.ts): more quantity is straightforwardly more
+ * revenue for an abundant-stock merchant, but extra delivery TIME mainly
+ * helps a merchant that actually needs more lead time to source,
+ * produce, or ship — an abundant-stock merchant that could already ship
+ * on the standard schedule gains little from being given more time.
+ * Sanity-checked (not tuned to one fixture) against several stock levels
+ * and extension sizes before being set — see the Milestone 7 design
+ * review and calibration probe.
+ */
+export const CONSTRAINED_STOCK_DELIVERY_TRADE_MULTIPLIER = 1.75;
+
+/**
+ * Multiplier when stock is ABUNDANT (high) — zero, deliberately: an
+ * abundant-stock merchant has no genuine operational use for extra
+ * delivery time, so it grants no additional price discount for it (still
+ * accepts the later delivery date — that costs it nothing — just without
+ * rewarding it financially). This is what keeps the evaluation a real
+ * merchant-state judgment rather than a universal "+X days -> -Y rupees"
+ * rule: the SAME extension proposal is worth something to a constrained
+ * merchant and worth nothing to an abundant one.
+ */
+export const ABUNDANT_STOCK_DELIVERY_TRADE_MULTIPLIER = 0;
+
 export function resolveDeliveryTrade(
   item: Pick<CatalogItemSnapshot, "standardDeliveryDays" | "maxDeliveryDays" | "listedPrice" | "minPrice">,
   buyerDeadlineDays: number,

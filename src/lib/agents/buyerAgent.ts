@@ -36,6 +36,7 @@ import {
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
 import { decideBuyerConcessionMove, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
 import { decideBuyerQuantityTrade, type BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
+import { decideBuyerDeliveryTrade, type BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
 import {
   evaluateQuantitySufficiency,
   type QuantitySufficiencyDecision,
@@ -64,9 +65,13 @@ export interface BuyerAgentResponse {
    * request, an outright accept/reject, or a caller without a round
    * context) — distinct from "NO_TRADE", which means it WAS consulted
    * and declined. Internal/testability signal only — not yet threaded
-   * into the public DTO (see the Milestone 5 design note).
+   * into the public DTO (see the Milestone 5 design note). Milestone 7
+   * widens this to also carry "DELIVERY_FOR_PRICE" — the two trade
+   * dimensions are mutually exclusive within a round (see
+   * buildResponseToMerchantOffer's waterfall), so this single field is
+   * always enough to say which one (if either) fired.
    */
-  tradeMove: BuyerTradeMove | null;
+  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | null;
   /**
    * Milestone 6: the buyer's explicit, factor-based judgment of whether
    * the offered QUANTITY is actually sufficient — a separate question
@@ -112,6 +117,25 @@ export interface BuyerStrategyContext {
    * Omitted reproduces exactly today's ceiling (constraints.quantity).
    */
   previousBuyerQuantity?: number | null;
+  /**
+   * Milestone 7: whether the buyer has already used its delivery-for-price
+   * bargaining chip earlier in this same negotiation — tracked entirely
+   * independently from quantityTradeAlreadyUsed (using either chip never
+   * consumes the other). Derived by the caller from actual negotiation
+   * history, same discipline as quantityTradeAlreadyUsed. Omitted (or
+   * false) means the chip is still available.
+   */
+  deliveryTradeAlreadyUsed?: boolean;
+  /**
+   * Milestone 7: the buyer's own delivery-day ask from ONE ROUND BEFORE
+   * the offer being reacted to now. Used only to raise the acceptance
+   * ceiling (validateMerchantProposal) when the merchant's offer mirrors
+   * a later date the buyer itself already asked for via a trade —
+   * mirrors previousBuyerQuantity's own Milestone 5 role exactly, for
+   * the delivery dimension. Omitted reproduces exactly today's ceiling
+   * (constraints.deliveryDeadlineDays).
+   */
+  previousBuyerDeliveryDays?: number | null;
 }
 
 const BUYER_SYSTEM_PROMPT = `You are PACT's Buyer Agent, communicating with a merchant's AI agent on behalf of the buyer.
@@ -162,7 +186,7 @@ function buildResponseToMerchantOffer(
   validation: BuyerValidationResult;
   move: BuyerMove | null;
   moveReason: string | null;
-  tradeMove: BuyerTradeMove | null;
+  tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | null;
   sufficiency: QuantitySufficiencyDecision | null;
 } {
   if (
@@ -196,7 +220,21 @@ function buildResponseToMerchantOffer(
     constraints.quantity,
     strategyContext?.previousBuyerQuantity ?? 0,
   );
-  const validation = validateMerchantProposal(constraints, proposal, maxAcceptableQuantity);
+  // Milestone 7: same fix, for delivery — once the buyer has offered a
+  // LATER date than its original deadline (via a delivery trade), the
+  // merchant's offer mirroring that later date must not be rejected as
+  // "too slow" by the buyer's own constraints.deliveryDeadlineDays
+  // ceiling — see isDeliveryAcceptable's doc comment.
+  const maxAcceptableDeliveryDays = Math.max(
+    constraints.deliveryDeadlineDays,
+    strategyContext?.previousBuyerDeliveryDays ?? 0,
+  );
+  const validation = validateMerchantProposal(
+    constraints,
+    proposal,
+    maxAcceptableQuantity,
+    maxAcceptableDeliveryDays,
+  );
 
   // Milestone 6: technically satisfying every hard constraint
   // (price/quantity-ceiling/delivery) is NOT the same as the quantity
@@ -309,6 +347,46 @@ function buildResponseToMerchantOffer(
       move: null,
       moveReason: tradeDecision.reason,
       tradeMove: "QUANTITY_FOR_PRICE",
+      sufficiency,
+    };
+  }
+
+  // Milestone 7: the quantity chip declined (for whatever reason —
+  // already used, no gap, ineligible, or the merchant is already
+  // short-supplying the original request, in which case this is the
+  // buyer's ONLY remaining proactive lever, since offering slower
+  // delivery never requires more stock) — try the delivery chip next,
+  // before falling back to plain concession. A deliberate, documented
+  // waterfall (quantity first, delivery second), not a permanent
+  // "quantity always matters more" product principle — see the
+  // Milestone 7 design review for why this ordering is safe: each chip
+  // is a narrow, independently-gated, single-use, near-zero-cost check,
+  // so trying quantity first never meaningfully forecloses a genuinely
+  // better delivery opportunity — it only means that when BOTH would
+  // technically qualify, quantity is tried first. Mutually exclusive
+  // with the quantity chip by construction: at most one of them ever
+  // returns its own FOR_PRICE move in a single round.
+  const deliveryTradeDecision = decideBuyerDeliveryTrade(
+    constraints,
+    proposal.unitPrice,
+    concessionContext,
+    strategyContext?.leverageScore,
+    strategyContext?.deliveryTradeAlreadyUsed ?? false,
+  );
+
+  if (deliveryTradeDecision.move === "DELIVERY_FOR_PRICE") {
+    return {
+      action: {
+        type: "counter_offer",
+        sku: constraints.sku,
+        quantity: proposal.quantity,
+        unitPrice: deliveryTradeDecision.unitPrice as number,
+        deliveryDays: deliveryTradeDecision.deliveryDays as number,
+      },
+      validation,
+      move: null,
+      moveReason: deliveryTradeDecision.reason,
+      tradeMove: "DELIVERY_FOR_PRICE",
       sufficiency,
     };
   }
@@ -441,7 +519,7 @@ export async function runBuyerAgent(
       systemPrompt: BUYER_SYSTEM_PROMPT,
       context,
       instruction:
-        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"), still using only the exact numbers given.",
+        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"). If strategicReasons describes the buyer accepting a later delivery date in exchange for a better price, phrase that condition instead (e.g. \"I can accept 10-day delivery if you can do 43000 each.\"), still using only the exact numbers given.",
     });
     const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
     if (check.valid) {

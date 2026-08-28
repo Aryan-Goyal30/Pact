@@ -22,6 +22,7 @@ import {
   resolveDeliveryTrade,
 } from "@/lib/rules/negotiationStrategy";
 import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
+import { evaluateMerchantDeliveryTrade } from "@/lib/rules/merchantDeliveryTradeEvaluator";
 import { evaluateBuyerReciprocity } from "@/lib/rules/merchantReciprocity";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
@@ -137,6 +138,15 @@ function applyMerchantConcession(
   concessionContext: MerchantConcessionContext,
   priorBuyerUnitPrice?: number | null,
   previousBuyerQuantity?: number | null,
+  /**
+   * Milestone 7: the buyer's own delivery-day ask from ONE ROUND BEFORE
+   * `request` — lets the merchant recognize a genuine round-over-round
+   * delivery EXTENSION (a delivery-for-price trade), mirroring
+   * previousBuyerQuantity's Milestone 5 role exactly. Omitting it
+   * reproduces exactly today's (pre-Milestone-7) behavior — only the
+   * legacy, always-on resolveDeliveryTrade formula applies.
+   */
+  previousBuyerDeliveryDays?: number | null,
 ): NegotiationResult {
   if (
     request.maxUnitPrice === undefined ||
@@ -180,7 +190,43 @@ function applyMerchantConcession(
           { baselineConcessionPrice, hasGenuineIncrease: quantityIncreasedFromPrior },
         )
       : null;
-  const finalPrice = tradeEvaluation?.unitPrice ?? baselineConcessionPrice;
+
+  // Milestone 7: a genuine round-over-round delivery EXTENSION (a
+  // deliberate delivery-for-price trade — see buyerDeliveryTrade.ts) is
+  // evaluated by its own dedicated module, mirroring the quantity trade's
+  // shape but never its stock-pressure DIRECTION (extra delivery TIME is
+  // more valuable to a constrained merchant, not an abundant one — see
+  // merchantDeliveryTradeEvaluator.ts). Only considered when a quantity
+  // trade did NOT already fire this round — the two dimensions are
+  // mutually exclusive by construction of the buyer's own waterfall
+  // (buyerAgent.ts), and this is the defensive mirror of that on the
+  // merchant side. Evaluated against a DELIVERY-BLIND baseline (the
+  // legacy deliveryTradeDiscount deliberately excluded here) so this
+  // evaluator's own discount is the complete delivery-driven adjustment,
+  // never stacked on top of the legacy automatic formula.
+  const deliveryIncreasedFromPrior =
+    previousBuyerDeliveryDays !== null &&
+    previousBuyerDeliveryDays !== undefined &&
+    request.deliveryDeadlineDays !== undefined &&
+    request.deliveryDeadlineDays > previousBuyerDeliveryDays &&
+    (request.deliveryFlexible ?? false);
+
+  const deliveryTradeEvaluation =
+    !tradeEvaluation && deliveryIncreasedFromPrior
+      ? evaluateMerchantDeliveryTrade(
+          item,
+          { extraDays: trade.deliveryDays - item.standardDeliveryDays, unitPrice: request.maxUnitPrice },
+          {
+            baselineConcessionPrice: computeMerchantConcessionPrice(item, request.maxUnitPrice, {
+              ...concessionContext,
+              reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
+              // deliberately WITHOUT deliveryTradeDiscount.
+            }),
+          },
+        )
+      : null;
+
+  const finalPrice = tradeEvaluation?.unitPrice ?? deliveryTradeEvaluation?.unitPrice ?? baselineConcessionPrice;
 
   if (finalPrice === decision.unitPrice && trade.deliveryDays === decision.deliveryDays) {
     return decision;
@@ -197,6 +243,17 @@ function applyMerchantConcession(
           ]
         : []),
       ...(tradeEvaluation ? [tradeEvaluation.reason] : []),
+      // Gated on deliveryTradeEvaluation actually having run (not just
+      // deliveryIncreasedFromPrior being true) — a genuine delivery
+      // signal that got PREEMPTED by a same-round quantity trade must
+      // never claim the merchant "evaluated the full package" for
+      // delivery, since it didn't.
+      ...(deliveryTradeEvaluation
+        ? [
+            `The buyer offered a longer delivery window (from ${previousBuyerDeliveryDays} to ${trade.deliveryDays} days) in exchange for a better price, so the merchant evaluated the full package instead of price alone.`,
+          ]
+        : []),
+      ...(deliveryTradeEvaluation ? [deliveryTradeEvaluation.reason] : []),
       // quantityLeveraged is false here — the trade evaluation above
       // already supplies a more specific quantity reason when relevant,
       // so explainMerchantFactors only contributes stock/delivery reasons.
@@ -280,6 +337,13 @@ export async function runMerchantAgent(
    * behavior (only the absolute threshold can engage the trade evaluator).
    */
   previousBuyerQuantity?: number | null,
+  /**
+   * Milestone 7: the buyer's own delivery-day ask from ONE ROUND BEFORE
+   * `request` — lets the merchant recognize a genuine round-over-round
+   * delivery extension even when the legacy resolveDeliveryTrade formula
+   * would already silently apply. See applyMerchantConcession.
+   */
+  previousBuyerDeliveryDays?: number | null,
 ): Promise<MerchantAgentResponse> {
   let decision = evaluateNegotiationRequest(item, request);
   if (item && concessionContext) {
@@ -290,6 +354,7 @@ export async function runMerchantAgent(
       concessionContext,
       priorBuyerUnitPrice,
       previousBuyerQuantity,
+      previousBuyerDeliveryDays,
     );
   }
 
