@@ -317,6 +317,33 @@ describe("runBuyerAgent — HOLD vs CONCEDE strategy", () => {
     expect(response.strategicReasons.some((r) => r.toLowerCase().includes("has not moved"))).toBe(true);
   });
 
+  // Milestone 12.5: HOLD's own LLM instruction now explicitly steers
+  // phrasing toward firmness — this is the only change; the deterministic
+  // decision above (still HOLD, still repeating 43700) is completely
+  // unaffected. Verified against the real instruction string
+  // runBuyerAgent actually sends the LLM provider for a genuine HOLD
+  // round (not a live Gemini call, which this codebase's own tests never
+  // make — see this file's own provider mock — but the exact same
+  // mocking boundary every other prompt-content assertion in this test
+  // suite already relies on).
+  it("HOLD's LLM instruction explicitly requires firmness phrasing and forbids 'I can go up to' language", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 }, // merchant's offer unchanged -> HOLD
+    );
+
+    const [{ instruction }] = mockedGenerateAgentMessage.mock.calls[0];
+    expect(instruction).toMatch(/holding its position/i);
+    expect(instruction).toMatch(/firmness/i);
+    expect(instruction.toLowerCase()).toContain("i can go up to");
+    expect(instruction).toMatch(/must not use language like/i);
+  });
+
   it("B: concedes (a controlled, clamped move) when the merchant did move", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
 

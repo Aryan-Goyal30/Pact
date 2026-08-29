@@ -181,6 +181,12 @@ describe("getScenarioPresets", () => {
     const preset = getScenarioPresets(products).find((p) => p.id === "flexible-delivery");
     expect(preset).toBeDefined();
     expect(preset!.values.deliveryFlexible).toBe(true);
+    // Milestone 12.5: the deadline must sit strictly below the product's
+    // real maxDeliveryDays (12, from the manifest fixture above) — the
+    // pre-Milestone-12.5 preset failed this exact check (deadline was
+    // already AT 12, leaving no genuine slack to ever trade).
+    const laptop = products.find((p) => p.sku === "LAPTOP-14-I5")!;
+    expect(Number(preset!.values.deliveryDeadlineDays)).toBeLessThan(laptop.maxDeliveryDays);
   });
 
   it("never references a product SKU absent from the given catalog", () => {
@@ -206,5 +212,35 @@ describe("negotiationFailureExplanation", () => {
   it("never mentions minPrice or any private constraint", () => {
     expect(negotiationFailureExplanation("REJECTED")).not.toMatch(/minprice|floor|reservation/i);
     expect(negotiationFailureExplanation("EXPIRED")).not.toMatch(/minprice|floor|reservation/i);
+  });
+
+  // Milestone 12.5: EXPIRED is further distinguished using rounds/maxRounds
+  // — data the DTO already carries — rather than a new status enum.
+  it("omitting rounds/maxRounds reproduces the exact pre-Milestone-12.5 generic EXPIRED text", () => {
+    expect(negotiationFailureExplanation("EXPIRED")).toBe(
+      "The maximum number of negotiation rounds was reached before both sides could agree on terms.",
+    );
+  });
+
+  it("gives an early-end explanation when EXPIRED closed before the round limit (rounds < maxRounds)", () => {
+    const early = negotiationFailureExplanation("EXPIRED", 2, 6);
+    expect(early).toBe("Negotiation ended early — the two sides' positions could not be reconciled.");
+    expect(early).not.toMatch(/maximum number of.*rounds/i);
+  });
+
+  it("gives the round-exhaustion explanation when EXPIRED closed exactly at the round limit (rounds === maxRounds)", () => {
+    expect(negotiationFailureExplanation("EXPIRED", 6, 6)).toBe(
+      "The maximum number of negotiation rounds was reached before both sides could agree on terms.",
+    );
+  });
+
+  it("REJECTED ignores rounds/maxRounds entirely — the distinction only ever applies to EXPIRED", () => {
+    expect(negotiationFailureExplanation("REJECTED", 1, 6)).toBe(
+      negotiationFailureExplanation("REJECTED"),
+    );
+  });
+
+  it("never mentions minPrice or any private constraint in the early-end variant either", () => {
+    expect(negotiationFailureExplanation("EXPIRED", 2, 6)).not.toMatch(/minprice|floor|reservation/i);
   });
 });

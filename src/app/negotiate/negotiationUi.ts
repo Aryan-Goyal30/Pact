@@ -91,10 +91,20 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Balanced negotiation",
     description: "Neither side has a dominant advantage — a gradual, ordinary back-and-forth.",
     sku: "LAPTOP-14-I5",
+    // Milestone 12.5: maxUnitPrice lowered from 46000 -> 45000 — the only
+    // change. At 46000, round 1's anchored-midpoint merchant counter
+    // (45850) already cleared the buyer's ceiling, so the buyer accepted
+    // on round 2 with nothing else to observe. At 45000, that same
+    // counter (45375) does not clear the ceiling, so the negotiation
+    // genuinely continues — verified against the real orchestrator and
+    // the real seeded catalog: R1 counter, R2 buyer HOLD (a real,
+    // comparison-won strategic move — never forced), merchant concedes,
+    // R3 accept. Nothing about the buyer's decision logic changed; this
+    // preset simply no longer opens right on top of an instant accept.
     values: {
       sku: "LAPTOP-14-I5",
       quantity: "50",
-      maxUnitPrice: "46000",
+      maxUnitPrice: "45000",
       deliveryDeadlineDays: "7",
       urgency: "medium",
       deliveryFlexible: false,
@@ -103,14 +113,31 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
   {
     id: "bulk-buyer",
     label: "Bulk buyer",
-    description: "A large order against ample stock — buyer leverage should be strong.",
-    sku: "MONITOR-24-FHD",
+    description: "The buyer offers a bigger order in exchange for a better price — genuine quantity-for-price bargaining.",
+    sku: "LAPTOP-14-I5",
+    // Milestone 12.5: replaces the old MONITOR-24-FHD/200-unit shape.
+    // That preset's own large quantity pushed buyer leverage past 60
+    // almost immediately (quantityLeverageComponent + fulfillability
+    // alone contribute ~0.28 toward the leverage total at 200 units) —
+    // once leverage crosses that threshold, HOLD becomes the buyer's
+    // ordinary move, and HOLD (which repeats an earlier, lower round's
+    // price) structurally outprices any same-round QUANTITY_FOR_PRICE
+    // candidate, so the trade never won regardless of whether it fired.
+    // These values instead reuse the shape of an already-verified
+    // orchestrator fixture where the quantity trade genuinely wins a
+    // real price comparison (not a HOLD-favoring leverage band) —
+    // re-verified here against the REAL seeded LAPTOP-14-I5 catalog
+    // (availableQty 100, not the fixture's own 150): R1 opens 50 units,
+    // R2 the buyer's own comparison selects QUANTITY_FOR_PRICE, trading
+    // up to exactly 100 units (== all available stock, confirmed never
+    // exceeded / never partially fulfilled), for a materially better
+    // price than a plain concession would have given; R3 accepts.
     values: {
-      sku: "MONITOR-24-FHD",
-      quantity: "200",
-      maxUnitPrice: "9000",
-      deliveryDeadlineDays: "8",
-      urgency: "medium",
+      sku: "LAPTOP-14-I5",
+      quantity: "50",
+      maxUnitPrice: "45500",
+      deliveryDeadlineDays: "10",
+      urgency: "high",
       deliveryFlexible: false,
     },
   },
@@ -147,12 +174,36 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Flexible delivery",
     description: "The buyer trades a later delivery date for a better price.",
     sku: "LAPTOP-14-I5",
+    // Milestone 12.5: the old shape (deadline 12) already sat exactly at
+    // this item's real maxDeliveryDays (12) — zero genuine slack existed
+    // to trade before the preset even opened. The primary replacement
+    // proposed for this milestone (quantity 40, ceiling 45500, deadline
+    // 8) was tried first and found NOT to reproduce live: against the
+    // real catalog's stock of 100 (unlike the reference fixture, which
+    // used a deliberately-constrained stock of 30 specifically to
+    // suppress the competing quantity chip), 40 units never triggers
+    // partial fulfillment, so round 1's ordinary counter already cleared
+    // the buyer's ceiling and the negotiation accepted immediately —
+    // no round ever reached a point where any trade could fire. Two
+    // further adjustments were probed against the real orchestrator:
+    // tightening the ceiling alone (still qty 40) reopened a real
+    // negotiation, but buyer leverage still crossed 60 by round 2, so
+    // HOLD won instead of DELIVERY_FOR_PRICE, matching the exact
+    // mechanism already found in the bulk-buyer preset above. Raising
+    // quantity to 110 (creating a genuine, real partial-fulfillment
+    // shortfall against the real 100-unit stock — which also suppresses
+    // the competing quantity-for-price chip, mirroring the reference
+    // fixture's own isolation technique) alongside the tighter ceiling
+    // is what actually worked: re-verified against the real seeded
+    // catalog, R1 partial-fulfillment counter (100 of 110) does not
+    // clear the ceiling, R2 the buyer's own comparison genuinely selects
+    // DELIVERY_FOR_PRICE (never forced), R3 accepts.
     values: {
       sku: "LAPTOP-14-I5",
-      quantity: "20",
-      maxUnitPrice: "46000",
-      deliveryDeadlineDays: "12",
-      urgency: "low",
+      quantity: "110",
+      maxUnitPrice: "45000",
+      deliveryDeadlineDays: "8",
+      urgency: "high",
       deliveryFlexible: true,
     },
   },
@@ -227,11 +278,33 @@ export function negotiationStatusBadgeClass(status: NegotiationStatus): string {
  * distinction the UI can show without leaning on the (private-safe, but
  * still just one specific merchant message) text of the closing turn.
  * Never mentions minPrice or any other private constraint.
+ *
+ * Milestone 12.5: EXPIRED itself is further distinguished, UI-only, using
+ * data the DTO already carries (`rounds`/`maxRounds` — see
+ * NegotiationRunResponse / NegotiationTurnResponse) rather than a new
+ * status enum or WalkAwayReason field: a walk-away (structural price-gap
+ * impossibility, or a repeated-position deadlock — see walkAway.ts) can
+ * close well before the round limit, while genuine round-exhaustion
+ * always has rounds === maxRounds. Deliberately never derived from the
+ * closing turn's own LLM-phrased `message` text — nothing in this
+ * codebase parses agent messages to recover structured meaning (see
+ * negotiation/protocol.ts's own header comment), and this is no
+ * exception. `rounds`/`maxRounds` are optional and additive: omitting
+ * either reproduces the exact pre-Milestone-12.5 generic EXPIRED text,
+ * so every existing single-argument call site is unaffected.
  */
-export function negotiationFailureExplanation(status: "REJECTED" | "EXPIRED"): string {
-  return status === "EXPIRED"
-    ? "The maximum number of negotiation rounds was reached before both sides could agree on terms."
-    : "The negotiation could not find terms that satisfied both sides' requirements.";
+export function negotiationFailureExplanation(
+  status: "REJECTED" | "EXPIRED",
+  rounds?: number,
+  maxRounds?: number,
+): string {
+  if (status === "REJECTED") {
+    return "The negotiation could not find terms that satisfied both sides' requirements.";
+  }
+  if (rounds !== undefined && maxRounds !== undefined && rounds < maxRounds) {
+    return "Negotiation ended early — the two sides' positions could not be reconciled.";
+  }
+  return "The maximum number of negotiation rounds was reached before both sides could agree on terms.";
 }
 
 // ---------------------------------------------------------------------------

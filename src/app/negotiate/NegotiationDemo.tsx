@@ -120,7 +120,15 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
       const createResponse = await fetch("/api/negotiations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(parsed),
+        // Milestone 12.5: demo-only — widens the visible negotiation
+        // window past the API's own DEFAULT_MAX_ROUNDS (4), so the
+        // final-two-round guaranteed-convergence safety net (which
+        // activates once roundsLeft<=2) doesn't swallow half of every
+        // demo run. The server-side default and every other caller of
+        // POST /api/negotiations are completely unaffected — the API
+        // already accepted an optional maxRounds field before this
+        // change; only this one client now supplies it.
+        body: JSON.stringify({ ...parsed, maxRounds: 6 }),
       });
       const session = (await createResponse.json()) as NegotiationSessionResponse & {
         error?: string;
@@ -429,6 +437,8 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
               agreement={agreement}
               lastTurn={lastTurn}
               productName={selectedProduct?.name ?? null}
+              round={round}
+              maxRounds={maxRounds}
             />
           )}
         </section>
@@ -713,11 +723,16 @@ function OutcomeCard({
   agreement,
   lastTurn,
   productName,
+  round,
+  maxRounds,
 }: {
   status: NegotiationStatus;
   agreement: PersistedAgreementDTO | null;
   lastTurn: TranscriptTurn | undefined;
   productName: string | null;
+  /** Milestone 12.5: only used to distinguish an early walk-away EXPIRED from a round-exhaustion EXPIRED — see negotiationFailureExplanation. */
+  round: number;
+  maxRounds: number | null;
 }) {
   if (status === "AGREED" && agreement) {
     return (
@@ -784,7 +799,9 @@ function OutcomeCard({
   }
 
   const explanation =
-    status === "REJECTED" || status === "EXPIRED" ? negotiationFailureExplanation(status) : null;
+    status === "REJECTED" || status === "EXPIRED"
+      ? negotiationFailureExplanation(status, round, maxRounds ?? undefined)
+      : null;
 
   return (
     <div className="flex flex-col gap-2 rounded-xl border-2 border-red-300 bg-red-50 p-5 dark:border-red-900 dark:bg-red-950/30">
