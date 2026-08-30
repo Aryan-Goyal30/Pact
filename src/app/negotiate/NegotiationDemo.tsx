@@ -26,6 +26,7 @@ import {
   parseBuyerRequestForm,
   type BuyerRequestFormValues,
 } from "./negotiationUi";
+import { PaymentPanel } from "@/app/negotiate/PaymentPanel";
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -786,14 +787,7 @@ function OutcomeCard({
             Status: <span className="font-medium">{agreement.status}</span>
           </span>
         </div>
-        <button
-          type="button"
-          disabled
-          title="Payment integration is the next phase — not implemented yet"
-          className="flex h-11 w-fit items-center justify-center rounded-full bg-zinc-400 px-6 text-sm font-medium text-white opacity-60 dark:bg-zinc-700"
-        >
-          Proceed to Payment (coming in a later phase)
-        </button>
+        <PaymentPanel agreementId={agreement.id} productName={productName ?? agreement.sku} />
       </div>
     );
   }
