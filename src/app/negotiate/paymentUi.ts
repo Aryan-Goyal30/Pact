@@ -13,7 +13,22 @@ export interface VerifyRequestBody {
   razorpayOrderId: string;
   razorpayPaymentId?: string;
   razorpaySignature?: string;
+  /**
+   * Only ever sent by the MOCK checkout simulation now (see
+   * buildMockVerifyRequestBody) — a REAL Checkout `payment.failed` event
+   * is reported via buildFailureReportRequestBody / .../report-failure
+   * instead (M13.2), never through /verify, since it must never
+   * terminalize anything.
+   */
   reportedFailureCode?: string;
+}
+
+/** M13.2 — the request body for POST .../payment/report-failure: purely informational, no signature, no proof required (a decline report unlocks/forecloses nothing). */
+export interface FailureReportRequestBody {
+  razorpayOrderId: string;
+  errorCode?: string;
+  errorDescription?: string;
+  reportedPaymentId?: string;
 }
 
 /**
@@ -35,9 +50,31 @@ export function buildCheckoutSuccessRequestBody(response: {
   };
 }
 
-/** Builds the /verify request body for a REAL Checkout-reported failure (the `payment.failed` event) — no signature exists to relay; see paymentFailure.ts's own reasoning on why a failure claim needs none. */
-export function buildReportedFailureRequestBody(razorpayOrderId: string, errorCode: string | undefined): VerifyRequestBody {
-  return { razorpayOrderId, reportedFailureCode: errorCode };
+/**
+ * Builds the /report-failure request body for a REAL Checkout-reported
+ * failure (the `payment.failed` event) — M13.2. No signature exists to
+ * relay, and unlike the old (pre-M13.2) /verify-based version of this
+ * builder, this is now DELIBERATELY informational-only: Razorpay's
+ * Checkout `retry` option defaults to enabled (PACT never disables it —
+ * see PaymentPanel.tsx), so the modal may stay open after this exact
+ * decline and later receive a genuine success against the SAME order —
+ * this report must never be capable of terminalizing the PaymentAttempt
+ * or consuming any part of the recovery budget. `errorCode`/
+ * `errorDescription`/`paymentId` (Razorpay's own `error.metadata.payment_id`,
+ * when present) are all recorded purely for the audit trail.
+ */
+export function buildFailureReportRequestBody(
+  razorpayOrderId: string,
+  errorCode: string | undefined,
+  errorDescription: string | undefined,
+  paymentId: string | undefined,
+): FailureReportRequestBody {
+  return {
+    razorpayOrderId,
+    ...(errorCode ? { errorCode } : {}),
+    ...(errorDescription ? { errorDescription } : {}),
+    ...(paymentId ? { reportedPaymentId: paymentId } : {}),
+  };
 }
 
 /**

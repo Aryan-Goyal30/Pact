@@ -32,6 +32,15 @@ export const AUDIT_EVENT_RECOVERY_STARTED = "RECOVERY_STARTED";
 export const AUDIT_EVENT_RECOVERY_SUCCEEDED = "RECOVERY_SUCCEEDED";
 export const AUDIT_EVENT_RECOVERY_FAILED = "RECOVERY_FAILED";
 export const AUDIT_EVENT_WEBHOOK_RECEIVED = "WEBHOOK_RECEIVED";
+/**
+ * M13.2 — a browser-observed Razorpay Checkout `payment.failed` event,
+ * recorded PURELY for audit/diagnostics. Deliberately distinct from
+ * AUDIT_EVENT_PAYMENT_FAILED (which only ever accompanies an actual
+ * terminal state transition inside resolvePaymentAttempt) — this event
+ * type means the opposite: NOTHING was transitioned. See
+ * recordReportedCheckoutFailure's own comment for why.
+ */
+export const AUDIT_EVENT_PAYMENT_FAILURE_REPORTED = "PAYMENT_FAILURE_REPORTED";
 
 export type AgreementPaymentStatus = "pending_payment" | "paid" | "failed" | "recovered" | "closed";
 export type PaymentAttemptStatus = "created" | "success" | "failed";
@@ -358,6 +367,57 @@ export async function resolvePaymentAttempt(
     });
 
     return { applied: true, attemptStatus: input.outcome, agreementStatus };
+  });
+}
+
+export interface RecordReportedCheckoutFailureInput {
+  agreementId: string;
+  /** Set only when the reported razorpayOrderId matched the Agreement's currently-unresolved attempt — never invented, never guessed. */
+  paymentAttemptId?: string;
+  razorpayOrderId: string;
+  errorCode?: string;
+  errorDescription?: string;
+  /** Razorpay's own `error.metadata.payment_id`, when the failed event included one — audit-only, exactly like resolvePaymentAttempt's own razorpayPaymentId field. */
+  reportedPaymentId?: string;
+}
+
+/**
+ * M13.2 — records a browser-observed Razorpay Checkout `payment.failed`
+ * event as an AuditLog entry ONLY. This function NEVER touches a
+ * PaymentAttempt or Agreement row — no status write, no failureReason
+ * write, nothing.
+ *
+ * Why this exists as its own function, separate from resolvePaymentAttempt:
+ * real Razorpay Checkout's `retry` option defaults to enabled (PACT never
+ * disables it — see PaymentPanel.tsx), meaning the Checkout modal stays
+ * open after a single decline and the SAME registered `handler` callback
+ * may still receive a later, genuinely successful payment against the
+ * SAME order_id. Terminalizing the PaymentAttempt on the first decline
+ * (the pre-M13.2 behavior) meant that later real success could never be
+ * matched by findUnresolvedAttempt anymore, and was rejected outright —
+ * this was confirmed against real Razorpay Test Mode (Order=Paid,
+ * PACT=failed). A decline while Checkout may still be open is therefore
+ * informational, not authoritative: only a verified signature
+ * (resolvePaymentAttempt via verifyCheckoutPayment) or an authoritative
+ * webhook may ever move PaymentAttempt/Agreement to a terminal state.
+ *
+ * Never throws on a mismatched/stale/unmatched order id — see this
+ * function's only caller (paymentService.ts's reportCheckoutFailure) for
+ * why a failure REPORT must never be capable of rejecting anything.
+ */
+export async function recordReportedCheckoutFailure(input: RecordReportedCheckoutFailureInput): Promise<void> {
+  await prisma.auditLog.create({
+    data: {
+      eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED,
+      agreementId: input.agreementId,
+      paymentAttemptId: input.paymentAttemptId,
+      payload: JSON.stringify({
+        razorpayOrderId: input.razorpayOrderId,
+        errorCode: input.errorCode,
+        errorDescription: input.errorDescription,
+        reportedPaymentId: input.reportedPaymentId,
+      }),
+    },
   });
 }
 

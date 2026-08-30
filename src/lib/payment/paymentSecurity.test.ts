@@ -12,7 +12,7 @@ import { createNegotiationSession } from "@/lib/negotiation/negotiationSessionRe
 import { ensureAgreementForSession } from "@/lib/negotiation/agreementRepository";
 import { getLlmProvider } from "@/lib/llm/provider";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
-import { createOrderForAgreement, verifyCheckoutPayment } from "@/lib/payment/paymentService";
+import { createOrderForAgreement, reportCheckoutFailure, verifyCheckoutPayment } from "@/lib/payment/paymentService";
 import { startRecovery, RecoveryLimitExceededError } from "@/lib/payment/recoveryService";
 import { MOCK_VALID_SIGNATURE } from "@/types/payment";
 import { POST as verifyRoute } from "@/app/api/agreements/[id]/payment/verify/route";
@@ -224,6 +224,32 @@ describe("Security: paid state cannot regress", () => {
 
     const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
     expect(agreement.status).toBe("paid");
+  });
+});
+
+describe("Security: an unauthenticated client payment.failed report can never terminalize a payment (M13.2)", () => {
+  it("reportCheckoutFailure alone — no signature, arbitrary attacker-controlled content — never moves PaymentAttempt/Agreement out of 'created'/'pending_payment', and a genuine later success still resolves cleanly", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    // An attacker (or a merely stale/duplicate real event) reports failure
+    // repeatedly, with no proof of any kind.
+    for (let i = 0; i < 5; i++) {
+      await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "FORGED" });
+    }
+
+    const midway = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(midway.status).toBe("pending_payment"); // never terminalized by an unproven claim
+
+    // The genuine, cryptographically-verified success — this is exactly
+    // the real-provider scenario (Order=Paid, PACT=failed) this milestone
+    // fixes: it must still succeed after any number of prior reports.
+    const result = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_real",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+    expect(result.agreementStatus).toBe("paid");
   });
 });
 

@@ -783,9 +783,15 @@ function OutcomeCard({
           <span>
             Agreement ID: <span className="font-mono">{agreement.id}</span>
           </span>
-          <span>
-            Status: <span className="font-medium">{agreement.status}</span>
-          </span>
+          {/* Deliberately no "Status: {agreement.status}" line here — that
+              was a one-time PersistedAgreementDTO snapshot, captured the
+              moment the negotiation reached AGREED, and never refreshed
+              afterward (see this component's own header comment: this
+              module never re-fetches the Agreement after that point).
+              PaymentPanel below is the sole, live-refreshed source of
+              truth for payment status — rendering a second, frozen copy
+              here previously showed a permanently stale "pending_payment"
+              even after a real payment succeeded. */}
         </div>
         <PaymentPanel agreementId={agreement.id} productName={productName ?? agreement.sku} />
       </div>

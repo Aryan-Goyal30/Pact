@@ -15,7 +15,7 @@ import { getLlmProvider } from "@/lib/llm/provider";
 import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 import type { PublicManifestProduct } from "@/types/manifest";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
-import { createOrderForAgreement, verifyCheckoutPayment } from "@/lib/payment/paymentService";
+import { createOrderForAgreement, reportCheckoutFailure, verifyCheckoutPayment } from "@/lib/payment/paymentService";
 import { startRecovery } from "@/lib/payment/recoveryService";
 import { MOCK_VALID_SIGNATURE } from "@/types/payment";
 
@@ -213,5 +213,62 @@ describe("E2E B: negotiation -> Agreement -> order -> failure -> retry -> recove
     expect(persisted.quantity).toBe(originalQuantity);
     expect(persisted.pricePerUnit).toBe(originalPrice);
     expect(persisted.deliveryDays).toBe(originalDelivery);
+  });
+});
+
+// C. M13.2 — Razorpay's native in-Checkout retry path: negotiation ->
+// Agreement -> order -> Checkout decline(s) reported (informational only,
+// Razorpay's own modal stays open) -> a later success against the SAME
+// order/attempt -> PAID. This is the automated-mock stand-in for the real
+// Razorpay Test Mode walkthrough this milestone's own report performs
+// live (PACT Pay Now -> Netbanking -> Test Bank FAILURE -> WITHOUT
+// closing Checkout -> Razorpay's native Retry -> Test Bank SUCCESS).
+describe("E2E C: negotiation -> Agreement -> order -> native in-Checkout retry -> success -> PAID (never a 2nd PaymentAttempt)", () => {
+  it("resolves to paid through the SAME single PaymentAttempt/order, with every decline preserved as audit history", async () => {
+    const { agreement } = await negotiateToAgreement({
+      sku: LAPTOP_SKU,
+      quantity: 10,
+      maxUnitPrice: 48000,
+      deliveryDeadlineDays: 5,
+    });
+
+    const order = await createOrderForAgreement(agreement.id);
+
+    // Two declines inside what would be the SAME still-open real Checkout
+    // session — informational only, never terminalizing.
+    await reportCheckoutFailure(agreement.id, { razorpayOrderId: order.razorpayOrderId, errorCode: "BAD_OTP" });
+    await reportCheckoutFailure(agreement.id, { razorpayOrderId: order.razorpayOrderId, errorCode: "CARD_DECLINED" });
+
+    const midway = await prisma.agreement.findUniqueOrThrow({ where: { id: agreement.id } });
+    expect(midway.status).toBe("pending_payment"); // never invented into "failed"
+
+    // Razorpay's native retry eventually succeeds against the SAME order —
+    // the same registered Checkout `handler` fires, forwarded to /verify.
+    const result = await verifyCheckoutPayment(agreement.id, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_e2e_native_retry_success",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+
+    expect(result.agreementStatus).toBe("paid");
+    const persisted = await prisma.agreement.findUniqueOrThrow({ where: { id: agreement.id } });
+    expect(persisted.status).toBe("paid");
+
+    // Exactly ONE PaymentAttempt and ONE Razorpay order for the whole
+    // sequence — Razorpay's own retries never created a 2nd logical
+    // attempt or a 2nd order, and no recovery attempt was ever started.
+    const attempts = await prisma.paymentAttempt.findMany({ where: { agreementId: agreement.id } });
+    expect(attempts).toHaveLength(1);
+    expect(attempts[0].status).toBe("success");
+    expect(attempts[0].razorpayOrderId).toBe(order.razorpayOrderId);
+
+    // Both earlier declines are preserved in the audit trail alongside the
+    // eventual success — informational history is never discarded.
+    const events = (await prisma.auditLog.findMany({ where: { agreementId: agreement.id }, orderBy: { createdAt: "asc" } })).map(
+      (log) => log.eventType,
+    );
+    expect(events.filter((e) => e === "PAYMENT_FAILURE_REPORTED")).toHaveLength(2);
+    expect(events).toContain("PAYMENT_SUCCEEDED");
+    expect(events).not.toContain("PAYMENT_FAILED"); // never a terminal-failure event for this attempt
   });
 });

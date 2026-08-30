@@ -4,7 +4,8 @@ import { createNegotiationSession } from "@/lib/negotiation/negotiationSessionRe
 import { ensureAgreementForSession } from "@/lib/negotiation/agreementRepository";
 import { getLlmProvider } from "@/lib/llm/provider";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
-import { createOrderForAgreement } from "@/lib/payment/paymentService";
+import { createOrderForAgreement, reportCheckoutFailure, verifyCheckoutPayment } from "@/lib/payment/paymentService";
+import { startRecovery } from "@/lib/payment/recoveryService";
 import { GET } from "./route";
 import type { PaymentStatusResponseDTO } from "@/types/payment";
 
@@ -72,5 +73,43 @@ describe("GET /api/agreements/:id/payment", () => {
 
     const { body } = await callStatus(agreementId);
     expect(body.currentRazorpayOrderId).toBe(order.razorpayOrderId);
+  });
+
+  // M13.1 — the exact real-provider regression, proven through the real
+  // HTTP GET route: Attempt #1 failed, Attempt #2 created (unresolved)
+  // must report as resumable, not "exhausted after 2 attempts."
+  it("M13.1: Attempt #1 failed + Attempt #2 created (unresolved) → recoveryAvailable = true", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+    await startRecovery(agreementId); // attempt #2, deliberately left unresolved
+
+    const { status, body } = await callStatus(agreementId);
+
+    expect(status).toBe(200);
+    expect(body.agreementStatus).toBe("failed");
+    expect(body.attempts).toHaveLength(2);
+    expect(body.attempts[1]).toMatchObject({ attemptNumber: 2, isRecovery: true, status: "created" });
+    expect(body.recoveryAvailable).toBe(true);
+    expect(body.currentRazorpayOrderId).toBe(order.razorpayOrderId);
+  });
+
+  // M13.2 — item L: one or more reported (informational-only)
+  // payment.failed events must NOT change what GET .../payment reports —
+  // the attempt stays "created"/unresolved, the Agreement stays
+  // "pending_payment", and the resumable order id is still surfaced.
+  it("M13.2: reported payment.failed events leave the attempt unresolved and pending_payment — status still correctly resumable", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "BAD_OTP" });
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "CARD_DECLINED" });
+
+    const { status, body } = await callStatus(agreementId);
+
+    expect(status).toBe(200);
+    expect(body.agreementStatus).toBe("pending_payment"); // never invented into "failed"
+    expect(body.attempts).toHaveLength(1);
+    expect(body.attempts[0]).toMatchObject({ attemptNumber: 1, status: "created" });
+    expect(body.currentRazorpayOrderId).toBe(order.razorpayOrderId); // still resumable
   });
 });

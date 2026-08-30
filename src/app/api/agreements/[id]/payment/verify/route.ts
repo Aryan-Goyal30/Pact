@@ -12,6 +12,8 @@ interface VerifyRequestBody {
   razorpayPaymentId?: unknown;
   razorpaySignature?: unknown;
   reportedFailureCode?: unknown;
+  /** M13.1 — audit-only, see paymentService.ts's VerifyCheckoutInput. */
+  reportedPaymentId?: unknown;
 }
 
 // POST /api/agreements/:id/payment/verify — resolves the Agreement's
@@ -41,6 +43,7 @@ export async function POST(request: Request, context: RouteContext<"/api/agreeme
       razorpayPaymentId: typeof body.razorpayPaymentId === "string" ? body.razorpayPaymentId : undefined,
       razorpaySignature: typeof body.razorpaySignature === "string" ? body.razorpaySignature : undefined,
       reportedFailureCode: typeof body.reportedFailureCode === "string" ? body.reportedFailureCode : undefined,
+      reportedPaymentId: typeof body.reportedPaymentId === "string" ? body.reportedPaymentId : undefined,
     });
     return jsonResponse(result, 200);
   } catch (error) {

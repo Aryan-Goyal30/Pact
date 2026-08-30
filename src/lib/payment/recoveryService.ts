@@ -12,6 +12,7 @@
 
 import {
   createPaymentAttempt,
+  findUnresolvedAttempt,
   listPaymentAttempts,
   loadAgreementForPayment,
 } from "@/lib/payment/paymentRepository";
@@ -19,7 +20,7 @@ import { createRazorpayOrder, MAX_LOGICAL_PAYMENT_ATTEMPTS } from "@/lib/payment
 import { isMockProviderActive, rupeesToPaise } from "@/lib/payment/razorpayClient";
 import { AgreementNotFoundError, AgreementNotEligibleError } from "@/lib/payment/paymentService";
 import type { PaymentOrderResponseDTO } from "@/types/payment";
-import type { PaymentAttemptRow } from "@/lib/payment/paymentRepository";
+import type { AgreementForPayment, PaymentAttemptRow } from "@/lib/payment/paymentRepository";
 
 /** Thrown when recovery is requested but the Agreement has already used its one bounded recovery attempt (or somehow has more attempts on record than the bound allows). */
 export class RecoveryLimitExceededError extends Error {
@@ -55,6 +56,21 @@ export class RecoveryLimitExceededError extends Error {
  * exists. A new Razorpay order is only ever created in the one case
  * where attempt #1 never durably obtained one in the first place (its
  * own order-creation call itself failed) — genuinely nothing to reuse.
+ *
+ * M13.1 — RESUME, not just CREATE (the real-provider hardening this
+ * function needed): if a recovery attempt already exists and is still
+ * unresolved (`status: "created"` — e.g. the browser crashed or the
+ * Checkout modal never completed its round trip after an earlier
+ * `/recover` call), this call idempotently RESUMES that exact same
+ * attempt — same PaymentAttempt row, same razorpayOrderId, same
+ * attemptNumber — rather than trying to create a new one. This is what
+ * makes an interrupted recovery resumable instead of a dead end: by
+ * construction, the moment `Agreement.status === "failed"` is true,
+ * attempt #1 is guaranteed already terminal (resolvePaymentAttempt only
+ * ever sets that status once attempt #1 has resolved to "failed" — see
+ * paymentRepository.ts), so ANY unresolved row found at this point can
+ * only be an already-started recovery attempt — never attempt #1 itself,
+ * and never a reason to create a 3rd attempt.
  */
 export async function startRecovery(agreementId: string): Promise<PaymentOrderResponseDTO> {
   const agreement = await loadAgreementForPayment(agreementId);
@@ -66,6 +82,11 @@ export async function startRecovery(agreementId: string): Promise<PaymentOrderRe
       agreement.status,
       `Cannot start recovery: Agreement status is "${agreement.status}", not "failed".`,
     );
+  }
+
+  const alreadyOpenRecovery = await findUnresolvedAttempt(agreementId);
+  if (alreadyOpenRecovery) {
+    return toRecoveryOrderResponse(agreement, alreadyOpenRecovery);
   }
 
   const attempts = await listPaymentAttempts(agreementId);
@@ -86,21 +107,23 @@ export async function startRecovery(agreementId: string): Promise<PaymentOrderRe
     razorpayOrderId,
   });
 
+  return toRecoveryOrderResponse(agreement, attempt);
+}
+
+/** The safe browser-facing shape for a recovery attempt — shared by both the "create" and "resume" paths above, so they can never drift apart. */
+function toRecoveryOrderResponse(agreement: AgreementForPayment, attempt: PaymentAttemptRow): PaymentOrderResponseDTO {
   return {
-    razorpayOrderId,
+    razorpayOrderId: attempt.razorpayOrderId as string,
     amount: rupeesToPaise(agreement.totalAmount),
     currency: "INR",
     keyId: process.env.RAZORPAY_KEY_ID ?? "",
     attemptNumber: attempt.attemptNumber,
-    isRecovery: true,
+    isRecovery: attempt.isRecovery,
     maxAttempts: MAX_LOGICAL_PAYMENT_ATTEMPTS,
-    ...(isMockProviderActive() ? { mockForceOutcome: mockOutcomeFor(attempt) } : {}),
+    // Demo sequence (Milestone 13 §16): a recovery attempt always
+    // simulates success — deterministic, never randomized — whether this
+    // is the moment it was first created or a later resume of the same
+    // still-open attempt.
+    ...(isMockProviderActive() ? { mockForceOutcome: "success" as const } : {}),
   };
-}
-
-function mockOutcomeFor(attempt: PaymentAttemptRow): "success" | "failure" {
-  // Demo sequence (Milestone 13 §16): the recovery attempt always
-  // simulates success — deterministic, never randomized.
-  void attempt;
-  return "success";
 }

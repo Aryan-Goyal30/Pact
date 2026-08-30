@@ -17,9 +17,11 @@ import {
   listPaymentAttempts,
   loadAgreementForPayment,
   recordOrderCreationFailure,
+  recordReportedCheckoutFailure,
   recordVerificationStarted,
   resolvePaymentAttempt,
   type AgreementForPayment,
+  type AgreementPaymentStatus,
   type PaymentAttemptRow,
 } from "@/lib/payment/paymentRepository";
 import { getPaymentProvider, isMockProviderActive, rupeesToPaise } from "@/lib/payment/razorpayClient";
@@ -33,6 +35,44 @@ import type {
 } from "@/types/payment";
 
 export const MAX_LOGICAL_PAYMENT_ATTEMPTS = 2;
+
+/**
+ * M13.1: the ONE place that decides "can the user still move this
+ * Agreement forward right now" — reused by both getPaymentStatus and
+ * verifyCheckoutPayment so the two never disagree.
+ *
+ * Real-provider finding this fixes: `attempts.length >= MAX` alone is
+ * NOT the same question as "is recovery exhausted" — a recovery attempt
+ * that was created but never resolved (`status: "created"`, e.g. the
+ * browser crashed before calling /verify while Razorpay itself went on
+ * to capture a real payment) already counts toward `attempts.length`
+ * without ever having had a real chance to complete. Treating that as
+ * "exhausted" turns a resumable, still-open attempt into a permanent
+ * dead end — exactly what was observed against real Razorpay Test Mode.
+ *
+ * The correct question has two parts:
+ *  1. Is there an UNRESOLVED (status="created") attempt right now? If
+ *     so, the user can always resume it — this is true regardless of
+ *     how many attempts already exist, since resuming an already-created
+ *     attempt never creates a new one (see recoveryService.ts's own
+ *     resume branch) and so can never exceed MAX_LOGICAL_PAYMENT_ATTEMPTS.
+ *  2. Otherwise, can a genuinely NEW recovery attempt still be started?
+ *     Only if the Agreement is "failed" and the bound hasn't been used
+ *     up by TERMINAL (resolved) attempts.
+ *
+ * This never raises MAX_LOGICAL_PAYMENT_ATTEMPTS and never permits a
+ * 3rd logical attempt to be CREATED — it only correctly distinguishes
+ * "resume what's already open" from "start something new."
+ */
+export function computeRecoveryAvailability(
+  agreementStatus: AgreementPaymentStatus,
+  attempts: PaymentAttemptRow[],
+): boolean {
+  if (agreementStatus !== "failed") return false;
+  const hasResumableAttempt = attempts.some((a) => a.status === "created");
+  if (hasResumableAttempt) return true;
+  return attempts.length < MAX_LOGICAL_PAYMENT_ATTEMPTS;
+}
 
 export class AgreementNotFoundError extends Error {
   constructor(agreementId: string) {
@@ -181,6 +221,16 @@ export interface VerifyCheckoutInput {
   razorpaySignature?: string;
   /** Present only on a client-reported failure (Razorpay's own checkout `payment.failed` event code) — classified via classifyCheckoutFailure, never trusted beyond that classification. */
   reportedFailureCode?: string;
+  /**
+   * M13.1: Razorpay's real `payment.failed` event's own
+   * `error.metadata.payment_id`, when present — forwarded into the
+   * AuditLog payload purely for reconciliation/audit visibility (see
+   * this milestone's own real-provider findings). Never verified, never
+   * used to decide anything — a failure report still requires no proof,
+   * exactly as before; this only makes a real payment_id recoverable
+   * from the audit trail instead of permanently lost.
+   */
+  reportedPaymentId?: string;
 }
 
 /**
@@ -229,15 +279,75 @@ export async function verifyCheckoutPayment(
       : await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason: "verification_failed", source: "verify" });
   } else {
     const failureReason = classifyCheckoutFailure(input.reportedFailureCode);
-    result = await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason, source: "verify" });
+    result = await resolvePaymentAttempt({
+      attempt,
+      outcome: "failed",
+      failureReason,
+      // Audit-only (see VerifyCheckoutInput's own doc comment) — never
+      // read by anything that decides success/failure.
+      razorpayPaymentId: input.reportedPaymentId,
+      source: "verify",
+    });
   }
+
+  const attemptsAfter = await listPaymentAttempts(agreementId);
 
   return {
     attemptStatus: result.attemptStatus === "created" ? "failed" : result.attemptStatus,
     agreementStatus: result.agreementStatus,
     failureReason: result.attemptStatus === "failed" ? deriveFailureReasonForResponse(input) : undefined,
-    recoveryAvailable: result.agreementStatus === "failed" && attempt.attemptNumber < MAX_LOGICAL_PAYMENT_ATTEMPTS,
+    recoveryAvailable: computeRecoveryAvailability(result.agreementStatus, attemptsAfter),
   };
+}
+
+export interface ReportCheckoutFailureInput {
+  razorpayOrderId: string;
+  /** Razorpay Checkout's own `payment.failed` error.code, when present — recorded verbatim, never classified/interpreted (classification only matters for a REAL, resolved failure — see classifyCheckoutFailure's own callers). */
+  errorCode?: string;
+  errorDescription?: string;
+  /** Razorpay's own `error.metadata.payment_id`, when a payment object was actually created before this particular attempt failed. */
+  reportedPaymentId?: string;
+}
+
+/**
+ * M13.2 — records a browser-observed Razorpay Checkout `payment.failed`
+ * event for audit/diagnostics ONLY. Deliberately the opposite shape of
+ * verifyCheckoutPayment: this function NEVER calls resolvePaymentAttempt,
+ * never changes PaymentAttemptStatus or AgreementPaymentStatus, never
+ * consumes any part of the MAX_LOGICAL_PAYMENT_ATTEMPTS budget, and never
+ * throws for a mismatched/stale report — a mere decline report must never
+ * be capable of rejecting or altering anything (see
+ * paymentRepository.ts's recordReportedCheckoutFailure for the full
+ * real-Razorpay reasoning this encodes).
+ *
+ * The ONLY error this can still raise is AgreementNotFoundError, for a
+ * genuinely unknown Agreement id — the same existence check every other
+ * payment operation makes.
+ *
+ * Correlation with the current unresolved attempt is best-effort: when
+ * the reported razorpayOrderId matches the Agreement's currently-
+ * unresolved attempt, the AuditLog row is linked to it (paymentAttemptId)
+ * for easy reconciliation; otherwise it is still recorded, unlinked,
+ * rather than discarded or rejected — a late/mismatched report is still
+ * useful diagnostic history, never a reason to error out.
+ */
+export async function reportCheckoutFailure(agreementId: string, input: ReportCheckoutFailureInput): Promise<void> {
+  const agreement = await loadAgreementForPayment(agreementId);
+  if (!agreement) {
+    throw new AgreementNotFoundError(agreementId);
+  }
+
+  const attempt = await findUnresolvedAttempt(agreementId);
+  const matchesCurrentAttempt = attempt !== null && attempt.razorpayOrderId === input.razorpayOrderId;
+
+  await recordReportedCheckoutFailure({
+    agreementId,
+    paymentAttemptId: matchesCurrentAttempt ? attempt.id : undefined,
+    razorpayOrderId: input.razorpayOrderId,
+    errorCode: input.errorCode,
+    errorDescription: input.errorDescription,
+    reportedPaymentId: input.reportedPaymentId,
+  });
 }
 
 function deriveFailureReasonForResponse(input: VerifyCheckoutInput): PaymentFailureReason {
@@ -264,7 +374,7 @@ export async function getPaymentStatus(agreementId: string): Promise<PaymentStat
   return {
     agreementStatus: agreement.status,
     attempts: attemptDTOs,
-    recoveryAvailable: agreement.status === "failed" && attempts.length < MAX_LOGICAL_PAYMENT_ATTEMPTS,
+    recoveryAvailable: computeRecoveryAvailability(agreement.status, attempts),
     maxAttempts: MAX_LOGICAL_PAYMENT_ATTEMPTS,
     currentRazorpayOrderId: unresolved?.razorpayOrderId ?? null,
   };

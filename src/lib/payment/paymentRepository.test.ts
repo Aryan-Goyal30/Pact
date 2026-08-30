@@ -13,6 +13,7 @@ import { getLlmProvider } from "@/lib/llm/provider";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import {
   AUDIT_EVENT_PAYMENT_FAILED,
+  AUDIT_EVENT_PAYMENT_FAILURE_REPORTED,
   AUDIT_EVENT_PAYMENT_ORDER_CREATED,
   AUDIT_EVENT_PAYMENT_SUCCEEDED,
   AUDIT_EVENT_RECOVERY_FAILED,
@@ -24,6 +25,7 @@ import {
   findUnresolvedAttemptByOrderId,
   hasWebhookEventBeenProcessed,
   listPaymentAttempts,
+  recordReportedCheckoutFailure,
   recordWebhookReceived,
   resolvePaymentAttempt,
 } from "./paymentRepository";
@@ -305,6 +307,63 @@ describe("webhook event idempotency (via AuditLog — no new table)", () => {
     await recordWebhookReceived({ eventId: "evt_c", eventType: "payment.failed", agreementId, rawPayload: {} });
     const rows = await prisma.auditLog.findMany({ where: { agreementId, eventType: AUDIT_EVENT_WEBHOOK_RECEIVED } });
     expect(rows).toHaveLength(1);
+  });
+});
+
+// M13.2 — recordReportedCheckoutFailure is the ONLY function that writes
+// AUDIT_EVENT_PAYMENT_FAILURE_REPORTED, and it must never touch
+// PaymentAttempt/Agreement rows at all — see this function's own doc
+// comment for the real-Razorpay reasoning.
+describe("recordReportedCheckoutFailure — audit-only, never a state transition (M13.2)", () => {
+  it("writes a PAYMENT_FAILURE_REPORTED row without changing the PaymentAttempt or Agreement at all", async () => {
+    const { agreementId } = await createTestAgreement();
+    const { attempt } = await createPaymentAttempt({ agreementId, attemptNumber: 1, isRecovery: false, razorpayOrderId: "order_1" });
+
+    await recordReportedCheckoutFailure({
+      agreementId,
+      paymentAttemptId: attempt.id,
+      razorpayOrderId: "order_1",
+      errorCode: "BAD_OTP",
+      errorDescription: "OTP incorrect",
+      reportedPaymentId: "pay_declined",
+    });
+
+    const storedAttempt = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+    expect(storedAttempt.status).toBe("created"); // completely untouched
+    expect(storedAttempt.failureReason).toBeNull();
+
+    const logs = await prisma.auditLog.findMany({ where: { paymentAttemptId: attempt.id, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(1);
+    const payload = JSON.parse(logs[0].payload) as { razorpayOrderId: string; errorCode: string; reportedPaymentId: string };
+    expect(payload).toEqual({
+      razorpayOrderId: "order_1",
+      errorCode: "BAD_OTP",
+      errorDescription: "OTP incorrect",
+      reportedPaymentId: "pay_declined",
+    });
+  });
+
+  it("can be recorded WITHOUT a paymentAttemptId (a stale/mismatched report) — never required to link to a real attempt", async () => {
+    const { agreementId } = await createTestAgreement();
+
+    await recordReportedCheckoutFailure({ agreementId, razorpayOrderId: "order_never_created", errorCode: "GATEWAY_ERROR" });
+
+    const logs = await prisma.auditLog.findMany({ where: { agreementId, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(1);
+    expect(logs[0].paymentAttemptId).toBeNull();
+  });
+
+  it("repeated calls each write their own independent row — never deduplicated, never overwritten", async () => {
+    const { agreementId } = await createTestAgreement();
+    const { attempt } = await createPaymentAttempt({ agreementId, attemptNumber: 1, isRecovery: false, razorpayOrderId: "order_1" });
+
+    await recordReportedCheckoutFailure({ agreementId, paymentAttemptId: attempt.id, razorpayOrderId: "order_1", errorCode: "A" });
+    await recordReportedCheckoutFailure({ agreementId, paymentAttemptId: attempt.id, razorpayOrderId: "order_1", errorCode: "B" });
+
+    const logs = await prisma.auditLog.findMany({ where: { paymentAttemptId: attempt.id, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(2);
+    const stored = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+    expect(stored.status).toBe("created"); // still unresolved after both
   });
 });
 

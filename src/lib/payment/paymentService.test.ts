@@ -11,14 +11,19 @@ import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import {
   AgreementNotEligibleError,
   AgreementNotFoundError,
+  computeRecoveryAvailability,
   createOrderForAgreement,
   getPaymentStatus,
   MAX_LOGICAL_PAYMENT_ATTEMPTS,
+  reportCheckoutFailure,
   verifyCheckoutPayment,
   VerificationMismatchError,
 } from "./paymentService";
+import { AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } from "./paymentRepository";
+import { startRecovery } from "./recoveryService";
 import { MOCK_VALID_SIGNATURE } from "@/types/payment";
 import { rupeesToPaise } from "./razorpayClient";
+import type { PaymentAttemptRow } from "./paymentRepository";
 
 vi.mock("@/lib/llm/provider", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/llm/provider")>();
@@ -132,6 +137,39 @@ describe("createOrderForAgreement", () => {
 });
 
 describe("verifyCheckoutPayment", () => {
+  // M13.1 §7 — a reported failure's own payment_id (when Razorpay's real
+  // event carried one) reaches the AuditLog payload, purely for
+  // reconciliation visibility — never used to decide anything, and the
+  // failure resolution itself still requires no proof, exactly as before.
+  it("M13.1: forwards a reported failure's payment_id into the AuditLog payload, audit-only", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      reportedFailureCode: "GATEWAY_ERROR",
+      reportedPaymentId: "pay_real_but_declined",
+    });
+
+    const log = await prisma.auditLog.findFirstOrThrow({ where: { agreementId, eventType: "PAYMENT_FAILED" } });
+    const payload = JSON.parse(log.payload) as Record<string, unknown>;
+    expect(payload.razorpayPaymentId).toBe("pay_real_but_declined");
+    // Still classified via the closed taxonomy, still no proof required —
+    // this field changes nothing about the resolution itself.
+    expect(payload.outcome).toBe("failed");
+  });
+
+  it("omits razorpayPaymentId from the payload entirely when none was reported (unchanged, pre-existing behavior)", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+
+    const log = await prisma.auditLog.findFirstOrThrow({ where: { agreementId, eventType: "PAYMENT_FAILED" } });
+    const payload = JSON.parse(log.payload) as Record<string, unknown>;
+    expect(payload.razorpayPaymentId).toBeUndefined();
+  });
+
   it("marks the Agreement 'paid' on a genuinely valid signature", async () => {
     const { agreementId } = await createTestAgreement();
     const order = await createOrderForAgreement(agreementId);
@@ -248,5 +286,205 @@ describe("getPaymentStatus", () => {
     await createOrderForAgreement(agreementId);
     const serialized = JSON.stringify(await getPaymentStatus(agreementId));
     expect(serialized).not.toMatch(/secret|signature/i);
+  });
+
+  // M13.1 — the exact real-provider regression: Attempt #1 failed,
+  // Attempt #2 created (never resolved) must still report as resumable,
+  // not exhausted. This is the precise state a real Razorpay Test Mode
+  // session produced (order Paid, attempt #2 stuck "created") that the
+  // pre-M13.1 `attempts.length < MAX` check got wrong.
+  it("M13.1: Attempt #1 failed + Attempt #2 created (unresolved) → recoveryAvailable = true", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+    await startRecovery(agreementId); // creates attempt #2, deliberately left unresolved
+
+    const status = await getPaymentStatus(agreementId);
+
+    expect(status.agreementStatus).toBe("failed");
+    expect(status.attempts).toEqual([
+      { attemptNumber: 1, isRecovery: false, status: "failed", failureReason: "payment_declined" },
+      { attemptNumber: 2, isRecovery: true, status: "created" },
+    ]);
+    expect(status.recoveryAvailable).toBe(true); // the actual real-provider fix
+    expect(status.currentRazorpayOrderId).toBe(order.razorpayOrderId);
+  });
+});
+
+describe("computeRecoveryAvailability — the one shared semantic (M13.1)", () => {
+  function attempt(overrides: Partial<PaymentAttemptRow>): PaymentAttemptRow {
+    return {
+      id: "a",
+      agreementId: "ag",
+      attemptNumber: 1,
+      isRecovery: false,
+      razorpayOrderId: "order_x",
+      status: "failed",
+      failureReason: null,
+      createdAt: new Date(),
+      ...overrides,
+    };
+  }
+
+  it("is false whenever the Agreement isn't 'failed', regardless of attempts", () => {
+    expect(computeRecoveryAvailability("pending_payment", [])).toBe(false);
+    expect(computeRecoveryAvailability("paid", [attempt({ status: "success" })])).toBe(false);
+    expect(computeRecoveryAvailability("recovered", [attempt({ status: "success", isRecovery: true })])).toBe(false);
+    expect(computeRecoveryAvailability("closed", [])).toBe(false);
+  });
+
+  it("is true when a 'created' (unresolved) attempt exists, EVEN AT the attempt-count bound — the real-provider fix", () => {
+    const attempts = [
+      attempt({ attemptNumber: 1, isRecovery: false, status: "failed" }),
+      attempt({ attemptNumber: 2, isRecovery: true, status: "created" }), // exactly the real Razorpay scenario
+    ];
+    expect(attempts.length).toBe(MAX_LOGICAL_PAYMENT_ATTEMPTS); // confirms this is genuinely "at the bound"
+    expect(computeRecoveryAvailability("failed", attempts)).toBe(true);
+  });
+
+  it("is true when failed with room left under the bound and nothing unresolved (the ordinary case, unchanged)", () => {
+    expect(computeRecoveryAvailability("failed", [attempt({ status: "failed" })])).toBe(true);
+  });
+
+  it("is false when failed, nothing unresolved, and the bound is genuinely used up by TERMINAL attempts", () => {
+    const attempts = [
+      attempt({ attemptNumber: 1, isRecovery: false, status: "failed" }),
+      attempt({ attemptNumber: 2, isRecovery: true, status: "failed" }), // both terminal — genuinely exhausted
+    ];
+    expect(computeRecoveryAvailability("failed", attempts)).toBe(false);
+  });
+
+  it("never returns true in a way that would let a 3rd attempt be created — this function only reports resumability, it does not itself create anything", () => {
+    // Documents the contract: true here means "resume the existing
+    // unresolved row OR start a new one within the bound" — never
+    // "create a 3rd, regardless." recoveryService.ts's own resume
+    // branch (tested separately) is what actually enforces this.
+    const attempts = [
+      attempt({ attemptNumber: 1, isRecovery: false, status: "failed" }),
+      attempt({ attemptNumber: 2, isRecovery: true, status: "created" }),
+    ];
+    expect(computeRecoveryAvailability("failed", attempts)).toBe(true);
+    expect(attempts).toHaveLength(2); // still exactly 2 — this function never mutates anything
+  });
+});
+
+// M13.2 — the real-provider fix: a browser-observed Razorpay Checkout
+// `payment.failed` event must be recorded for audit purposes but must
+// NEVER terminalize the PaymentAttempt/Agreement, since Razorpay's own
+// Checkout retry (enabled by default) may still succeed against the same
+// order afterward. See paymentRepository.ts's recordReportedCheckoutFailure
+// and PaymentPanel.tsx's own header comments for the full reasoning.
+describe("reportCheckoutFailure — M13.2 informational-only failure reporting", () => {
+  it("does NOT change PaymentAttempt or Agreement status (A)", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "BAD_OTP" });
+
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(attempt.status).toBe("created"); // still unresolved
+    expect(attempt.failureReason).toBeNull();
+    expect(agreement.status).toBe("pending_payment"); // never moved to "failed"
+  });
+
+  it("records a PAYMENT_FAILURE_REPORTED AuditLog row linked to the still-unresolved attempt", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await reportCheckoutFailure(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      errorCode: "BAD_OTP",
+      errorDescription: "OTP incorrect",
+      reportedPaymentId: "pay_declined_1",
+    });
+
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
+    const logs = await prisma.auditLog.findMany({ where: { agreementId, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(1);
+    expect(logs[0].paymentAttemptId).toBe(attempt.id);
+    const payload = JSON.parse(logs[0].payload) as { errorCode?: string; reportedPaymentId?: string };
+    expect(payload.errorCode).toBe("BAD_OTP");
+    expect(payload.reportedPaymentId).toBe("pay_declined_1");
+  });
+
+  it("multiple payment.failed events for the SAME still-open attempt each produce their own audit row, never overwriting one another (B, E)", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "BAD_OTP" });
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "INSUFFICIENT_FUNDS" });
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "CARD_DECLINED" });
+
+    const logs = await prisma.auditLog.findMany({ where: { agreementId, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(3);
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
+    expect(attempt.status).toBe("created"); // still one single unresolved attempt throughout
+  });
+
+  it("a later genuine success still resolves the SAME attempt to paid, even after earlier payment.failed reports (C, D, K — the exact real-provider regression this milestone fixes)", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    // Two declines inside a still-open Checkout session (Razorpay's own
+    // native retry) — must not foreclose the later success below.
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "BAD_OTP" });
+    await reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "CARD_DECLINED" });
+
+    const result = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_eventual_success",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+
+    expect(result.agreementStatus).toBe("paid");
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid");
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
+    expect(attempt.status).toBe("success");
+
+    // Exactly ONE PaymentAttempt and ONE Razorpay order throughout — the
+    // native retries never created a second logical attempt.
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(1);
+
+    // Earlier failure reports are still preserved in the audit trail
+    // alongside the eventual success (E).
+    const logs = (await prisma.auditLog.findMany({ where: { agreementId }, orderBy: { createdAt: "asc" } })).map((l) => l.eventType);
+    expect(logs.filter((e) => e === AUDIT_EVENT_PAYMENT_FAILURE_REPORTED)).toHaveLength(2);
+    expect(logs).toContain("PAYMENT_SUCCEEDED");
+  });
+
+  it("never throws for a mismatched/stale order id — still records, unlinked, rather than rejecting", async () => {
+    const { agreementId } = await createTestAgreement();
+    await createOrderForAgreement(agreementId);
+
+    await expect(
+      reportCheckoutFailure(agreementId, { razorpayOrderId: "order_totally_different_stale", errorCode: "BAD_OTP" }),
+    ).resolves.toBeUndefined();
+
+    const logs = await prisma.auditLog.findMany({ where: { agreementId, eventType: AUDIT_EVENT_PAYMENT_FAILURE_REPORTED } });
+    expect(logs).toHaveLength(1);
+    expect(logs[0].paymentAttemptId).toBeNull(); // correctly unlinked — no attempt actually matched
+  });
+
+  it("never throws when there is no unresolved attempt at all (e.g. already resolved) — still records", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "p",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    }); // already resolved to paid
+
+    await expect(
+      reportCheckoutFailure(agreementId, { razorpayOrderId: order.razorpayOrderId, errorCode: "STALE_EVENT" }),
+    ).resolves.toBeUndefined();
+
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid"); // completely unaffected
+  });
+
+  it("404s (AgreementNotFoundError) for a genuinely unknown Agreement id", async () => {
+    await expect(reportCheckoutFailure("not-a-real-id", { razorpayOrderId: "order_x" })).rejects.toBeInstanceOf(AgreementNotFoundError);
   });
 });

@@ -165,3 +165,87 @@ describe("startRecovery", () => {
     expect(recovery.razorpayOrderId).toMatch(/^order_mock_/);
   });
 });
+
+// M13.1 — the real-provider hardening: a recovery attempt that was
+// created but never resolved (the browser crashed/errored before
+// calling /verify, while Razorpay itself may have gone on to capture a
+// real payment) must be RESUMABLE — calling startRecovery again must
+// return the SAME attempt/order, never create a 3rd logical attempt.
+describe("startRecovery — resuming an already-open (unresolved) recovery attempt", () => {
+  it("a second startRecovery call, while attempt #2 is still 'created', returns the SAME attempt/order — never creates a 3rd", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+
+    const first = await startRecovery(agreementId); // creates attempt #2
+    const second = await startRecovery(agreementId); // must RESUME it, not create #3
+
+    expect(second.attemptNumber).toBe(2);
+    expect(second.razorpayOrderId).toBe(first.razorpayOrderId);
+    expect(second.isRecovery).toBe(true);
+
+    const rows = await prisma.paymentAttempt.findMany({ where: { agreementId } });
+    expect(rows).toHaveLength(2); // attempt #1 (failed) + attempt #2 (still created) — never 3
+  });
+
+  it("resuming does not write a duplicate RECOVERY_STARTED AuditLog row", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+    await startRecovery(agreementId);
+    await startRecovery(agreementId); // resume
+
+    const logs = await prisma.auditLog.findMany({ where: { agreementId, eventType: "RECOVERY_STARTED" } });
+    expect(logs).toHaveLength(1);
+  });
+
+  it("resuming works even though attempts.length already equals MAX_LOGICAL_PAYMENT_ATTEMPTS — the exact real-provider scenario, not blocked by the bound check", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+    await startRecovery(agreementId);
+
+    const attemptsBefore = await prisma.paymentAttempt.count({ where: { agreementId } });
+    expect(attemptsBefore).toBe(2); // already "at the bound" by count alone
+
+    // Must NOT throw RecoveryLimitExceededError — the unresolved attempt
+    // is resumable precisely because it was never actually resolved.
+    const resumed = await startRecovery(agreementId);
+    expect(resumed.attemptNumber).toBe(2);
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(2);
+  });
+
+  it("a resumed order response still carries the correct mock demo hint", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+    await startRecovery(agreementId);
+
+    const resumed = await startRecovery(agreementId);
+    expect(resumed.mockForceOutcome).toBe("success");
+  });
+
+  it("resuming, then genuinely resolving the attempt, still reaches 'recovered' correctly (the fix doesn't change the eventual real outcome)", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+    await startRecovery(agreementId);
+    const resumed = await startRecovery(agreementId); // simulate a resumed session
+
+    const result = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: resumed.razorpayOrderId,
+      razorpayPaymentId: "pay_resumed",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+
+    expect(result.agreementStatus).toBe("recovered");
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(2); // still never a 3rd
+  });
+
+  it("multiple repeated resume calls (simulating several reloads of an interrupted page) never create additional rows", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+    await startRecovery(agreementId);
+
+    await startRecovery(agreementId);
+    await startRecovery(agreementId);
+    await startRecovery(agreementId);
+
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(2);
+  });
+});

@@ -92,4 +92,20 @@ describe("POST /api/agreements/:id/payment/recover", () => {
     const { status } = await callRecover(agreementId);
     expect(status).toBe(409);
   });
+
+  // M13.1 — the real-provider fix, proven through the actual HTTP route:
+  // a second /recover call while attempt #2 is still unresolved (never
+  // 409s, never creates a 3rd attempt) — resumes the same one instead.
+  it("M13.1: a repeated /recover call while attempt #2 is still unresolved resumes it (200, same order/attempt) rather than 409ing or creating attempt #3", async () => {
+    const agreementId = await createTestAgreement();
+    await failFirstAttempt(agreementId);
+
+    const first = await callRecover(agreementId);
+    const second = await callRecover(agreementId);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body.attemptNumber).toBe(2);
+    expect(second.body.razorpayOrderId).toBe(first.body.razorpayOrderId);
+  });
 });

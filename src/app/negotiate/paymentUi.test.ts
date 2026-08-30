@@ -3,8 +3,8 @@ import { MOCK_VALID_SIGNATURE, type PaymentOrderResponseDTO } from "@/types/paym
 import {
   attemptProgressLabel,
   buildCheckoutSuccessRequestBody,
+  buildFailureReportRequestBody,
   buildMockVerifyRequestBody,
-  buildReportedFailureRequestBody,
   paymentFailureLabel,
   paymentStatusLabel,
 } from "./paymentUi";
@@ -30,11 +30,32 @@ describe("buildCheckoutSuccessRequestBody", () => {
   });
 });
 
-describe("buildReportedFailureRequestBody", () => {
-  it("carries the order id and error code, with no signature at all", () => {
-    const body = buildReportedFailureRequestBody("order_1", "GATEWAY_ERROR");
-    expect(body).toEqual({ razorpayOrderId: "order_1", reportedFailureCode: "GATEWAY_ERROR" });
+// M13.2 — this now builds the /report-failure request body (informational
+// audit-only reporting), never /verify's — see paymentUi.ts's own header
+// comment on why a real Checkout `payment.failed` event no longer
+// terminalizes anything.
+describe("buildFailureReportRequestBody", () => {
+  it("carries the order id, error code, and description — with no signature-shaped fields at all", () => {
+    const body = buildFailureReportRequestBody("order_1", "GATEWAY_ERROR", "The card was declined.", undefined);
+    expect(body).toEqual({ razorpayOrderId: "order_1", errorCode: "GATEWAY_ERROR", errorDescription: "The card was declined." });
     expect(body).not.toHaveProperty("razorpaySignature");
+    expect(body).not.toHaveProperty("razorpayPaymentId");
+  });
+
+  // M13.1 §7 / M13.2 — forward Razorpay's real payment.failed metadata
+  // payment_id when present, purely for audit/reconciliation visibility.
+  it("forwards reportedPaymentId when Razorpay's event included one", () => {
+    const body = buildFailureReportRequestBody("order_1", "GATEWAY_ERROR", undefined, "pay_real_123");
+    expect(body).toEqual({
+      razorpayOrderId: "order_1",
+      errorCode: "GATEWAY_ERROR",
+      reportedPaymentId: "pay_real_123",
+    });
+  });
+
+  it("omits any field Razorpay's event didn't provide — still no proof required for any of them", () => {
+    const body = buildFailureReportRequestBody("order_1", undefined, undefined, undefined);
+    expect(body).toEqual({ razorpayOrderId: "order_1" });
   });
 });
 
