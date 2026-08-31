@@ -32,10 +32,10 @@ import {
 } from "@/lib/rules/buyerRules";
 import { resolveLeverageAskMultiplier } from "@/lib/rules/buyerQuantityTrade";
 import {
-  DELIVERY_TRADE_EXTENSION_FRACTION,
   DELIVERY_TRADE_PRICE_ASK_DISCOUNT,
   QUANTITY_TRADE_INCREASE_FRACTION,
   QUANTITY_TRADE_PRICE_ASK_DISCOUNT,
+  resolveDeliveryUrgencyFactor,
 } from "@/lib/rules/negotiationStrategy";
 
 export type BuyerPackageTradeMove = "NO_TRADE" | "QUANTITY_AND_DELIVERY_FOR_PRICE";
@@ -86,9 +86,18 @@ function clamp(value: number, min: number, max: number): number {
  *
  * SIZING reuses the exact same constants and formulas as the two solo
  * trades — QUANTITY_TRADE_INCREASE_FRACTION for the quantity give,
- * DELIVERY_TRADE_EXTENSION_FRACTION for the delivery give,
- * resolveLeverageAskMultiplier for how hard leverage lets the buyer
- * push. No new constant is invented for either give.
+ * resolveDeliveryUrgencyFactor (urgency-driven — see its own doc
+ * comment) for the delivery give, resolveLeverageAskMultiplier for how
+ * hard leverage lets the buyer push. No new constant is invented for
+ * either give.
+ *
+ * The delivery give's raw extension math is clamped to `maxDeliveryDays`
+ * exactly like buyerDeliveryTrade.ts's own solo trade — see that
+ * function's doc comment for why (a real, live-observed over-ceiling
+ * ask) and why this is safe, public information to use here. If the
+ * clamp leaves no real extension, the combined package correctly does
+ * not fire (see the check below) — the quantity dimension alone is
+ * never repackaged as a delivery give that isn't genuinely one.
  *
  * The PRICE ask is deliberately NOT
  * `normalAsk - quantityDiscount - deliveryDiscount` (which would treat
@@ -109,6 +118,8 @@ export function decideBuyerQuantityAndDeliveryTrade(
   buyerLeverageScore: number | undefined,
   quantityTradeAlreadyUsed: boolean,
   deliveryTradeAlreadyUsed: boolean,
+  /** Public information — see buyerDeliveryTrade.ts's decideBuyerDeliveryTrade for why this is safe to pass and why it's needed. */
+  maxDeliveryDays: number,
 ): BuyerQuantityAndDeliveryTradeDecision {
   const noTrade = (reason: string): BuyerQuantityAndDeliveryTradeDecision => ({
     move: "NO_TRADE",
@@ -148,10 +159,23 @@ export function decideBuyerQuantityAndDeliveryTrade(
     return noTrade("No buyer leverage signal is available to size the ask.");
   }
 
-  const tradeQuantity = Math.round(constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION));
-  const extraDays = Math.max(1, Math.round(constraints.deliveryDeadlineDays * DELIVERY_TRADE_EXTENSION_FRACTION));
-  const tradeDeliveryDays = constraints.deliveryDeadlineDays + extraDays;
+  // Same urgency-driven extension willingness as buyerDeliveryTrade.ts's
+  // own solo trade — the two must stay semantically aligned; see
+  // resolveDeliveryUrgencyFactor's own doc comment.
+  const extraDays = Math.max(
+    1,
+    Math.round(constraints.deliveryDeadlineDays * resolveDeliveryUrgencyFactor(constraints.urgency)),
+  );
+  const tradeDeliveryDays = Math.min(constraints.deliveryDeadlineDays + extraDays, maxDeliveryDays);
+  if (tradeDeliveryDays <= constraints.deliveryDeadlineDays) {
+    // Same reasoning as buyerDeliveryTrade.ts's own solo trade: no real
+    // delivery slack left to trade means this isn't a genuine combined
+    // give — never silently degrade to a quantity-only trade under this
+    // move's own name.
+    return noTrade("The merchant's maximum delivery window leaves no real slack beyond the buyer's own deadline to trade, so the combined package is not available.");
+  }
 
+  const tradeQuantity = Math.round(constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION));
   const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
   const askMultiplier = resolveLeverageAskMultiplier(buyerLeverageScore);
   const afterQuantityDiscount = normalAsk * (1 - QUANTITY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier);

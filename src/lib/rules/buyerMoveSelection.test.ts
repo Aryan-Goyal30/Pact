@@ -34,9 +34,16 @@ const openStrategy: BuyerCandidateStrategyContext = {
   deliveryTradeAlreadyUsed: false,
 };
 
+// The computed delivery give below is 10 + round(10*0.5) = 15. 20 is
+// deliberately well above that, so every existing test in this file
+// exercises the "computed <= maxDeliveryDays, behavior unchanged" case
+// (Milestone hardening req. 5) — the clamp itself is covered in
+// buyerDeliveryTrade.test.ts / buyerQuantityAndDeliveryTrade.test.ts.
+const maxDeliveryDays = 20;
+
 describe("generateBuyerCandidates — adapters map existing decisions correctly", () => {
   it("the ordinary decision (decideBuyerConcessionMove) always adapts into the first candidate, whatever move it picked", () => {
-    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy);
+    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     expect(candidates[0].move === "HOLD" || candidates[0].move === "CONCEDE").toBe(true);
     expect(candidates[0].unitPrice).toBeGreaterThan(0);
     expect(candidates[0].quantity).toBeUndefined();
@@ -46,7 +53,7 @@ describe("generateBuyerCandidates — adapters map existing decisions correctly"
   });
 
   it("a firing quantity trade (decideBuyerQuantityTrade) adapts its quantity/unitPrice/reason verbatim into a QUANTITY_FOR_PRICE candidate", () => {
-    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy);
+    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     const trade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
     expect(trade).toBeDefined();
     expect(trade!.quantity).toBe(100); // constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
@@ -55,7 +62,7 @@ describe("generateBuyerCandidates — adapters map existing decisions correctly"
   });
 
   it("a firing delivery trade (decideBuyerDeliveryTrade) adapts its deliveryDays/unitPrice/reason verbatim into a DELIVERY_FOR_PRICE candidate", () => {
-    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy);
+    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     const trade = candidates.find((c) => c.move === "DELIVERY_FOR_PRICE");
     expect(trade).toBeDefined();
     expect(trade!.deliveryDays).toBe(15); // 10 + round(10 * 0.5)
@@ -66,7 +73,7 @@ describe("generateBuyerCandidates — adapters map existing decisions correctly"
   it("a NO_TRADE verdict from either module never produces a candidate for that dimension", () => {
     // deliveryFlexible false -> decideBuyerDeliveryTrade always returns NO_TRADE.
     const inflexible: BuyerConstraints = { ...constraints, deliveryFlexible: false };
-    const candidates = generateBuyerCandidates(inflexible, 46800, 50, ctx(3), openStrategy);
+    const candidates = generateBuyerCandidates(inflexible, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     expect(candidates.some((c) => c.move === "DELIVERY_FOR_PRICE")).toBe(false);
   });
 });
@@ -78,7 +85,7 @@ describe("generateBuyerCandidates — all eligible candidates are generated at o
     // short-supplied) satisfies the combined package's own eligibility
     // too — a fourth, genuinely independent candidate, not a
     // replacement for either solo trade.
-    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy);
+    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     expect(candidates).toHaveLength(4);
     // Exactly one ordinary candidate (HOLD or CONCEDE — whichever
     // decideBuyerConcessionMove picked this round), plus all three trades.
@@ -145,20 +152,28 @@ describe("generateBuyerCandidates — leverage is never an eligibility gate", ()
   it.each([0, 20, 50, 75, 100])(
     "both trade candidates remain present at leverageScore=%d — only their price/ask size changes",
     (leverageScore) => {
-      const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), {
-        ...openStrategy,
-        leverageScore,
-      });
+      const candidates = generateBuyerCandidates(
+        constraints,
+        46800,
+        50,
+        ctx(3),
+        { ...openStrategy, leverageScore },
+        maxDeliveryDays,
+      );
       expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(true);
       expect(candidates.some((c) => c.move === "DELIVERY_FOR_PRICE")).toBe(true);
     },
   );
 
   it("the only leverage-driven exclusion is the documented TECHNICAL gate (leverage completely undefined) — not a strategic band", () => {
-    const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), {
-      ...openStrategy,
-      leverageScore: undefined,
-    });
+    const candidates = generateBuyerCandidates(
+      constraints,
+      46800,
+      50,
+      ctx(3),
+      { ...openStrategy, leverageScore: undefined },
+      maxDeliveryDays,
+    );
     // Neither trade module has a leverage signal to size its ask with —
     // this is buyerQuantityTrade.ts's/buyerDeliveryTrade.ts's own
     // pre-existing, unchanged technical precondition (see their doc

@@ -152,6 +152,16 @@ describe("getScenarioPresets", () => {
       maxDeliveryDays: 10,
       negotiable: true,
     },
+    {
+      sku: "KEYBOARD-WIRELESS",
+      name: "Wireless Keyboard and Mouse Combo",
+      description: "Standard wireless keyboard and mouse set.",
+      listedPrice: 1400,
+      availableQuantity: 500,
+      standardDeliveryDays: 3,
+      maxDeliveryDays: 7,
+      negotiable: true,
+    },
   ];
 
   it("returns a distinct, non-empty preset for each major scenario", () => {
@@ -168,25 +178,40 @@ describe("getScenarioPresets", () => {
     }
   });
 
-  it("the walk-away preset's budget is genuinely below what the balanced preset asks", () => {
+  it("the walk-away preset's budget is genuinely further below its own product's listed price than the balanced preset's ask is", () => {
+    // Catalog/preset recalibration: balanced and walk-away no longer
+    // necessarily share a product (balanced moved to MONITOR-24-FHD), so
+    // a raw cross-product maxUnitPrice comparison is no longer
+    // meaningful (a MONITOR price is never comparable to a LAPTOP price
+    // as bare rupee figures). Compare each preset's ask as a FRACTION of
+    // its own product's listed price instead — genuinely product-
+    // agnostic, and still proves the real intent: walk-away's ask sits
+    // proportionally much further below what it would take to succeed.
     const presets = getScenarioPresets(products);
     const walkAway = presets.find((p) => p.id === "walk-away");
     const balanced = presets.find((p) => p.id === "balanced");
     expect(walkAway).toBeDefined();
     expect(balanced).toBeDefined();
-    expect(Number(walkAway!.values.maxUnitPrice)).toBeLessThan(Number(balanced!.values.maxUnitPrice));
+
+    const walkAwayProduct = products.find((p) => p.sku === walkAway!.sku)!;
+    const balancedProduct = products.find((p) => p.sku === balanced!.sku)!;
+    const walkAwayRatio = Number(walkAway!.values.maxUnitPrice) / walkAwayProduct.listedPrice;
+    const balancedRatio = Number(balanced!.values.maxUnitPrice) / balancedProduct.listedPrice;
+    expect(walkAwayRatio).toBeLessThan(balancedRatio);
   });
 
   it("the flexible-delivery preset actually sets deliveryFlexible and real deadline slack", () => {
     const preset = getScenarioPresets(products).find((p) => p.id === "flexible-delivery");
     expect(preset).toBeDefined();
     expect(preset!.values.deliveryFlexible).toBe(true);
-    // Milestone 12.5: the deadline must sit strictly below the product's
-    // real maxDeliveryDays (12, from the manifest fixture above) — the
-    // pre-Milestone-12.5 preset failed this exact check (deadline was
-    // already AT 12, leaving no genuine slack to ever trade).
-    const laptop = products.find((p) => p.sku === "LAPTOP-14-I5")!;
-    expect(Number(preset!.values.deliveryDeadlineDays)).toBeLessThan(laptop.maxDeliveryDays);
+    // The deadline must sit strictly below the preset's OWN product's
+    // real maxDeliveryDays — looked up dynamically via preset.sku (not
+    // hardcoded to one product) so this stays correct regardless of
+    // which catalog item the preset targets. Catalog/preset
+    // recalibration: flexible-delivery now targets MONITOR-24-FHD
+    // (maxDeliveryDays 10, from the manifest fixture above).
+    const product = products.find((p) => p.sku === preset!.sku)!;
+    expect(Number(preset!.values.deliveryDeadlineDays)).toBeLessThan(product.maxDeliveryDays);
   });
 
   it("never references a product SKU absent from the given catalog", () => {
@@ -198,6 +223,65 @@ describe("getScenarioPresets", () => {
 
   it("returns nothing when the catalog is empty", () => {
     expect(getScenarioPresets([])).toEqual([]);
+  });
+
+  // PACT — Add buyer bulk request demo preset. Focused tests per that
+  // task's own required list (1-5).
+  describe("buyer-bulk-request (new preset, buyer-side QUANTITY_FOR_PRICE)", () => {
+    it("1. exists among the returned presets", () => {
+      const preset = getScenarioPresets(products).find((p) => p.id === "buyer-bulk-request");
+      expect(preset).toBeDefined();
+    });
+
+    it("2. has exactly the intended values", () => {
+      const preset = getScenarioPresets(products).find((p) => p.id === "buyer-bulk-request");
+      expect(preset).toMatchObject({
+        id: "buyer-bulk-request",
+        label: "Buyer bulk request",
+        description: "The buyer offers to buy more in exchange for a lower unit price.",
+        sku: "MONITOR-24-FHD",
+        values: {
+          sku: "MONITOR-24-FHD",
+          quantity: "20",
+          maxUnitPrice: "8700",
+          deliveryDeadlineDays: "7",
+          urgency: "high",
+          deliveryFlexible: false,
+        },
+      });
+    });
+
+    it("5. its id does not collide with any other preset's id", () => {
+      const ids = getScenarioPresets(products).map((p) => p.id);
+      expect(ids.filter((id) => id === "buyer-bulk-request")).toHaveLength(1);
+    });
+  });
+
+  it("3. the existing bulk-buyer preset is completely unchanged by adding buyer-bulk-request", () => {
+    const preset = getScenarioPresets(products).find((p) => p.id === "bulk-buyer");
+    expect(preset).toMatchObject({
+      id: "bulk-buyer",
+      label: "Bulk buyer",
+      sku: "KEYBOARD-WIRELESS",
+      values: {
+        sku: "KEYBOARD-WIRELESS",
+        quantity: "300",
+        maxUnitPrice: "1270",
+        deliveryDeadlineDays: "5",
+        urgency: "high",
+        deliveryFlexible: false,
+      },
+    });
+  });
+
+  it("4. every existing preset validation still holds with the new preset present (count, uniqueness, parseability)", () => {
+    const presets = getScenarioPresets(products);
+    expect(presets.length).toBeGreaterThanOrEqual(7); // 6 existing + the new one
+    const ids = presets.map((p) => p.id);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicate ids, including the new one
+    for (const preset of presets) {
+      expect(typeof parseBuyerRequestForm(preset.values)).not.toBe("string");
+    }
   });
 });
 

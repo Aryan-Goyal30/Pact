@@ -643,9 +643,9 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
       sku: "LAPTOP-14-I5",
       quantity: 30, // still adopts the merchant's supply-constrained quantity
       unitPrice: 44625,
-      deliveryDays: 12, // 8 + round(8 * 0.5)
+      deliveryDays: 10, // 8 + round(8 * 0.3) — resolveDeliveryUrgencyFactor("high"), negotiation calibration task
     });
-    expect(response.strategicReasons.some((r) => r.includes("accept delivery in 12 days"))).toBe(true);
+    expect(response.strategicReasons.some((r) => r.includes("accept delivery in 10 days"))).toBe(true);
   });
 
   it("does not trade delivery when the buyer never indicated flexibility", async () => {
@@ -708,16 +708,16 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     expect(response.action).toEqual({
       type: "counter_offer",
       sku: "LAPTOP-14-I5",
-      quantity: 80, // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
+      quantity: 80, // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION) — untouched by this task
       unitPrice: 43947,
-      deliveryDays: 12, // 8 + round(8 * DELIVERY_TRADE_EXTENSION_FRACTION)
+      deliveryDays: 10, // 8 + round(8 * 0.3) — resolveDeliveryUrgencyFactor("high")
     });
   });
 
   // LLM message contains all required conditional-trade numbers.
   it("passes through an LLM message that correctly states the delivery trade's terms", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
-      "For 30 units, I can accept delivery in 12 days if you can bring the price down to 44625 each.",
+      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44625 each.",
     );
 
     const response = await runBuyerAgent(
@@ -729,7 +729,7 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     );
 
     expect(response.message).toBe(
-      "For 30 units, I can accept delivery in 12 days if you can bring the price down to 44625 each.",
+      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44625 each.",
     );
   });
 
@@ -746,10 +746,10 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     );
 
     // The structured decision itself is completely unaffected...
-    expect(response.action.deliveryDays).toBe(12);
+    expect(response.action.deliveryDays).toBe(10);
     expect(response.action.unitPrice).toBe(44625);
     // ...but the fallback caption states the real numbers, not the vague LLM text.
-    expect(response.message).toContain("12");
+    expect(response.message).toContain("10");
     expect(response.message).toContain("44625");
     expect(response.message).not.toContain("help on price");
   });
@@ -765,10 +765,10 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
       { leverageScore: 26, deliveryTradeAlreadyUsed: false },
     );
 
-    expect(response.action.deliveryDays).toBe(12); // structured value unaffected
+    expect(response.action.deliveryDays).toBe(10); // structured value unaffected
     expect(response.message).not.toContain("999");
     expect(response.message).not.toContain("1 each");
-    expect(response.message).toContain("12");
+    expect(response.message).toContain("10");
     expect(response.message).toContain("44625");
   });
 });

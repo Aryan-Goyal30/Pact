@@ -1265,26 +1265,33 @@ describe("buyer-initiated delivery-for-price trade through the real orchestrator
     // Round 2: the buyer changes DELIVERY specifically to negotiate price
     // — quantity chip is unavailable here (merchant already short-supplying
     // the original request), so this cleanly isolates the delivery move.
-    expect(transcript[1].buyer.deliveryDays).toBe(12); // 8 + round(8 * 0.5)
+    // Negotiation calibration task: deliveryDeadlineDays=8 with
+    // urgency="high" now resolves via resolveDeliveryUrgencyFactor
+    // ("high"=0.3), not the flat 0.5 every urgency used before — 8 +
+    // round(8*0.3) = 10, not 12. Re-verified against the real
+    // orchestrator (not hand-derived) — the merchant's own package price
+    // shifts too, since its own delivery discount is sized off the
+    // SAME (now smaller) extra-days figure.
+    expect(transcript[1].buyer.deliveryDays).toBe(10); // 8 + round(8 * 0.3)
     expect(transcript[1].buyer.quantity).toBe(30); // unchanged — this round's move is delivery, not quantity
     expect(transcript[1].buyer.unitPrice).toBe(44625);
     // The merchant evaluated the whole package: the countered price
     // reflects a real stock-driven delivery discount on top of the
     // baseline, and honors the buyer's own extended date.
     expect(transcript[1].merchant.type).toBe("counter_offer");
-    expect(transcript[1].merchant.deliveryDays).toBe(12);
-    expect(transcript[1].merchant.unitPrice).toBe(45081);
+    expect(transcript[1].merchant.deliveryDays).toBe(10);
+    expect(transcript[1].merchant.unitPrice).toBe(45221);
 
     // Round 3: a genuine AGREED close — the trade did not force
     // agreement on its own.
     expect(transcript[2].buyer.type).toBe("accept");
-    expect(transcript[2].buyer.unitPrice).toBe(45081);
+    expect(transcript[2].buyer.unitPrice).toBe(45221);
     expect(finalState.status).toBe("AGREED");
 
     // The delivery chip is never used a second time.
     const buyerDeliveryDays = transcript.map((t) => t.buyer.deliveryDays);
-    expect(buyerDeliveryDays.filter((d) => d === 12)).toHaveLength(2); // round 2's trade, then round 3 mirrors it back
-    expect(buyerDeliveryDays.every((d) => d === 8 || d === 12)).toBe(true); // never a third, escalating value
+    expect(buyerDeliveryDays.filter((d) => d === 10)).toHaveLength(2); // round 2's trade, then round 3 mirrors it back
+    expect(buyerDeliveryDays.every((d) => d === 8 || d === 10)).toBe(true); // never a third, escalating value
   });
 
   // Counterfactual proving the trade materially changed the merchant's
@@ -1510,6 +1517,9 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
         quantityTradeAlreadyUsed: false,
         deliveryTradeAlreadyUsed: false,
       },
+      // deliveryFlexible is unset on these constraints -> the delivery
+      // trade is structurally ineligible here regardless of this value.
+      Number.POSITIVE_INFINITY,
     );
 
     const ordinary = candidates.find((c) => c.move === "CONCEDE" || c.move === "HOLD");
@@ -1549,6 +1559,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
         quantityTradeAlreadyUsed: false,
         deliveryTradeAlreadyUsed: false,
       },
+      12, // the real LAPTOP-14-I5 maxDeliveryDays
     );
 
     expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(false); // confirms isolation, not a lucky absence
@@ -1560,7 +1571,9 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
 
     const selected = selectBestBuyerCandidate(candidates, constraints, 30, 8);
     expect(selected.move).toBe("DELIVERY_FOR_PRICE");
-    expect(selected.deliveryDays).toBe(12);
+    // Negotiation calibration task: 8 + round(8*0.3) = 10 (high urgency),
+    // computed 10 <= maxDeliveryDays (12), unclamped.
+    expect(selected.deliveryDays).toBe(10);
   });
 
   // C: plain price concession is the correct, sole real candidate this
@@ -1641,6 +1654,10 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
         quantityTradeAlreadyUsed: false,
         deliveryTradeAlreadyUsed: false,
       },
+      // Only unitPrice is asserted below (never deliveryDays) — Infinity
+      // keeps the delivery trade's raw computed value untouched, exactly
+      // matching this test's pre-existing, unrelated-to-this-fix behavior.
+      Number.POSITIVE_INFINITY,
     );
 
     const hold = candidates.find((c) => c.move === "HOLD");
@@ -1848,7 +1865,9 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     );
 
     expect(transcript[1].buyer.move).toBe("DELIVERY_FOR_PRICE");
-    expect(transcript[1].buyer.deliveryDays).toBe(12);
+    // Negotiation calibration task: 8 + round(8*0.3) = 10 (high urgency) —
+    // see the identical, fully re-verified fixture above.
+    expect(transcript[1].buyer.deliveryDays).toBe(10);
     // The merchant independently evaluated and selected the SAME
     // dimension this round too — both sides' selected moves reach the
     // transcript, not just the buyer's.
@@ -2021,19 +2040,21 @@ describe("buyer-initiated combined quantity+delivery-for-price package through t
     // the SAME round, as one conditional offer — never two independent
     // field changes.
     expect(transcript[1].buyer.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
-    expect(transcript[1].buyer.quantity).toBe(80); // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
-    expect(transcript[1].buyer.deliveryDays).toBe(12); // 8 + round(8 * DELIVERY_TRADE_EXTENSION_FRACTION)
+    expect(transcript[1].buyer.quantity).toBe(80); // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION) — untouched by this task
+    // Negotiation calibration task: 8 + round(8*0.3) = 10 (high urgency),
+    // not the flat 8 + round(8*0.5) = 12 every urgency used before.
+    expect(transcript[1].buyer.deliveryDays).toBe(10);
     expect(transcript[1].buyer.unitPrice).toBe(43130);
 
     // The merchant cannot actually supply 80 units (only 45 available) —
     // the EXISTING partial-fulfillment path (Milestone 6, completely
     // untouched) naturally caps the quantity half of the combined
     // package to its own real stock, while still honoring the extended
-    // 12-day delivery date the buyer offered. No special-casing was
+    // 10-day delivery date the buyer offered. No special-casing was
     // needed for this interaction — it falls directly out of reusing
     // the existing, unmodified engine.
     expect(transcript[1].merchant.quantity).toBe(45);
-    expect(transcript[1].merchant.deliveryDays).toBe(12);
+    expect(transcript[1].merchant.deliveryDays).toBe(10);
 
     // Round 3: a genuine AGREED close on the merchant's own real,
     // stock-capped terms — the buyer accepts once those terms actually
@@ -2151,6 +2172,9 @@ describe("buyer-initiated combined quantity+delivery-for-price package through t
         quantityTradeAlreadyUsed: true,
         deliveryTradeAlreadyUsed: true,
       },
+      // Both chips already used blocks every trade candidate before this
+      // value is even consulted — irrelevant to this test's assertions.
+      Number.POSITIVE_INFINITY,
     );
     expect(candidatesAfter.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(false);
     expect(candidatesAfter.some((c) => c.move === "DELIVERY_FOR_PRICE")).toBe(false);

@@ -249,8 +249,63 @@ export const MAX_DELIVERY_TRADE_DISCOUNT_FRACTION = 0.15;
 // buyerDeliveryTrade.ts, not resolveDeliveryTrade.
 // ---------------------------------------------------------------------------
 
-/** How much longer a delivery the buyer offers, as a fraction of its own stated deadline, when it uses its (single-use) delivery-for-price bargaining chip. */
+/**
+ * How much longer a delivery the buyer offers, as a fraction of its own
+ * stated deadline, when it uses its (single-use) delivery-for-price
+ * bargaining chip — at "medium" urgency. Kept as its own named constant
+ * (rather than folded into resolveDeliveryUrgencyFactor below) because it
+ * is still what every pre-existing caller/test in this codebase was
+ * calibrated against, and it remains the one true baseline value
+ * resolveDeliveryUrgencyFactor("medium") reproduces exactly.
+ */
 export const DELIVERY_TRADE_EXTENSION_FRACTION = 0.5;
+
+/**
+ * Urgency-driven delivery-extension willingness — how much of its own
+ * stated deadline the buyer is willing to add when it trades delivery
+ * for price, NOT how much it asks for in return (that stays
+ * DELIVERY_TRADE_PRICE_ASK_DISCOUNT's own, unrelated question). This
+ * REPLACES DELIVERY_TRADE_EXTENSION_FRACTION at the actual call site —
+ * the two are never both multiplied together, which would silently
+ * double-apply the fraction. Higher urgency means LESS willingness to
+ * extend delivery at all — a genuinely time-pressured buyer has less
+ * slack to trade away in the first place; low urgency (patient, can
+ * wait) is willing to offer more. "medium" — the default whenever a
+ * caller doesn't specify urgency, i.e. every pre-existing caller —
+ * returns exactly DELIVERY_TRADE_EXTENSION_FRACTION (0.5), so every
+ * existing scenario that predates this resolver is completely
+ * unaffected (the same "medium is a no-op" contract
+ * resolveUrgencyConcessionFactor / resolveQuantityShortfallTolerance
+ * already follow).
+ *
+ * maxDeliveryDays remains the absolute, final ceiling regardless of this
+ * factor — buyerDeliveryTrade.ts / buyerQuantityAndDeliveryTrade.ts still
+ * clamp the resulting ask to it exactly as before, and a deadline already
+ * AT maxDeliveryDays still always produces NO_TRADE for every urgency
+ * level (this factor can only ever shrink or grow the RAW ask before
+ * that clamp is applied — it can never bypass it).
+ *
+ * Values calibrated against a dedicated read-only probe (real
+ * LAPTOP-14-I5 / MONITOR-24-FHD deadlines, swept across comfortable,
+ * moderate, near-ceiling, and at-ceiling slack, real leverage, the real
+ * comparator) — not hand-picked to pass one fixture. See that probe's
+ * own report for the full evidence: every tested value left candidate
+ * eligibility, the winning candidate, and price completely unaffected —
+ * only the resulting deliveryDays term changed, and only in the
+ * comfortable/moderate-slack regime where the maxDeliveryDays clamp
+ * doesn't already dominate.
+ */
+export function resolveDeliveryUrgencyFactor(urgency: UrgencyLevel = "medium"): number {
+  switch (urgency) {
+    case "high":
+      return 0.3;
+    case "low":
+      return 0.7;
+    case "medium":
+    default:
+      return DELIVERY_TRADE_EXTENSION_FRACTION;
+  }
+}
 
 /** Extra fractional discount, on top of the buyer's ordinary round-aware concession ask, requested in exchange for that additional delivery slack. */
 export const DELIVERY_TRADE_PRICE_ASK_DISCOUNT = 0.02;

@@ -185,12 +185,18 @@ describe("Milestone 11: OLD (price-only) vs NEW (package comparator) buyer selec
   it.each([...namedScenarios, ...sweepScenarios])(
     "$label",
     ({ constraints, merchantOfferUnitPrice, merchantOfferedQuantity, concessionContext, strategyContext }) => {
+      // maxDeliveryDays = Infinity: this file exists solely to prove
+      // old-vs-new SELECTOR equivalence, unrelated to the delivery-trade
+      // ceiling fix — Infinity guarantees the clamp is a mathematical
+      // no-op (min(computed, Infinity) === computed always) for every
+      // fixture below, so none of them need re-deriving.
       const candidates = generateBuyerCandidates(
         constraints,
         merchantOfferUnitPrice,
         merchantOfferedQuantity,
         concessionContext,
         strategyContext,
+        Number.POSITIVE_INFINITY,
       );
 
       const oldWinner = oldSelectBestBuyerCandidate(candidates);
@@ -217,6 +223,7 @@ describe("Milestone 11: OLD (price-only) vs NEW (package comparator) buyer selec
       scenario.merchantOfferedQuantity,
       scenario.concessionContext,
       scenario.strategyContext,
+      Number.POSITIVE_INFINITY,
     );
     expect(oldSelectBestBuyerCandidate(candidates).move).toBe("HOLD");
     expect(

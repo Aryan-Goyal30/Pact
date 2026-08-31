@@ -90,21 +90,22 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     id: "balanced",
     label: "Balanced negotiation",
     description: "Neither side has a dominant advantage — a gradual, ordinary back-and-forth.",
-    sku: "LAPTOP-14-I5",
-    // Milestone 12.5: maxUnitPrice lowered from 46000 -> 45000 — the only
-    // change. At 46000, round 1's anchored-midpoint merchant counter
-    // (45850) already cleared the buyer's ceiling, so the buyer accepted
-    // on round 2 with nothing else to observe. At 45000, that same
-    // counter (45375) does not clear the ceiling, so the negotiation
-    // genuinely continues — verified against the real orchestrator and
-    // the real seeded catalog: R1 counter, R2 buyer HOLD (a real,
-    // comparison-won strategic move — never forced), merchant concedes,
-    // R3 accept. Nothing about the buyer's decision logic changed; this
-    // preset simply no longer opens right on top of an instant accept.
+    sku: "MONITOR-24-FHD",
+    // Catalog/preset recalibration: moved off LAPTOP-14-I5 (whose stock
+    // was lowered 100 -> 10, making almost any meaningful quantity there
+    // exceed the real ~₹5,00,000 Razorpay transaction ceiling) onto
+    // MONITOR-24-FHD, the new general-purpose "workhorse" product — its
+    // price band gives roughly 5x the safe-quantity headroom. Verified
+    // against the real orchestrator and the real seeded catalog: R1
+    // buyer opens 8550, merchant counters 9025 (CONCEDE); R2 buyer HOLDS
+    // at 8550 (a real, comparison-won strategic move — never forced),
+    // merchant concedes to 8847; R3 accepts at 8847. A genuinely
+    // multi-round negotiation, not an instant accept. Final Agreement:
+    // 20 x 8847 = ₹1,76,940 — comfortably under the transaction ceiling.
     values: {
-      sku: "LAPTOP-14-I5",
-      quantity: "50",
-      maxUnitPrice: "45000",
+      sku: "MONITOR-24-FHD",
+      quantity: "20",
+      maxUnitPrice: "9000",
       deliveryDeadlineDays: "7",
       urgency: "medium",
       deliveryFlexible: false,
@@ -114,29 +115,90 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     id: "bulk-buyer",
     label: "Bulk buyer",
     description: "The buyer offers a bigger order in exchange for a better price — genuine quantity-for-price bargaining.",
-    sku: "LAPTOP-14-I5",
-    // Milestone 12.5: replaces the old MONITOR-24-FHD/200-unit shape.
-    // That preset's own large quantity pushed buyer leverage past 60
-    // almost immediately (quantityLeverageComponent + fulfillability
-    // alone contribute ~0.28 toward the leverage total at 200 units) —
-    // once leverage crosses that threshold, HOLD becomes the buyer's
-    // ordinary move, and HOLD (which repeats an earlier, lower round's
-    // price) structurally outprices any same-round QUANTITY_FOR_PRICE
-    // candidate, so the trade never won regardless of whether it fired.
-    // These values instead reuse the shape of an already-verified
-    // orchestrator fixture where the quantity trade genuinely wins a
-    // real price comparison (not a HOLD-favoring leverage band) —
-    // re-verified here against the REAL seeded LAPTOP-14-I5 catalog
-    // (availableQty 100, not the fixture's own 150): R1 opens 50 units,
-    // R2 the buyer's own comparison selects QUANTITY_FOR_PRICE, trading
-    // up to exactly 100 units (== all available stock, confirmed never
-    // exceeded / never partially fulfilled), for a materially better
-    // price than a plain concession would have given; R3 accepts.
+    sku: "KEYBOARD-WIRELESS",
+    // Catalog/preset recalibration: moved onto KEYBOARD-WIRELESS, now
+    // negotiable (negotiationEnabled flipped true — a pure demo/business
+    // data decision, no new negotiation logic). Its low unit price
+    // (₹1,400 listed) is what makes a genuinely large quantity payable:
+    // 300 x 1234 = ₹3,70,200, comfortably under the transaction ceiling
+    // even though 300 == LARGE_ORDER_QUANTITY_THRESHOLD exactly.
+    //
+    // Verified live against the real orchestrator: requesting exactly
+    // 300 (rather than trading UP to it from a smaller opening request)
+    // is the configuration that actually exercises a genuine
+    // quantity-driven discount for this product — the MERCHANT's own
+    // evaluateMerchantTrade recognizes the bulk order (hasQuantityLeverage
+    // becomes true at >=300) and counters with move=QUANTITY_FOR_PRICE
+    // at a real discount off its baseline, accepted round 2. Several
+    // smaller starting quantities (80/150/250, at multiple price
+    // ceilings and urgency levels) were also tried, specifically to
+    // trigger the BUYER's own escalation trade (a smaller opening
+    // request doubling up toward 300) — none won: KEYBOARD's abundant
+    // stock (500) keeps the buyer's fulfillability-leverage component
+    // strongly favorable from round 1 regardless of quantity in that
+    // range, which pushes buyerLeverageScore above HOLD_LEVERAGE_THRESHOLD
+    // immediately; decideBuyerQuantityTrade's own price floor (clamped to
+    // resolveBuyerTarget, the SAME floor a plain HOLD already repeats)
+    // means the trade can at best TIE a HOLD that's already available
+    // every round, never beat it. This preset instead demonstrates the
+    // MERCHANT-side half of "large order -> lower price," which is an
+    // equally genuine, arguably cleaner exercise of the same
+    // LARGE_ORDER_QUANTITY_THRESHOLD mechanic — see this milestone's own
+    // final report, regression checks A/E, for the full trace.
     values: {
-      sku: "LAPTOP-14-I5",
-      quantity: "50",
-      maxUnitPrice: "45500",
-      deliveryDeadlineDays: "10",
+      sku: "KEYBOARD-WIRELESS",
+      quantity: "300",
+      maxUnitPrice: "1270",
+      deliveryDeadlineDays: "5",
+      urgency: "high",
+      deliveryFlexible: false,
+    },
+  },
+  {
+    id: "buyer-bulk-request",
+    label: "Buyer bulk request",
+    description: "The buyer offers to buy more in exchange for a lower unit price.",
+    sku: "MONITOR-24-FHD",
+    // Deliberately separate from "bulk-buyer" above, not a replacement
+    // for it — that preset demonstrates the MERCHANT's own
+    // evaluateMerchantTrade bulk discount / LARGE_ORDER_QUANTITY_THRESHOLD
+    // behavior; this one demonstrates the BUYER's own
+    // decideBuyerQuantityTrade escalation (buyerQuantityTrade.ts), which
+    // is a genuinely different mechanism that KEYBOARD-WIRELESS's own
+    // abundant stock (500) structurally could never exercise — see the
+    // "bulk-buyer" preset's own comment on why (buyer leverage there
+    // saturates past HOLD_LEVERAGE_THRESHOLD before the trade can ever
+    // beat a plain HOLD).
+    //
+    // This is the center of an empirically verified robust winning
+    // region (negotiation demo calibration probe) — quantity ∈
+    // {15,20,25} x ceiling ≈ ₹8,500–9,000 x urgency=high x
+    // deliveryFlexible=false all produced a genuine buyer-side
+    // QUANTITY_FOR_PRICE win against the real orchestrator, not one
+    // hand-picked fixture. HIGH urgency is not incidental here — it is
+    // what actually pulls round-1 buyer leverage down near 54 (LOW and
+    // MEDIUM both leave it well above the 60 HOLD threshold for this
+    // exact fixture, at which point HOLD wins instead and the trade
+    // never surfaces at all — verified live). deliveryFlexible=false
+    // keeps this a clean, single-dimension quantity trade, never
+    // DELIVERY_FOR_PRICE / the combined package.
+    //
+    // Verified live against the real orchestrator: R1 buyer opens 20 @
+    // 8265, merchant CONCEDEs to 20 @ 8883 (leverage(B)≈54); R2 the
+    // buyer's own comparison genuinely selects QUANTITY_FOR_PRICE —
+    // 20 -> 40 units @ 8517 (strictly cheaper than the 8698 a plain
+    // concession would have offered that round), and the merchant's own
+    // bulk evaluation independently agrees, countering 40 @ 8621; R3
+    // accepts. Final Agreement: 40 x 8621 = ₹3,44,840 — comfortably
+    // under the transaction ceiling. These are documentation of the
+    // calibration result only, not hardcoded anywhere in the app —
+    // the actual trajectory is always computed live by the real,
+    // unmodified orchestrator.
+    values: {
+      sku: "MONITOR-24-FHD",
+      quantity: "20",
+      maxUnitPrice: "8700",
+      deliveryDeadlineDays: "7",
       urgency: "high",
       deliveryFlexible: false,
     },
@@ -146,9 +208,26 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Low-stock merchant",
     description: "The order exceeds available stock — expect partial fulfillment and merchant leverage.",
     sku: "LAPTOP-14-I5",
+    // Catalog/preset recalibration: LAPTOP-14-I5 is now the dedicated
+    // scarce-inventory / partial-fulfillment product (availableQty
+    // lowered 100 -> 10 specifically for this purpose — see prisma/seed.ts).
+    // Requesting 12 against a 10-unit stock produces a genuine partial
+    // fulfillment (offered quantity = 10, the entire available stock),
+    // and crosses MERCHANT_STOCK_LOW (30) for the first time in this
+    // catalog, exercising the merchant's scarce-inventory posture —
+    // neither of which any preset could previously reach.
+    //
+    // Verified live: a 15-unit request (a 33% shortfall against the
+    // 10-unit stock) was tried first and genuinely walked away — the
+    // buyer's own quantity-shortfall tolerance (medium urgency: 20%,
+    // resolveQuantityShortfallTolerance) was exceeded and the offered
+    // price didn't compensate enough, a real, correct REJECT, not a
+    // bug. 12 units (a 17% shortfall, within tolerance) reaches a real
+    // AGREED in 2 rounds: offered quantity 10, price 46828, total
+    // ₹4,68,280 — safely under the transaction ceiling.
     values: {
       sku: "LAPTOP-14-I5",
-      quantity: "150",
+      quantity: "12",
       maxUnitPrice: "47000",
       deliveryDeadlineDays: "10",
       urgency: "medium",
@@ -160,9 +239,17 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Urgent delivery",
     description: "No slack on delivery — the merchant can hold a firmer price.",
     sku: "LAPTOP-14-I5",
+    // Catalog/preset recalibration: quantity lowered 20 -> 5 (well under
+    // LAPTOP-14-I5's new 10-unit stock) so this exercises urgency
+    // independently of stock/bulk effects — the previous qty=20 would
+    // now itself exceed the new stock and be a partial-fulfillment
+    // scenario, conflating the two concepts this preset is meant to keep
+    // separate. Deadline (5) is exactly standardDeliveryDays, i.e. zero
+    // slack. Worst case 5 x 47500 = ₹2,37,500 — comfortably under the
+    // transaction ceiling.
     values: {
       sku: "LAPTOP-14-I5",
-      quantity: "20",
+      quantity: "5",
       maxUnitPrice: "47500",
       deliveryDeadlineDays: "5",
       urgency: "high",
@@ -174,35 +261,52 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Flexible delivery",
     description: "The buyer trades a later delivery date for a better price.",
     sku: "LAPTOP-14-I5",
-    // Milestone 12.5: the old shape (deadline 12) already sat exactly at
-    // this item's real maxDeliveryDays (12) — zero genuine slack existed
-    // to trade before the preset even opened. The primary replacement
-    // proposed for this milestone (quantity 40, ceiling 45500, deadline
-    // 8) was tried first and found NOT to reproduce live: against the
-    // real catalog's stock of 100 (unlike the reference fixture, which
-    // used a deliberately-constrained stock of 30 specifically to
-    // suppress the competing quantity chip), 40 units never triggers
-    // partial fulfillment, so round 1's ordinary counter already cleared
-    // the buyer's ceiling and the negotiation accepted immediately —
-    // no round ever reached a point where any trade could fire. Two
-    // further adjustments were probed against the real orchestrator:
-    // tightening the ceiling alone (still qty 40) reopened a real
-    // negotiation, but buyer leverage still crossed 60 by round 2, so
-    // HOLD won instead of DELIVERY_FOR_PRICE, matching the exact
-    // mechanism already found in the bulk-buyer preset above. Raising
-    // quantity to 110 (creating a genuine, real partial-fulfillment
-    // shortfall against the real 100-unit stock — which also suppresses
-    // the competing quantity-for-price chip, mirroring the reference
-    // fixture's own isolation technique) alongside the tighter ceiling
-    // is what actually worked: re-verified against the real seeded
-    // catalog, R1 partial-fulfillment counter (100 of 110) does not
-    // clear the ceiling, R2 the buyer's own comparison genuinely selects
-    // DELIVERY_FOR_PRICE (never forced), R3 accepts.
+    // Catalog/preset recalibration: MONITOR-24-FHD was tried FIRST (per
+    // this milestone's own instruction to prefer it here), extensively —
+    // several quantities (20 up to 275, including deliberately
+    // over-requesting past its 250-unit stock, the same technique the
+    // ORIGINAL pre-recalibration version of this preset used on LAPTOP)
+    // and both urgency levels, all verified against the real
+    // orchestrator. None reproduced a genuine DELIVERY_FOR_PRICE: merely
+    // FLAGGING deliveryFlexible=true adds a flat +0.3 to buyer leverage
+    // (leverage.ts's deliveryFlexComponent, independent of whether the
+    // deliberate trade actually fires) on top of MONITOR's own abundant-
+    // stock fulfillability pull — together enough to push buyer leverage
+    // past HOLD_LEVERAGE_THRESHOLD (60) from round 1, at which point
+    // decideBuyerConcessionMove locks into HOLD every round, and
+    // buyerDeliveryTrade.ts's own price floor (clamped to the SAME
+    // resolveBuyerTarget a plain HOLD already repeats) can at best tie a
+    // HOLD that's already available, never beat it. The one technique
+    // that broke this (deliberately over-requesting past available
+    // stock, suppressing fulfillability toward neutral) requires a
+    // fulfilled quantity large enough to matter, which for MONITOR's
+    // price band means exceeding the ₹5,00,000 ceiling — the exact
+    // conflict this whole recalibration exists to avoid.
+    //
+    // Falling back to LAPTOP-14-I5 (now with its own small, deliberately
+    // constrained 10-unit stock) reproduces the SAME technique at a
+    // price-safe scale. Verified live: R1 ordinary exchange; R2 the
+    // buyer's own comparison selects QUANTITY_AND_DELIVERY_FOR_PRICE
+    // (the combined trade, never forced) and the merchant's own response
+    // explicitly uses DELIVERY_FOR_PRICE; R3 accepts at qty=10 (capped
+    // at all available stock) — total safely under the transaction
+    // ceiling. A genuine delivery-for-price exchange, on both sides, in
+    // a real run — see this milestone's own final report, regression
+    // check C.
+    //
+    // Negotiation calibration task: this preset's own "high" urgency now
+    // resolves DELIVERY_TRADE_EXTENSION_FRACTION via
+    // resolveDeliveryUrgencyFactor("high")=0.3, not the flat 0.5 every
+    // urgency used before — re-verified live: delivery=9 days (was 11),
+    // price=45167 (was 45027), total ₹4,51,670 (was ₹4,50,270). Still a
+    // genuine, real 3-round negotiation reaching the same
+    // QUANTITY_AND_DELIVERY_FOR_PRICE / DELIVERY_FOR_PRICE mechanic —
+    // only the exact numbers shifted, exactly as intended by that task.
     values: {
       sku: "LAPTOP-14-I5",
-      quantity: "110",
-      maxUnitPrice: "45000",
-      deliveryDeadlineDays: "8",
+      quantity: "6",
+      maxUnitPrice: "46000",
+      deliveryDeadlineDays: "7",
       urgency: "high",
       deliveryFlexible: true,
     },
@@ -212,6 +316,11 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     label: "Impossible budget",
     description: "The buyer's ceiling is below the merchant's floor — expect no agreement.",
     sku: "LAPTOP-14-I5",
+    // Unchanged (per this recalibration's own explicit instruction): a
+    // ceiling below the merchant's floor never reaches Agreement
+    // regardless of quantity or the catalog's stock level, so this
+    // preset was already, and remains, fully compatible with the
+    // transaction ceiling — no Agreement is ever created for it to apply to.
     values: {
       sku: "LAPTOP-14-I5",
       quantity: "10",

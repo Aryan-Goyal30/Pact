@@ -197,6 +197,16 @@ function buildOpeningRequest(
 function buildResponseToMerchantOffer(
   constraints: BuyerConstraints,
   merchantResult: NegotiationResult,
+  /**
+   * Public information only — the exact same maxDeliveryDays field
+   * GET /api/manifest already returns (PublicManifestProduct), threaded
+   * down to generateBuyerCandidates so the delivery/combined trades'
+   * own raw extension math can never propose an ask past what the
+   * merchant could ever actually grant. Never the full
+   * CatalogItemSnapshot or any private field — see this file's own
+   * header comment on that boundary, still intact.
+   */
+  maxDeliveryDays: number,
   concessionContext?: BuyerConcessionContext,
   strategyContext?: BuyerStrategyContext,
 ): {
@@ -346,6 +356,7 @@ function buildResponseToMerchantOffer(
     proposal.quantity,
     concessionContext,
     strategyContext,
+    maxDeliveryDays,
   );
   const selected = selectBestBuyerCandidate(candidates, constraints, proposal.quantity, proposal.deliveryDays);
 
@@ -420,7 +431,13 @@ export async function runBuyerAgent(
           tradeMove: null,
           sufficiency: null,
         }
-      : buildResponseToMerchantOffer(constraints, merchantResult, concessionContext, strategyContext);
+      : buildResponseToMerchantOffer(
+          constraints,
+          merchantResult,
+          manifestProduct.maxDeliveryDays,
+          concessionContext,
+          strategyContext,
+        );
 
   const roundsLeft = concessionContext
     ? Math.max(1, concessionContext.maxRounds - concessionContext.round + 1)

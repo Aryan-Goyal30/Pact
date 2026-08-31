@@ -64,6 +64,16 @@ export function generateBuyerCandidates(
   merchantOfferedQuantity: number,
   concessionContext: BuyerConcessionContext,
   strategyContext: BuyerCandidateStrategyContext | undefined,
+  /**
+   * Public information (the exact same field GET /api/manifest already
+   * returns — types/manifest.ts's PublicManifestProduct.maxDeliveryDays,
+   * never a private catalog field) — threaded through to
+   * decideBuyerDeliveryTrade / decideBuyerQuantityAndDeliveryTrade so
+   * their own raw delivery-extension math can never propose an ask past
+   * what the merchant could ever actually grant. See either function's
+   * own doc comment for the real-world case this fixes.
+   */
+  maxDeliveryDays: number,
 ): CandidateMove[] {
   const candidates: CandidateMove[] = [];
 
@@ -105,6 +115,7 @@ export function generateBuyerCandidates(
     concessionContext,
     strategyContext?.leverageScore,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,
+    maxDeliveryDays,
   );
   if (deliveryDecision.move === "DELIVERY_FOR_PRICE") {
     candidates.push({
@@ -131,6 +142,7 @@ export function generateBuyerCandidates(
     strategyContext?.leverageScore,
     strategyContext?.quantityTradeAlreadyUsed ?? false,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,
+    maxDeliveryDays,
   );
   if (packageDecision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
     candidates.push({
