@@ -161,7 +161,30 @@ export function generateMerchantCandidates(
   // to the floor; when the floor already IS the answer, countering there
   // (never simply refusing to move) is what "still counters rather than
   // caving outright" means throughout this codebase.
+  //
+  // Final-round correctness fix: also requires real rounds to remain
+  // (roundsLeft > 2) — symmetric to decideBuyerConcessionMove's own
+  // unconditional roundsLeft<=2 override (buyerMoveSelector.ts) and to
+  // computeMerchantConcessionPrice's own roundsLeft<=2 branch
+  // (negotiationEngine.ts), both of which force convergence toward the
+  // buyer's ceiling once only the final two rounds remain. HOLD had no
+  // equivalent override: it always repeats a price at least as high as
+  // any fresh concession, so once eligible it would keep winning the
+  // candidate comparison even after the ordinary CONCEDE candidate had
+  // already been correctly forced all the way down to the buyer's
+  // ceiling — silently defeating the guaranteed-convergence property
+  // every other strategic overlay in this codebase already respects. A
+  // read-only calibration audit found this produces real, reproducible
+  // false EXPIRED (walk-away) outcomes: HOLD freezes at a price above
+  // the buyer's reachable ceiling and is never released in time for
+  // CONCEDE's own final-round convergence to close an otherwise-genuine
+  // deal. roundsLeft is computed exactly like every other final-round
+  // check in this codebase — never a new formula, and this is the only
+  // new condition added; the stock-pressure signal, the floor-safety
+  // check, and every other gate above are unchanged.
+  const roundsLeft = Math.max(1, concessionContext.maxRounds - concessionContext.round + 1);
   if (
+    roundsLeft > 2 &&
     resolveMerchantStockPressure(item) === "low" &&
     concessionContext.previousOfferUnitPrice !== undefined &&
     baselineConcessionPrice > item.minPrice

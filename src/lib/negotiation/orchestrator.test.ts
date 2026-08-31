@@ -2026,6 +2026,61 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     expect(transcript[1].merchant.move).toBe("HOLD");
     expect(transcript[1].merchant.unitPrice).toBe(transcript[0].merchant.unitPrice); // genuinely repeated, not coincidence
   });
+
+  // Merchant-HOLD final-round correctness fix — end-to-end regression.
+  // Real, reproducible false-EXPIRED fixture from the calibration audit:
+  // LAPTOP-14-I5 (scarce stock -> the merchant's HOLD gate is open),
+  // maxUnitPrice comfortably above minPrice (a genuine deal exists), but
+  // tight enough that the merchant's round-1 counter (the midpoint
+  // formula) exceeds it, forcing a second round. Before this fix, HOLD
+  // froze at that unreachable round-1 price and never released it, even
+  // once the buyer's own final-round safety net forced it all the way up
+  // to its true ceiling — producing a false EXPIRED via the
+  // repeated-positions walk-away instead of the AGREED outcome a real
+  // ₹2,500 margin should have produced. Confirmed via runNegotiationToCompletion,
+  // not a mocked or hand-derived trajectory.
+  it("resolves a previously-false walk-away: a genuine deal (ceiling comfortably above the floor) now closes AGREED instead of deadlocking on a stale HOLD price", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 10, // scarce -> "low" stock pressure, HOLD's own gate is open
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 10,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 5,
+      maxUnitPrice: 46500, // comfortably above minPrice(44000) — a real deal exists
+      deliveryDeadlineDays: 5,
+      urgency: "high",
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      6, // matches NegotiationDemo.tsx's real maxRounds
+    );
+
+    expect(finalState.status).toBe("AGREED");
+    const last = transcript[transcript.length - 1];
+    expect(last.merchant.unitPrice).not.toBeNull();
+    expect(last.merchant.unitPrice as number).toBeLessThanOrEqual(buyerConstraints.maxUnitPrice);
+    expect(last.merchant.unitPrice as number).toBeGreaterThanOrEqual(item.minPrice);
+    // HOLD is still a real, visible mid-negotiation move here (round 2) —
+    // this fix suppresses it only in the final two rounds, never removes
+    // it as a genuine strategic option.
+    expect(transcript.some((t) => t.merchant.move === "HOLD")).toBe(true);
+  });
 });
 
 // PACT V2 Milestone 12: combined quantity+delivery-for-price bargaining

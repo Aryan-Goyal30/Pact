@@ -202,6 +202,79 @@ describe("merchant HOLD candidate — real, gated on stock scarcity (not leverag
   });
 });
 
+// Final-round correctness fix: HOLD must not be eligible once only the
+// final two rounds remain (roundsLeft <= 2) — symmetric to
+// decideBuyerConcessionMove's own unconditional override
+// (buyerMoveSelector.ts) and to computeMerchantConcessionPrice's own
+// roundsLeft<=2 branch (negotiationEngine.ts). Without this, HOLD's
+// stale, higher repeated price could keep winning the candidate
+// comparison right up to round exhaustion, defeating the
+// guaranteed-convergence property the round-bounded design relies on —
+// see the calibration audit that found real, reproducible false EXPIRED
+// (walk-away) outcomes caused by exactly this.
+describe("merchant HOLD — final-round eligibility fix (roundsLeft <= 2)", () => {
+  const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 }; // "low" stock pressure -> HOLD's own gate is otherwise open
+  // A generous buyer ask so the ordinary concession keeps real room above
+  // the floor at every round tested here — isolates the roundsLeft fix
+  // from the pre-existing floor-safety gate (tested separately above).
+  const generousAsk = req({ maxUnitPrice: 46000 });
+
+  it("A: existing HOLD behavior is unchanged with more than 2 rounds remaining (roundsLeft === 3, the boundary just above the cutoff)", () => {
+    const ctx: MerchantConcessionContext = { round: 4, maxRounds: 6, previousOfferUnitPrice: 46800 }; // roundsLeft = 6-4+1 = 3
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, ctx, null, null, null, 10);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(true);
+  });
+
+  it("B: HOLD becomes ineligible the moment roundsLeft drops to 2, and stays ineligible at roundsLeft === 1", () => {
+    const roundsLeftTwo: MerchantConcessionContext = { round: 5, maxRounds: 6, previousOfferUnitPrice: 46800 }; // roundsLeft = 6-5+1 = 2
+    const roundsLeftOne: MerchantConcessionContext = { round: 6, maxRounds: 6, previousOfferUnitPrice: 46800 }; // roundsLeft = 6-6+1 = 1
+    const atTwo = generateMerchantCandidates(scarce, generousAsk, roundsLeftTwo, null, null, null, 10);
+    const atOne = generateMerchantCandidates(scarce, generousAsk, roundsLeftOne, null, null, null, 10);
+    expect(atTwo.candidates.some((c) => c.move === "HOLD")).toBe(false);
+    expect(atOne.candidates.some((c) => c.move === "HOLD")).toBe(false);
+    // The exact same scarce-stock / real-headroom conditions that produce
+    // a real HOLD at roundsLeft === 3 (test A) — only roundsLeft differs.
+    const stillEligibleOneRoundEarlier: MerchantConcessionContext = { round: 4, maxRounds: 6, previousOfferUnitPrice: 46800 };
+    const control = generateMerchantCandidates(scarce, generousAsk, stillEligibleOneRoundEarlier, null, null, null, 10);
+    expect(control.candidates.some((c) => c.move === "HOLD")).toBe(true);
+  });
+
+  it("C: with HOLD suppressed in the final two rounds, the ordinary CONCEDE candidate wins and moves toward the buyer's reachable ceiling", () => {
+    const finalRound: MerchantConcessionContext = { round: 6, maxRounds: 6, previousOfferUnitPrice: 46800 };
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, finalRound, null, null, null, 10);
+    const selected = selectBestMerchantCandidate(candidates);
+    expect(selected.move).toBe("CONCEDE");
+    // computeMerchantConcessionPrice's own roundsLeft<=2 branch forces the
+    // final-round price to the buyer's own ask (46000), clamped to
+    // [minPrice, listedPrice] — real convergence, not the stale 46800
+    // HOLD would otherwise have repeated forever.
+    expect(selected.unitPrice).toBe(46000);
+    expect(selected.unitPrice).toBeLessThan(46800); // strictly better for the buyer than the suppressed stale HOLD price
+  });
+
+  it("D: the fix never produces a price below minPrice, and every existing candidate-selection invariant still holds at roundsLeft <= 2", () => {
+    const finalRound: MerchantConcessionContext = { round: 6, maxRounds: 6, previousOfferUnitPrice: 46800 };
+    // An extreme low ask, at the final round, under scarce stock — the
+    // pre-existing floor-safety gate and the new roundsLeft gate both
+    // apply here; the result must still never breach the floor.
+    const extremeAsk = req({ maxUnitPrice: 1 });
+    const { candidates } = generateMerchantCandidates(scarce, extremeAsk, finalRound, null, null, null, 10);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(false);
+    const selected = selectBestMerchantCandidate(candidates);
+    expect(selected.unitPrice).toBeGreaterThanOrEqual(item.minPrice);
+    expect(selected.unitPrice).toBeLessThanOrEqual(item.listedPrice);
+  });
+
+  it("E: a quantity trade candidate at roundsLeft <= 2 is completely unaffected by the HOLD fix (isolation proof)", () => {
+    const finalRound: MerchantConcessionContext = { round: 6, maxRounds: 6, previousOfferUnitPrice: 46800 };
+    const abundant: CatalogItemSnapshot = { ...item, availableQty: 5000 }; // abundant, not scarce -> HOLD's own gate stays closed regardless
+    const bulkRequest = req({ quantity: 300, maxUnitPrice: 45000 });
+    const { candidates } = generateMerchantCandidates(abundant, bulkRequest, finalRound, null, null, null, 300);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(false); // abundant stock, not this fix, is why
+    expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(true); // unrelated trade path, unchanged
+  });
+});
+
 // PACT V2 Milestone 12 CORRECTION: merchant package/trade pricing must
 // reflect the actual authorized (stock-capped) quantity, not the buyer's
 // raw ask, wherever they diverge (partial fulfillment). This describe
