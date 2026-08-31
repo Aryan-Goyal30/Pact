@@ -27,6 +27,10 @@ import type { CatalogItemSnapshot } from "@/lib/rules/catalogRules";
 export type UrgencyLevel = "low" | "medium" | "high";
 export type PressureLevel = "low" | "medium" | "high";
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
 // ---------------------------------------------------------------------------
 // Buyer-side factors
 // ---------------------------------------------------------------------------
@@ -69,21 +73,153 @@ export function hasQuantityLeverage(quantity: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Quantity-for-price bargaining — PACT V2 Milestone 5. Deliberately
-// independent of LARGE_ORDER_QUANTITY_THRESHOLD above: that constant
-// gates a flat bulk-order posture at an absolute quantity; these gate a
-// RELATIVE increase the buyer deliberately offers mid-negotiation, which
-// can (and typically will) stay well below that absolute threshold — see
-// buyerQuantityTrade.ts. Calibration parameters of the strategy, not the
-// mechanic itself — sanity-checked against several representative
-// scenarios (not just one fixture) before being set; not sacred.
+// Quantity-for-price bargaining — PACT V2 Milestone 5, redesigned by the
+// Buyer Quantity-for-Price Redesign (following a live calibration audit
+// that found the original flat QUANTITY_TRADE_INCREASE_FRACTION=1.0 /
+// QUANTITY_TRADE_PRICE_ASK_DISCOUNT=0.02 pair produced a universal 2x
+// doubling and a price ask anchored to the round's own rising CONCEDE
+// candidate rather than the buyer's own previous visible offer — the
+// mechanical cause of every live-observed "buyer offers more AND its own
+// price goes up" case. Both flat constants are gone; see
+// resolveQuantityTradeIncreaseFraction / resolveQuantityTradePriceImprovementFraction
+// below and their sole callers (buyerQuantityTrade.ts,
+// buyerQuantityAndDeliveryTrade.ts) for the replacement.
+//
+// Deliberately independent of LARGE_ORDER_QUANTITY_THRESHOLD above: that
+// constant gates a flat bulk-order posture at an absolute quantity; this
+// gates a RELATIVE increase the buyer deliberately offers mid-negotiation,
+// which can (and typically will) stay well below that absolute threshold.
+// Calibration parameters of the strategy, not the mechanic itself — not
+// sacred.
 // ---------------------------------------------------------------------------
 
-/** How much more quantity the buyer offers, as a fraction of its original ask, when it uses its (single-use) quantity-for-price bargaining chip. */
-export const QUANTITY_TRADE_INCREASE_FRACTION = 1.0;
+/** Reference "clearly low-ticket" per-unit price for the log-interpolated ticket-size scale below — never a per-SKU value, a calibration band. */
+export const QUANTITY_TRADE_PRICE_SCALE_LOW_REFERENCE = 1000;
+/** Reference "clearly high-ticket" per-unit price for the same scale. */
+export const QUANTITY_TRADE_PRICE_SCALE_HIGH_REFERENCE = 50000;
+/** Reference "small order" base quantity for the log-interpolated order-magnitude scale below. */
+export const QUANTITY_TRADE_QTY_SCALE_SMALL_REFERENCE = 5;
+/** Floor on the order-magnitude scale factor — a very large base order still gets a real (if small) relative increase, never zero. */
+export const QUANTITY_TRADE_QTY_SCALE_MIN_FACTOR = 0.2;
+/** Floor on the final increase fraction, after every scale factor and leverage have been applied — even the most conservative case (an expensive item, a very large base order, weak leverage) still offers a real, visible increase. */
+export const QUANTITY_TRADE_MIN_INCREASE_FRACTION = 0.15;
+/** Ceiling on the final increase fraction — reuses the old flat value as the UPPER bound (a cheap item, a small base order, strong leverage) rather than the universal one. */
+export const QUANTITY_TRADE_MAX_INCREASE_FRACTION = 1.0;
 
-/** Extra fractional discount, on top of the buyer's ordinary round-aware concession ask, requested in exchange for that additional quantity. */
-export const QUANTITY_TRADE_PRICE_ASK_DISCOUNT = 0.02;
+/**
+ * Ticket-size scale factor: 0 (very expensive per-unit price) to 1 (very
+ * cheap), log-interpolated between QUANTITY_TRADE_PRICE_SCALE_LOW_REFERENCE
+ * and QUANTITY_TRADE_PRICE_SCALE_HIGH_REFERENCE. Uses `maxUnitPrice` —
+ * already a field on every BuyerConstraints, never a new catalog field —
+ * as the ticket-size proxy: the negotiation core has no product
+ * category/type today, and this codebase's own discipline forbids adding
+ * one without proof of necessity (see the redesign's own design review).
+ * Log, not linear, so the scale moves gradually across orders of
+ * magnitude rather than reacting sharply to a small price difference.
+ */
+function quantityTradePriceScaleFactor(maxUnitPrice: number): number {
+  return clamp(
+    1 -
+      Math.log10(maxUnitPrice / QUANTITY_TRADE_PRICE_SCALE_LOW_REFERENCE) /
+        Math.log10(QUANTITY_TRADE_PRICE_SCALE_HIGH_REFERENCE / QUANTITY_TRADE_PRICE_SCALE_LOW_REFERENCE),
+    0,
+    1,
+  );
+}
+
+/**
+ * Order-magnitude scale factor: 1 (a small base order) down to
+ * QUANTITY_TRADE_QTY_SCALE_MIN_FACTOR (a very large one), log-interpolated
+ * between QUANTITY_TRADE_QTY_SCALE_SMALL_REFERENCE and
+ * LARGE_ORDER_QUANTITY_THRESHOLD — reusing that existing constant rather
+ * than inventing a second "what counts as large" threshold.
+ */
+function quantityTradeQuantityScaleFactor(baseQuantity: number): number {
+  return clamp(
+    1 -
+      Math.log10(baseQuantity / QUANTITY_TRADE_QTY_SCALE_SMALL_REFERENCE) /
+        Math.log10(LARGE_ORDER_QUANTITY_THRESHOLD / QUANTITY_TRADE_QTY_SCALE_SMALL_REFERENCE),
+    QUANTITY_TRADE_QTY_SCALE_MIN_FACTOR,
+    1,
+  );
+}
+
+/**
+ * How much more quantity the buyer offers, as a fraction of its own
+ * original ask, when it uses its (single-use) quantity-for-price
+ * bargaining chip — replaces the old flat QUANTITY_TRADE_INCREASE_FRACTION.
+ * Continuous, never a per-SKU rule: expensive-per-unit items and very
+ * large base orders scale toward QUANTITY_TRADE_MIN_INCREASE_FRACTION;
+ * cheap items and small base orders can scale up to
+ * QUANTITY_TRADE_MAX_INCREASE_FRACTION (the old universal value, now an
+ * upper bound rather than a constant).
+ *
+ * `leverageAskMultiplier` is the ALREADY-RESOLVED output of
+ * buyerQuantityTrade.resolveLeverageAskMultiplier — accepted here as a
+ * plain number, never imported, since that function lives in a file that
+ * itself imports from this one; computing it here would create a
+ * circular import. The caller resolves it once and passes it to both
+ * this function and resolveQuantityTradePriceImprovementFraction below.
+ */
+export function resolveQuantityTradeIncreaseFraction(
+  maxUnitPrice: number,
+  baseQuantity: number,
+  leverageAskMultiplier: number,
+): number {
+  const baseIncrease =
+    QUANTITY_TRADE_MIN_INCREASE_FRACTION +
+    quantityTradePriceScaleFactor(maxUnitPrice) *
+      (QUANTITY_TRADE_MAX_INCREASE_FRACTION - QUANTITY_TRADE_MIN_INCREASE_FRACTION);
+  return clamp(
+    baseIncrease * quantityTradeQuantityScaleFactor(baseQuantity) * leverageAskMultiplier,
+    QUANTITY_TRADE_MIN_INCREASE_FRACTION,
+    QUANTITY_TRADE_MAX_INCREASE_FRACTION,
+  );
+}
+
+/** Baseline price-improvement fraction the quantity trade asks for, before leverage/urgency modulation — replaces the old flat QUANTITY_TRADE_PRICE_ASK_DISCOUNT (0.02), which anchored the ask to the round's own rising CONCEDE candidate with no real bite. */
+export const QUANTITY_TRADE_PRICE_IMPROVEMENT_BASE = 0.15;
+/** Floor on the resolved price-improvement fraction. */
+export const QUANTITY_TRADE_MIN_PRICE_IMPROVEMENT_FRACTION = 0.05;
+/** Ceiling on the resolved price-improvement fraction. */
+export const QUANTITY_TRADE_MAX_PRICE_IMPROVEMENT_FRACTION = 0.3;
+/** The smallest price improvement (relative to the buyer's own previous visible offer) that counts as a genuine exchange, not rounding noise — below this, the trade is not meaningfully different from what the buyer already offered, and must not fire. */
+export const QUANTITY_TRADE_MIN_MEANINGFUL_PRICE_IMPROVEMENT_RATIO = 0.005;
+
+/**
+ * How aggressively the quantity trade's price ask improves on the
+ * buyer's ordinary round-aware concession, before the hard
+ * previousBuyerUnitPrice ceiling (enforced by the caller) is applied.
+ * Two independent, continuous signals compose here:
+ *
+ *  - leverage (via the already-resolved leverageAskMultiplier, 0.5x-1.5x
+ *    — the same curve buyerQuantityTrade.ts already used for its old,
+ *    smaller discount): a stronger buyer can credibly push for more.
+ *  - urgency: high urgency shrinks the improvement (an impatient buyer
+ *    extracts less), low urgency grows it (a patient buyer bargains
+ *    harder) — the direct inverse of resolveUrgencyConcessionFactor,
+ *    kept consistent with that resolver's own meaning rather than a new,
+ *    unrelated urgency effect. "medium" is the neutral 1.0 scale, same
+ *    "medium is a no-op relative to the baseline" contract every other
+ *    urgency resolver in this file already follows.
+ *
+ * This is deliberately the thing that changes; the hard ceiling
+ * (previousBuyerUnitPrice, when one exists) is enforced by the caller,
+ * never here — this function only ever proposes how much of the ROOM
+ * between the round's own concession ask and the buyer's target to give
+ * back, never a specific final price.
+ */
+export function resolveQuantityTradePriceImprovementFraction(
+  leverageAskMultiplier: number,
+  urgency: UrgencyLevel | undefined,
+): number {
+  const urgencyPriceScale = clamp(2 - resolveUrgencyConcessionFactor(urgency), 0.5, 1.5);
+  return clamp(
+    QUANTITY_TRADE_PRICE_IMPROVEMENT_BASE * leverageAskMultiplier * urgencyPriceScale,
+    QUANTITY_TRADE_MIN_PRICE_IMPROVEMENT_FRACTION,
+    QUANTITY_TRADE_MAX_PRICE_IMPROVEMENT_FRACTION,
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Quantity SUFFICIENCY — PACT V2 Milestone 6. Deliberately a SEPARATE

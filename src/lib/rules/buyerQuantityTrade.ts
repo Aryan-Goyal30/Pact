@@ -29,8 +29,9 @@ import {
   type BuyerConstraints,
 } from "@/lib/rules/buyerRules";
 import {
-  QUANTITY_TRADE_INCREASE_FRACTION,
-  QUANTITY_TRADE_PRICE_ASK_DISCOUNT,
+  QUANTITY_TRADE_MIN_MEANINGFUL_PRICE_IMPROVEMENT_RATIO,
+  resolveQuantityTradeIncreaseFraction,
+  resolveQuantityTradePriceImprovementFraction,
 } from "@/lib/rules/negotiationStrategy";
 
 export type BuyerTradeMove = "NO_TRADE" | "QUANTITY_FOR_PRICE";
@@ -117,6 +118,26 @@ export function resolveLeverageAskMultiplier(buyerLeverageScore: number): number
  * review) — a genuine full stall is a rare edge case, not the normal
  * shape of a stalled-but-still-negotiating round. priorMerchantUnitPrice
  * is still accepted for forward compatibility but currently unused.
+ *
+ * SIZING (Buyer Quantity-for-Price Redesign): once every situational
+ * gate above has passed, quantity and price are no longer a flat
+ * doubling / flat 2% discount. Quantity uses
+ * negotiationStrategy.resolveQuantityTradeIncreaseFraction — continuous
+ * in the item's per-unit price (constraints.maxUnitPrice, the only
+ * "ticket size" signal available without a new catalog field) and in the
+ * base quantity itself, so an expensive item or an already-large order
+ * gets a conservative relative increase, never a universal 2x. Price
+ * uses negotiationStrategy.resolveQuantityTradePriceImprovementFraction
+ * to improve on the round's own ordinary concession ask — but the result
+ * is then additionally clamped to `previousBuyerUnitPrice`, the buyer's
+ * OWN prior visible offer, whenever one exists: this is the hard
+ * invariant the redesign exists to guarantee — a genuine quantity-for-
+ * price trade must read as "give more, pay no more than I already said
+ * I would," never "give more AND pay more." If the resulting price
+ * (after that ceiling) is not a real, meaningful improvement over the
+ * buyer's own previous offer, or the resulting quantity rounds to no
+ * real increase at all, this correctly falls through to NO_TRADE rather
+ * than firing a degenerate trade — see both checks below.
  */
 export function decideBuyerQuantityTrade(
   constraints: BuyerConstraints,
@@ -124,6 +145,8 @@ export function decideBuyerQuantityTrade(
   merchantOfferedQuantity: number,
   concessionContext: BuyerConcessionContext,
   priorMerchantUnitPrice: number | null | undefined,
+  /** The buyer's own previous-round unit price, if any — the hard upper bound this trade's price must never exceed. See this function's own doc comment. */
+  previousBuyerUnitPrice: number | null | undefined,
   buyerLeverageScore: number | undefined,
   quantityTradeAlreadyUsed: boolean,
 ): BuyerQuantityTradeDecision {
@@ -162,14 +185,36 @@ export function decideBuyerQuantityTrade(
     return noTrade("No buyer leverage signal is available to size the ask.");
   }
 
-  const tradeQuantity = Math.round(constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION));
-  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
   const askMultiplier = resolveLeverageAskMultiplier(buyerLeverageScore);
-  const tradeUnitPrice = clamp(
-    Math.round(normalAsk * (1 - QUANTITY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier)),
-    target,
+
+  const increaseFraction = resolveQuantityTradeIncreaseFraction(
     constraints.maxUnitPrice,
+    constraints.quantity,
+    askMultiplier,
   );
+  const tradeQuantity = Math.round(constraints.quantity * (1 + increaseFraction));
+  if (tradeQuantity <= constraints.quantity) {
+    return noTrade(
+      "No meaningful quantity increase remains once bounded to a commercially conservative size for this order.",
+    );
+  }
+
+  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
+  const priceImprovementFraction = resolveQuantityTradePriceImprovementFraction(askMultiplier, constraints.urgency);
+  const upperBound =
+    previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
+      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
+      : constraints.maxUnitPrice;
+  const tradeUnitPrice = clamp(Math.round(normalAsk * (1 - priceImprovementFraction)), target, upperBound);
+
+  if (previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined) {
+    const improvementRatio = (previousBuyerUnitPrice - tradeUnitPrice) / previousBuyerUnitPrice;
+    if (improvementRatio < QUANTITY_TRADE_MIN_MEANINGFUL_PRICE_IMPROVEMENT_RATIO) {
+      return noTrade(
+        "The best price this trade could offer is not a meaningful improvement over the buyer's own last offer.",
+      );
+    }
+  }
 
   return {
     move: "QUANTITY_FOR_PRICE",

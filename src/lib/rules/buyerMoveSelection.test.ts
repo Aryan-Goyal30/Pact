@@ -56,9 +56,11 @@ describe("generateBuyerCandidates — adapters map existing decisions correctly"
     const candidates = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
     const trade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
     expect(trade).toBeDefined();
-    expect(trade!.quantity).toBe(100); // constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION)
+    // Buyer Quantity-for-Price Redesign — verified live: 57, not the old
+    // flat-doubled 100 (see resolveQuantityTradeIncreaseFraction).
+    expect(trade!.quantity).toBe(57);
     expect(trade!.deliveryDays).toBeUndefined();
-    expect(trade!.reason).toContain("increase the order to 100 units");
+    expect(trade!.reason).toContain("increase the order to 57 units");
   });
 
   it("a firing delivery trade (decideBuyerDeliveryTrade) adapts its deliveryDays/unitPrice/reason verbatim into a DELIVERY_FOR_PRICE candidate", () => {

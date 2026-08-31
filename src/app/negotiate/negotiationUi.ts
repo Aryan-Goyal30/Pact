@@ -183,17 +183,22 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     // keeps this a clean, single-dimension quantity trade, never
     // DELIVERY_FOR_PRICE / the combined package.
     //
-    // Verified live against the real orchestrator: R1 buyer opens 20 @
-    // 8265, merchant CONCEDEs to 20 @ 8883 (leverage(B)≈54); R2 the
-    // buyer's own comparison genuinely selects QUANTITY_FOR_PRICE —
-    // 20 -> 40 units @ 8517 (strictly cheaper than the 8698 a plain
-    // concession would have offered that round), and the merchant's own
-    // bulk evaluation independently agrees, countering 40 @ 8621; R3
-    // accepts. Final Agreement: 40 x 8621 = ₹3,44,840 — comfortably
-    // under the transaction ceiling. These are documentation of the
-    // calibration result only, not hardcoded anywhere in the app —
-    // the actual trajectory is always computed live by the real,
-    // unmodified orchestrator.
+    // Buyer Quantity-for-Price Redesign — re-verified live, SAME input
+    // values (no recalibration needed; the existing preset already
+    // demonstrates the redesigned invariant correctly): R1 buyer opens
+    // 20 @ 8265, merchant CONCEDEs to 20 @ 8883; R2 an ordinary
+    // concession, buyer 20 @ 8698 (the trade's own previous-price
+    // invariant correctly has nothing to improve on yet immediately
+    // after the opening round); R3 the buyer's own comparison genuinely
+    // selects QUANTITY_FOR_PRICE — 20 -> 27 units @ 8265, a REAL
+    // decrease from its own round-2 ask (8698), never an increase — and
+    // the merchant's own bulk evaluation independently agrees, countering
+    // 27 @ 8571; R3 accepts. Final Agreement: 27 x 8571 = ₹2,31,417 —
+    // comfortably under the transaction ceiling. This is exactly the
+    // "buy more, pay no more than I already offered" story the redesign
+    // exists to guarantee — documentation of the calibration result
+    // only, not hardcoded anywhere in the app; the actual trajectory is
+    // always computed live by the real, unmodified orchestrator.
     values: {
       sku: "MONITOR-24-FHD",
       quantity: "20",
@@ -285,23 +290,34 @@ const SCENARIO_PRESET_DEFINITIONS: ScenarioPreset[] = [
     //
     // Falling back to LAPTOP-14-I5 (now with its own small, deliberately
     // constrained 10-unit stock) reproduces the SAME technique at a
-    // price-safe scale. Verified live: R1 ordinary exchange; R2 the
-    // buyer's own comparison selects QUANTITY_AND_DELIVERY_FOR_PRICE
-    // (the combined trade, never forced) and the merchant's own response
-    // explicitly uses DELIVERY_FOR_PRICE; R3 accepts at qty=10 (capped
-    // at all available stock) — total safely under the transaction
-    // ceiling. A genuine delivery-for-price exchange, on both sides, in
-    // a real run — see this milestone's own final report, regression
-    // check C.
+    // price-safe scale.
     //
-    // Negotiation calibration task: this preset's own "high" urgency now
-    // resolves DELIVERY_TRADE_EXTENSION_FRACTION via
-    // resolveDeliveryUrgencyFactor("high")=0.3, not the flat 0.5 every
-    // urgency used before — re-verified live: delivery=9 days (was 11),
-    // price=45167 (was 45027), total ₹4,51,670 (was ₹4,50,270). Still a
-    // genuine, real 3-round negotiation reaching the same
-    // QUANTITY_AND_DELIVERY_FOR_PRICE / DELIVERY_FOR_PRICE mechanic —
-    // only the exact numbers shifted, exactly as intended by that task.
+    // Buyer Quantity-for-Price Redesign — re-verified live, SAME input
+    // values: R1 ordinary exchange, buyer 6 @ 43700, merchant CONCEDEs to
+    // 6 @ 46415; R2 the buyer's own comparison now selects the SOLO
+    // DELIVERY_FOR_PRICE trade (not the combined package) — quantity
+    // stays 6 (never increases), delivery extends 7 -> 9 days, price
+    // 43700 -> 44798; merchant's own response agrees, countering 6 @
+    // 45484 / 9 days; R2 accepts. Final Agreement: 6 x 45484 = ₹2,72,904
+    // — comfortably under the transaction ceiling.
+    //
+    // Root cause of the combined-package no longer winning here, verified
+    // directly: the redesigned quantity-driven price-improvement fraction
+    // alone already floor-clamps to the buyer's own target on this
+    // fixture, so stacking the delivery discount on top of it cannot go
+    // any lower — the two tie on price, and the existing, unmodified
+    // comparator's first-encountered-wins tie-break (DELIVERY_FOR_PRICE
+    // is generated before QUANTITY_AND_DELIVERY_FOR_PRICE) favors the
+    // solo trade. This preset was searched for alternate input values
+    // that restore the combined package winning outright — none were
+    // found within a reasonable search on this catalog (every fixture
+    // tried either closed instantly or walked away) — see the redesign's
+    // own final report for the recommendation to revisit
+    // QUANTITY_TRADE_MIN_PRICE_IMPROVEMENT_FRACTION if demonstrating the
+    // combined move specifically becomes a priority. The preset still
+    // demonstrates a genuine, real delivery-for-price exchange — a
+    // legitimate, still-coherent "trade time for price" story, just not
+    // the combined one.
     values: {
       sku: "LAPTOP-14-I5",
       quantity: "6",

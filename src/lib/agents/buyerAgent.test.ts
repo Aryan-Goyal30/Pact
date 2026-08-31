@@ -465,11 +465,11 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
     expect(response.action).toEqual({
       type: "counter_offer",
       sku: "LAPTOP-14-I5",
-      quantity: 100,
-      unitPrice: 43963,
+      quantity: 57,
+      unitPrice: 43225,
       deliveryDays: 10,
     });
-    expect(response.strategicReasons.some((r) => r.includes("increase the order to 100 units"))).toBe(true);
+    expect(response.strategicReasons.some((r) => r.includes("increase the order to 57 units"))).toBe(true);
   });
 
   // Milestone 6: a high-leverage buyer is NOT excluded from the trade by
@@ -480,10 +480,19 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
   // Milestone 9: eligibility alone is no longer the whole story — the
   // trade candidate is generated here exactly as before, but now has to
   // WIN a genuine comparison against the buyer's ordinary candidate too.
-  // With a real prior price on record (44700, from an earlier round) to
-  // hold at, the trade's more aggressive 43640 ask is still the better
-  // deal, so it correctly wins the comparison, not merely the gate.
-  it("still trades at strong leverage, asking for an even better price than at moderate leverage", async () => {
+  //
+  // Buyer Quantity-for-Price Redesign — re-verified live: on this exact
+  // fixture, the natural (uncapped) trade price already floor-clamps to
+  // the buyer's own target (43225) at BOTH moderate and strong leverage
+  // — the 44700 previous-price ceiling never actually needs to bind, so
+  // the two leverage levels produce an IDENTICAL price here (a real,
+  // disclosed consequence of the floor dominating on this fixture — see
+  // buyerQuantityTrade.test.ts's own direct resolver-level tests for
+  // leverage's genuine, continuous, non-degenerate effect on price,
+  // isolated from this kind of clamping). What strong leverage still
+  // reliably demonstrates on THIS fixture is that the trade continues to
+  // win the comparison and never breaches the previous-price ceiling.
+  it("still trades at strong leverage, respecting the previous-price ceiling (floor-clamped identically to moderate leverage on this fixture)", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
 
     const response = await runBuyerAgent(
@@ -495,9 +504,9 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
     );
 
     expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
-    expect(response.action.quantity).toBe(100);
-    expect(response.action.unitPrice).toBe(43640);
-    expect(response.action.unitPrice!).toBeLessThan(43963); // more aggressive than the moderate-leverage ask
+    expect(response.action.quantity).toBe(57);
+    expect(response.action.unitPrice).toBe(43225);
+    expect(response.action.unitPrice!).toBeLessThanOrEqual(44700); // never exceeds the buyer's own previous ask
   });
 
   // Milestone 9: the flip side of the same comparison, proven directly —
@@ -543,7 +552,7 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
   // 13. LLM message contains all required conditional-trade numbers.
   it("passes through an LLM message that correctly states the conditional trade's quantity, price, and delivery", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
-      "I'll take 100 units if you can bring the price down to 43963 each, delivered within 10 days.",
+      "I'll take 57 units if you can bring the price down to 43225 each, delivered within 10 days.",
     );
 
     const response = await runBuyerAgent(
@@ -555,7 +564,7 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
     );
 
     expect(response.message).toBe(
-      "I'll take 100 units if you can bring the price down to 43963 each, delivered within 10 days.",
+      "I'll take 57 units if you can bring the price down to 43225 each, delivered within 10 days.",
     );
   });
 
@@ -572,11 +581,11 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
     );
 
     // The structured decision itself is completely unaffected...
-    expect(response.action.quantity).toBe(100);
-    expect(response.action.unitPrice).toBe(43963);
+    expect(response.action.quantity).toBe(57);
+    expect(response.action.unitPrice).toBe(43225);
     // ...but the fallback caption states the real numbers, not the vague LLM text.
-    expect(response.message).toContain("100");
-    expect(response.message).toContain("43963");
+    expect(response.message).toContain("57");
+    expect(response.message).toContain("43225");
     expect(response.message).not.toContain("help on price");
   });
 
@@ -591,11 +600,11 @@ describe("runBuyerAgent — quantity-for-price bargaining strategy", () => {
       { leverageScore: 54, quantityTradeAlreadyUsed: false },
     );
 
-    expect(response.action.quantity).toBe(100); // structured value unaffected
+    expect(response.action.quantity).toBe(57); // structured value unaffected
     expect(response.message).not.toContain("99999");
     expect(response.message).not.toContain("1 each");
-    expect(response.message).toContain("100");
-    expect(response.message).toContain("43963");
+    expect(response.message).toContain("57");
+    expect(response.message).toContain("43225");
   });
 });
 
@@ -684,15 +693,29 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
   // delivery flexibility was stated), the buyer no longer fires just
   // one of the two solo trades in isolation — the combined
   // quantity+delivery package (buyerQuantityAndDeliveryTrade.ts) is now
-  // ALSO generated as a third candidate, and it structurally beats
-  // either solo trade on price (composing two sub-1 discount fractions
-  // sequentially always yields a lower price than applying either
-  // alone), so it wins via the existing, unmodified compareBuyerPackages
-  // — never a new priority rule. This was "never fires the delivery
-  // chip in the same round the quantity chip fires" pre-Milestone-12,
-  // when only two solo trades existed; now a combined move is the
-  // genuinely best available candidate in this exact scenario.
-  it("fires the combined quantity+delivery package when both chips are simultaneously eligible", async () => {
+  // ALSO generated as a third candidate, competing on price via the
+  // existing, unmodified compareBuyerPackages — never a new priority
+  // rule. This was "never fires the delivery chip in the same round the
+  // quantity chip fires" pre-Milestone-12, when only two solo trades
+  // existed.
+  //
+  // Buyer Quantity-for-Price Redesign — re-verified live: on this exact
+  // fixture (weak leverage, 26), the solo QUANTITY_FOR_PRICE candidate
+  // now wins instead of the combined package. Root cause, verified
+  // directly: the redesigned quantity trade's own price-improvement
+  // fraction alone already floor-clamps to the buyer's own target here,
+  // so the combined package's additional delivery discount cannot push
+  // the price any lower — the two tie on price, and
+  // Array.prototype.reduce's first-encountered-wins rule (unmodified)
+  // favors QUANTITY_FOR_PRICE, generated before
+  // QUANTITY_AND_DELIVERY_FOR_PRICE in generateBuyerCandidates. This is a
+  // real, disclosed consequence of the redesign — see
+  // buyerQuantityAndDeliveryTrade.test.ts for the combined package's own
+  // mechanism proven correct in isolation, and the redesign's final
+  // report for the recommendation to revisit
+  // QUANTITY_TRADE_MIN_PRICE_IMPROVEMENT_FRACTION if demonstrating the
+  // combined package winning end-to-end becomes a priority.
+  it("the solo quantity trade wins the price tie against the combined package on this (weak-leverage) fixture", async () => {
     mockedGenerateAgentMessage.mockResolvedValue("...");
     const fullySupplied: NegotiationResult = { ...merchantResult, offeredQuantity: 40 }; // quantity chip now eligible
 
@@ -704,13 +727,13 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
       { leverageScore: 26, quantityTradeAlreadyUsed: false, deliveryTradeAlreadyUsed: false },
     );
 
-    expect(response.tradeMove).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(response.tradeMove).toBe("QUANTITY_FOR_PRICE");
     expect(response.action).toEqual({
       type: "counter_offer",
       sku: "LAPTOP-14-I5",
-      quantity: 80, // 40 * (1 + QUANTITY_TRADE_INCREASE_FRACTION) — untouched by this task
-      unitPrice: 43947,
-      deliveryDays: 10, // 8 + round(8 * 0.3) — resolveDeliveryUrgencyFactor("high")
+      quantity: 46,
+      unitPrice: 43225,
+      deliveryDays: 8, // unchanged — the winning candidate never touched delivery
     });
   });
 

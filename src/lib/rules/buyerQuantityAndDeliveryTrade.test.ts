@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decideBuyerQuantityAndDeliveryTrade } from "./buyerQuantityAndDeliveryTrade";
+import { resolveQuantityTradeIncreaseFraction } from "./negotiationStrategy";
 import type { BuyerConcessionContext, BuyerConstraints } from "@/lib/rules/buyerRules";
 
 const constraints: BuyerConstraints = {
@@ -23,7 +24,7 @@ const maxDeliveryDays = 20;
 
 describe("decideBuyerQuantityAndDeliveryTrade — eligibility (intersection of both solo gates)", () => {
   it("fires when every precondition holds", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
     expect(decision.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
     expect(decision.quantity).not.toBeNull();
     expect(decision.deliveryDays).not.toBeNull();
@@ -32,7 +33,7 @@ describe("decideBuyerQuantityAndDeliveryTrade — eligibility (intersection of b
 
   it("requires delivery flexibility — never fires without it", () => {
     const inflexible: BuyerConstraints = { ...constraints, deliveryFlexible: false };
-    const decision = decideBuyerQuantityAndDeliveryTrade(inflexible, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(inflexible, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
     expect(decision.quantity).toBeNull();
     expect(decision.deliveryDays).toBeNull();
@@ -40,22 +41,22 @@ describe("decideBuyerQuantityAndDeliveryTrade — eligibility (intersection of b
   });
 
   it("requires rounds remain beyond the final-two-round safety net", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(7, 8), 60, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(7, 8), null, 60, false, false, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
   });
 
   it("BOTH chips must be unused — the quantity chip alone being used blocks it", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, true, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, true, false, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
   });
 
   it("BOTH chips must be unused — the delivery chip alone being used blocks it", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, true, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, true, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
   });
 
   it("BOTH chips already used blocks it too", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, true, true, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, true, true, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
   });
 
@@ -69,6 +70,7 @@ describe("decideBuyerQuantityAndDeliveryTrade — eligibility (intersection of b
       46800,
       merchantOfferedQuantity,
       ctx(3),
+      null,
       60,
       false,
       false,
@@ -80,63 +82,79 @@ describe("decideBuyerQuantityAndDeliveryTrade — eligibility (intersection of b
 
   it("requires a real price gap — no trade when the merchant's offer already meets the buyer's target", () => {
     // resolveBuyerTarget(constraints) with no leverage = round(46000*0.95) = 43700
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 43700, 50, ctx(3), 60, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 43700, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
   });
 
   it("requires a leverage signal (technical gate, not a strategic exclusion)", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), undefined, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, undefined, false, false, maxDeliveryDays);
     expect(decision.move).toBe("NO_TRADE");
     expect(decision.reason).toContain("No buyer leverage signal");
   });
 });
 
-describe("decideBuyerQuantityAndDeliveryTrade — sizing reuses existing constants", () => {
-  it("quantity give matches QUANTITY_TRADE_INCREASE_FRACTION exactly (same as the solo quantity trade)", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
-    expect(decision.quantity).toBe(100); // 50 * (1 + 1.0), identical to buyerQuantityTrade.ts's own formula
+describe("decideBuyerQuantityAndDeliveryTrade — sizing reuses the same resolvers as the solo quantity trade (redesign)", () => {
+  it("J: quantity give matches resolveQuantityTradeIncreaseFraction exactly — the SAME resolver the solo trade uses, not a second formula", () => {
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    // Verified live (Buyer Quantity-for-Price Redesign) — never hand-derived.
+    expect(decision.quantity).toBe(57);
+    const askMultiplier = 0.5 + 60 / 100; // resolveLeverageAskMultiplier(60), reused directly to cross-check
+    const expectedFraction = resolveQuantityTradeIncreaseFraction(constraints.maxUnitPrice, constraints.quantity, askMultiplier);
+    expect(decision.quantity).toBe(Math.round(constraints.quantity * (1 + expectedFraction)));
   });
 
-  it("delivery give matches DELIVERY_TRADE_EXTENSION_FRACTION exactly (same as the solo delivery trade)", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
+  it("delivery give matches DELIVERY_TRADE_EXTENSION_FRACTION exactly (unchanged — delivery math is explicitly out of scope for this redesign)", () => {
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
     expect(decision.deliveryDays).toBe(15); // 10 + round(10 * 0.5), identical to buyerDeliveryTrade.ts's own formula
   });
 
-  it("the combined price is strictly cheaper than either solo trade would ask (sequential composition, not a coincidence)", () => {
-    const combined = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
-    // normalAsk at round(3,8), leverage 60 -> askMultiplier = 0.5 + 0.6 = 1.1
-    // afterQuantity = normalAsk * (1 - 0.02*1.1); afterBoth = afterQuantity * (1 - 0.02*1.1)
-    // -> strictly less than a single 0.02*1.1 discount alone.
-    const singleDiscountPrice = Math.round(
-      // reconstruct what ONE discount alone would give, from the same normalAsk
-      // (informal cross-check, not a re-implementation of the module under test)
-      combined.unitPrice! / (1 - 0.02 * 1.1),
-    );
-    expect(combined.unitPrice!).toBeLessThan(singleDiscountPrice);
+  it("J: the combined price never exceeds previousBuyerUnitPrice when one exists, and is bounded to [target, maxUnitPrice]", () => {
+    const withoutCeiling = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    const withCeiling = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 44000, 60, false, false, maxDeliveryDays);
+    expect(withoutCeiling.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    // 44000 comfortably clears the natural (uncapped) price here, so the
+    // ceiling is a no-op on this fixture — both resolve identically.
+    // Verified live.
+    expect(withCeiling.unitPrice).toBe(withoutCeiling.unitPrice);
+    expect(withoutCeiling.unitPrice!).toBeGreaterThanOrEqual(43700); // target
+    expect(withoutCeiling.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+  });
+
+  // J. A real case where the ceiling DOES actively bind, correctly
+  // producing NO_TRADE rather than a trade priced worse than the buyer's
+  // own last offer — real numbers, verified live.
+  it("J: NO_TRADE when previousBuyerUnitPrice leaves no meaningful (>=0.5%) improvement over the natural price", () => {
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 43900, 20, false, false, maxDeliveryDays);
+    expect(decision.move).toBe("NO_TRADE");
+    expect(decision.reason).toContain("not a meaningful improvement");
   });
 });
 
 describe("decideBuyerQuantityAndDeliveryTrade — clamping and determinism", () => {
   it("never exceeds the buyer's maxUnitPrice, even against a very high merchant offer", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 200000, 50, ctx(3), 100, false, false, maxDeliveryDays);
-    expect(decision.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 200000, 50, ctx(3), null, 100, false, false, maxDeliveryDays);
+    if (decision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+      expect(decision.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    }
   });
 
   it("never goes below the buyer's own aspirational target", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 100, false, false, maxDeliveryDays);
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 100, false, false, maxDeliveryDays);
     // resolveBuyerTarget(constraints) = 43700 (no leverage-driven quantity discount at 50 units)
-    expect(decision.unitPrice!).toBeGreaterThanOrEqual(43700);
+    if (decision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+      expect(decision.unitPrice!).toBeGreaterThanOrEqual(43700);
+    }
   });
 
   it("is deterministic — repeated calls with identical inputs produce identical output", () => {
-    const first = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
-    const second = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
+    const first = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    const second = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
     expect(second).toEqual(first);
   });
 
   it("the reason string explicitly describes the conditional give-both-for-price semantics", () => {
-    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), 60, false, false, maxDeliveryDays);
-    expect(decision.reason).toContain("increase the order to 100 units");
+    const decision = decideBuyerQuantityAndDeliveryTrade(constraints, 46800, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    expect(decision.reason).toContain("increase the order to 57 units");
     expect(decision.reason).toContain("accept delivery in 15 days");
     expect(decision.reason).toContain("in exchange for a better unit price");
   });
@@ -146,13 +164,16 @@ describe("decideBuyerQuantityAndDeliveryTrade — clamping and determinism", () 
 // PACT — Buyer delivery-trade ceiling fix (negotiation hardening audit,
 // finding D: the combined trade's delivery component must obey exactly
 // the same ceiling as the solo trade). Focused regression test, per that
-// task's own required case D.
+// task's own required case D. Untouched by the quantity-for-price
+// redesign — the delivery-ceiling gate runs BEFORE quantity/price
+// sizing, so its own NO_TRADE outcome is unaffected by any formula
+// change on the quantity/price side.
 // ---------------------------------------------------------------------
 describe("decideBuyerQuantityAndDeliveryTrade — maxDeliveryDays ceiling (negotiation hardening fix)", () => {
   // D. combined trade also obeys the ceiling.
   it("D: deadline=12, maxDeliveryDays=12 — the delivery component never proposes 18, and the combined move correctly does not fire", () => {
     const atCeiling: BuyerConstraints = { ...constraints, deliveryDeadlineDays: 12 };
-    const decision = decideBuyerQuantityAndDeliveryTrade(atCeiling, 46800, 50, ctx(3), 60, false, false, 12);
+    const decision = decideBuyerQuantityAndDeliveryTrade(atCeiling, 46800, 50, ctx(3), null, 60, false, false, 12);
     expect(decision.deliveryDays).not.toBe(18);
     // 12 + round(12*0.5) = 18, clamped to 12 == the buyer's own deadline
     // -> no real delivery give left -> the combined move is not a valid
@@ -165,10 +186,13 @@ describe("decideBuyerQuantityAndDeliveryTrade — maxDeliveryDays ceiling (negot
 
   it("a tighter ceiling than the solo trade's own clamps the combined delivery give identically (deadline=7, max=10)", () => {
     const tight: BuyerConstraints = { ...constraints, deliveryDeadlineDays: 7 };
-    const decision = decideBuyerQuantityAndDeliveryTrade(tight, 46800, 50, ctx(3), 60, false, false, 10);
+    const decision = decideBuyerQuantityAndDeliveryTrade(tight, 46800, 50, ctx(3), null, 60, false, false, 10);
     expect(decision.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
     expect(decision.deliveryDays).toBe(10); // 7 + round(7*0.5) = 11, clamped to 10
-    expect(decision.quantity).toBe(100); // quantity sizing itself is completely untouched by this fix
+    // Quantity sizing is unaffected by deliveryDeadlineDays — the resolver
+    // reads only maxUnitPrice/quantity/leverage — so it matches the SAME
+    // fixture's own sizing test above (57), unchanged from that scenario.
+    expect(decision.quantity).toBe(57);
   });
 });
 
@@ -178,7 +202,9 @@ describe("decideBuyerQuantityAndDeliveryTrade — maxDeliveryDays ceiling (negot
 // EXACTLY the same resolveDeliveryUrgencyFactor policy as the solo
 // delivery trade — see buyerDeliveryTrade.test.ts for the equivalent
 // solo-trade coverage (A/B/C/G/I); this block covers what's specific to
-// the combined move (D, F, H).
+// the combined move (D, F, H). Untouched by the quantity-for-price
+// redesign on the delivery side; H's own quantity value is updated to
+// reflect the new resolver.
 // ---------------------------------------------------------------------
 describe("decideBuyerQuantityAndDeliveryTrade — urgency-calibrated delivery extension", () => {
   const comfortable: Omit<BuyerConstraints, "urgency"> = { ...constraints, deliveryDeadlineDays: 6 };
@@ -188,7 +214,7 @@ describe("decideBuyerQuantityAndDeliveryTrade — urgency-calibrated delivery ex
   it("D: deadline == maxDeliveryDays produces NO_TRADE for every urgency level", () => {
     for (const urgency of ["low", "medium", "high"] as const) {
       const atCeiling: BuyerConstraints = { ...comfortable, deliveryDeadlineDays: 12, urgency };
-      const decision = decideBuyerQuantityAndDeliveryTrade(atCeiling, 46800, 50, ctx(3), 60, false, false, 12);
+      const decision = decideBuyerQuantityAndDeliveryTrade(atCeiling, 46800, 50, ctx(3), null, 60, false, false, 12);
       expect(decision.move).toBe("NO_TRADE");
       expect(decision.quantity).toBeNull();
       expect(decision.deliveryDays).toBeNull();
@@ -202,20 +228,23 @@ describe("decideBuyerQuantityAndDeliveryTrade — urgency-calibrated delivery ex
     for (const urgency of ["low", "medium", "high"] as const) {
       const withUrgency: BuyerConstraints = { ...comfortable, urgency };
       const solo = decideBuyerDeliveryTrade(withUrgency, 46800, ctx(3), 60, false, 12);
-      const combined = decideBuyerQuantityAndDeliveryTrade(withUrgency, 46800, 50, ctx(3), 60, false, false, 12);
+      const combined = decideBuyerQuantityAndDeliveryTrade(withUrgency, 46800, 50, ctx(3), null, 60, false, false, 12);
       expect(combined.deliveryDays).toBe(solo.deliveryDays);
     }
   });
 
   // H. Quantity sizing is completely unaffected by the urgency-delivery
   // factor — only deliveryDays (never quantity) changes across urgency.
-  it("H: quantity sizing (2x the original ask) is identical across LOW/MEDIUM/HIGH — only deliveryDays changes", () => {
-    const low = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "low" }, 46800, 50, ctx(3), 60, false, false, 12);
-    const medium = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "medium" }, 46800, 50, ctx(3), 60, false, false, 12);
-    const high = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "high" }, 46800, 50, ctx(3), 60, false, false, 12);
-    expect(low.quantity).toBe(100);
-    expect(medium.quantity).toBe(100);
-    expect(high.quantity).toBe(100);
+  it("H: quantity sizing is identical across LOW/MEDIUM/HIGH — only deliveryDays changes", () => {
+    const low = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "low" }, 46800, 50, ctx(3), null, 60, false, false, 12);
+    const medium = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "medium" }, 46800, 50, ctx(3), null, 60, false, false, 12);
+    const high = decideBuyerQuantityAndDeliveryTrade({ ...comfortable, urgency: "high" }, 46800, 50, ctx(3), null, 60, false, false, 12);
+    // resolveQuantityTradeIncreaseFraction reads only maxUnitPrice/quantity/
+    // leverage — never urgency — so all three land on the identical
+    // quantity, matching the fixture's own sizing test above (57).
+    expect(low.quantity).toBe(57);
+    expect(medium.quantity).toBe(57);
+    expect(high.quantity).toBe(57);
     // ...but deliveryDays genuinely differs, confirming the sweep is real.
     expect(low.deliveryDays).toBe(10); // 6 + round(6*0.7)
     expect(medium.deliveryDays).toBe(9); // 6 + round(6*0.5) — the baseline

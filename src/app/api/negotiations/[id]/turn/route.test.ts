@@ -224,6 +224,13 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
 // limiting factor.
 describe("POST /api/negotiations/:id/turn — Milestone 10: move observability", () => {
   it("a quantity-for-price trade round's HTTP response carries move === QUANTITY_FOR_PRICE", async () => {
+    // Buyer Quantity-for-Price Redesign: the buyer's own previous-price
+    // invariant means the trade can no longer fire on its very first
+    // reactive round (round 2) — its own opening ask always sits exactly
+    // at target, leaving no meaningful room to improve on immediately.
+    // Re-verified live against this real seeded catalog (LAPTOP-14-I5,
+    // stock 10): the trade now genuinely fires on round 3, once the
+    // buyer has made one real concession in round 2.
     const sessionId = await createTestSession(
       { sku: LAPTOP_SKU, quantity: 5, maxUnitPrice: 45500, deliveryDeadlineDays: 10, urgency: "high" },
       10,
@@ -232,22 +239,25 @@ describe("POST /api/negotiations/:id/turn — Milestone 10: move observability",
     const first = await callTurn(sessionId); // round 1: ordinary opening exchange
     expect(first.body.buyer.move).toBeUndefined();
 
-    const second = await callTurn(sessionId); // round 2: the quantity-for-price trade fires
-    expect(second.body.buyer.move).toBe("QUANTITY_FOR_PRICE");
-    expect(second.body.buyer.quantity).toBe(10);
+    const second = await callTurn(sessionId); // round 2: an ordinary concession — no trade yet
+    expect(second.body.buyer.move).toBe("CONCEDE");
+
+    const third = await callTurn(sessionId); // round 3: the quantity-for-price trade fires
+    expect(third.body.buyer.move).toBe("QUANTITY_FOR_PRICE");
+    expect(third.body.buyer.quantity).toBe(6);
 
     // 11: every existing field is still present, still correctly typed,
     // and unaffected by the new optional field's presence — a snapshot
     // of the full non-move shape, asserted explicitly rather than
     // trusting TypeScript alone.
-    expect(second.body).toMatchObject({
+    expect(third.body).toMatchObject({
       sessionId,
-      turn: 2,
+      turn: 3,
       buyer: {
         sender: "buyer",
         type: "counter_offer",
         sku: LAPTOP_SKU,
-        quantity: 10,
+        quantity: 6,
         unitPrice: expect.any(Number),
         deliveryDays: expect.any(Number),
         message: expect.any(String),
@@ -262,11 +272,11 @@ describe("POST /api/negotiations/:id/turn — Milestone 10: move observability",
         message: expect.any(String),
       },
       status: "COUNTERED",
-      round: 2,
+      round: 3,
       maxRounds: 10,
       agreement: null,
     });
-    expect(second.body.leverage.buyer + second.body.leverage.merchant).toBe(100);
+    expect(third.body.leverage.buyer + third.body.leverage.merchant).toBe(100);
   });
 
   it("a plain accept round's HTTP response carries no move field at all (JSON omits it, not null)", async () => {

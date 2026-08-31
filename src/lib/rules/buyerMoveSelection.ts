@@ -97,6 +97,7 @@ export function generateBuyerCandidates(
     merchantOfferedQuantity,
     concessionContext,
     strategyContext?.priorMerchantUnitPrice,
+    strategyContext?.previousBuyerUnitPrice,
     strategyContext?.leverageScore,
     strategyContext?.quantityTradeAlreadyUsed ?? false,
   );
@@ -139,6 +140,7 @@ export function generateBuyerCandidates(
     merchantOfferUnitPrice,
     merchantOfferedQuantity,
     concessionContext,
+    strategyContext?.previousBuyerUnitPrice,
     strategyContext?.leverageScore,
     strategyContext?.quantityTradeAlreadyUsed ?? false,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,

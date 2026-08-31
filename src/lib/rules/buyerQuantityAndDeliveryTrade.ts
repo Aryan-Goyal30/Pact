@@ -33,9 +33,10 @@ import {
 import { resolveLeverageAskMultiplier } from "@/lib/rules/buyerQuantityTrade";
 import {
   DELIVERY_TRADE_PRICE_ASK_DISCOUNT,
-  QUANTITY_TRADE_INCREASE_FRACTION,
-  QUANTITY_TRADE_PRICE_ASK_DISCOUNT,
+  QUANTITY_TRADE_MIN_MEANINGFUL_PRICE_IMPROVEMENT_RATIO,
   resolveDeliveryUrgencyFactor,
+  resolveQuantityTradeIncreaseFraction,
+  resolveQuantityTradePriceImprovementFraction,
 } from "@/lib/rules/negotiationStrategy";
 
 export type BuyerPackageTradeMove = "NO_TRADE" | "QUANTITY_AND_DELIVERY_FOR_PRICE";
@@ -84,12 +85,14 @@ function clamp(value: number, min: number, max: number): number {
  *  - a leverage signal is available to size the ask (the same
  *    technical, not strategic, gate both solo trades already use).
  *
- * SIZING reuses the exact same constants and formulas as the two solo
- * trades — QUANTITY_TRADE_INCREASE_FRACTION for the quantity give,
- * resolveDeliveryUrgencyFactor (urgency-driven — see its own doc
- * comment) for the delivery give, resolveLeverageAskMultiplier for how
- * hard leverage lets the buyer push. No new constant is invented for
- * either give.
+ * SIZING (Buyer Quantity-for-Price Redesign): the quantity give reuses
+ * negotiationStrategy.resolveQuantityTradeIncreaseFraction — the EXACT
+ * SAME resolver buyerQuantityTrade.ts's own solo trade uses, never a
+ * second, independently-drifting quantity-sizing formula. The delivery
+ * give is completely UNCHANGED: resolveDeliveryUrgencyFactor,
+ * maxDeliveryDays clamping, and the extraDays math are exactly what the
+ * solo delivery trade already used. resolveLeverageAskMultiplier still
+ * decides how hard leverage lets the buyer push, on both dimensions.
  *
  * The delivery give's raw extension math is clamped to `maxDeliveryDays`
  * exactly like buyerDeliveryTrade.ts's own solo trade — see that
@@ -100,21 +103,28 @@ function clamp(value: number, min: number, max: number): number {
  * never repackaged as a delivery give that isn't genuinely one.
  *
  * The PRICE ask is deliberately NOT
- * `normalAsk - quantityDiscount - deliveryDiscount` (which would treat
- * the two discounts as independent amounts off the same anchor and
- * risk over-discounting) — it composes the two existing discount
- * fractions SEQUENTIALLY against the same buyer concession baseline
- * (apply the quantity discount, then apply the delivery discount to
- * what's left), the same "compose, don't sum, against one shared
- * baseline" principle the Milestone 12 design review required. Still
- * clamped to [target, maxUnitPrice], so it can never breach the buyer's
- * own hard ceiling no matter how the composition works out.
+ * `normalAsk - quantityImprovement - deliveryDiscount` (which would treat
+ * the two as independent amounts off the same anchor and risk
+ * over-discounting) — it composes them SEQUENTIALLY against the same
+ * buyer concession baseline (apply the quantity-driven price-improvement
+ * fraction — negotiationStrategy.resolveQuantityTradePriceImprovementFraction,
+ * the same one the solo quantity trade uses — then apply the delivery
+ * discount to what's left), the same "compose, don't sum, against one
+ * shared baseline" principle the Milestone 12 design review required.
+ * The composed result is then clamped to `previousBuyerUnitPrice`
+ * (the buyer's own prior visible offer), exactly like the solo quantity
+ * trade's own hard invariant — see decideBuyerQuantityTrade's doc
+ * comment for why. Still finally clamped to [target, maxUnitPrice], so
+ * it can never breach the buyer's own hard ceiling no matter how the
+ * composition works out.
  */
 export function decideBuyerQuantityAndDeliveryTrade(
   constraints: BuyerConstraints,
   merchantOfferUnitPrice: number,
   merchantOfferedQuantity: number,
   concessionContext: BuyerConcessionContext,
+  /** The buyer's own previous-round unit price, if any — the hard upper bound the composed trade price must never exceed. See decideBuyerQuantityTrade's doc comment for why. */
+  previousBuyerUnitPrice: number | null | undefined,
   buyerLeverageScore: number | undefined,
   quantityTradeAlreadyUsed: boolean,
   deliveryTradeAlreadyUsed: boolean,
@@ -175,12 +185,41 @@ export function decideBuyerQuantityAndDeliveryTrade(
     return noTrade("The merchant's maximum delivery window leaves no real slack beyond the buyer's own deadline to trade, so the combined package is not available.");
   }
 
-  const tradeQuantity = Math.round(constraints.quantity * (1 + QUANTITY_TRADE_INCREASE_FRACTION));
-  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
   const askMultiplier = resolveLeverageAskMultiplier(buyerLeverageScore);
-  const afterQuantityDiscount = normalAsk * (1 - QUANTITY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier);
+
+  const increaseFraction = resolveQuantityTradeIncreaseFraction(
+    constraints.maxUnitPrice,
+    constraints.quantity,
+    askMultiplier,
+  );
+  const tradeQuantity = Math.round(constraints.quantity * (1 + increaseFraction));
+  if (tradeQuantity <= constraints.quantity) {
+    return noTrade(
+      "No meaningful quantity increase remains once bounded to a commercially conservative size for this order.",
+    );
+  }
+
+  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
+  const quantityPriceImprovementFraction = resolveQuantityTradePriceImprovementFraction(
+    askMultiplier,
+    constraints.urgency,
+  );
+  const afterQuantityDiscount = normalAsk * (1 - quantityPriceImprovementFraction);
   const afterBothDiscounts = afterQuantityDiscount * (1 - DELIVERY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier);
-  const tradeUnitPrice = clamp(Math.round(afterBothDiscounts), target, constraints.maxUnitPrice);
+  const upperBound =
+    previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
+      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
+      : constraints.maxUnitPrice;
+  const tradeUnitPrice = clamp(Math.round(afterBothDiscounts), target, upperBound);
+
+  if (previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined) {
+    const improvementRatio = (previousBuyerUnitPrice - tradeUnitPrice) / previousBuyerUnitPrice;
+    if (improvementRatio < QUANTITY_TRADE_MIN_MEANINGFUL_PRICE_IMPROVEMENT_RATIO) {
+      return noTrade(
+        "The best price this combined package could offer is not a meaningful improvement over the buyer's own last offer.",
+      );
+    }
+  }
 
   return {
     move: "QUANTITY_AND_DELIVERY_FOR_PRICE",
