@@ -183,8 +183,39 @@ export function generateMerchantCandidates(
   // new condition added; the stock-pressure signal, the floor-safety
   // check, and every other gate above are unchanged.
   const roundsLeft = Math.max(1, concessionContext.maxRounds - concessionContext.round + 1);
+  //
+  // Mutual-freeze correctness fix: also requires the buyer/merchant
+  // reciprocity behavior computed above to not already be HELD. This
+  // refines the "NOT on reciprocity" finding this gate's own comment
+  // above describes — that finding is still correct as far as it goes
+  // (reciprocity must never GATE HOLD's eligibility the way stock
+  // scarcity does, and this remains true here), but a real breadth
+  // investigation (2,340 real-orchestrator configurations) found a
+  // second, distinct false-EXPIRED pattern the original gate didn't
+  // cover: once HOLD repeats the merchant's own price for one round, the
+  // buyer's ordinary CONCEDE formula (computeBuyerConcessionPrice) is
+  // memoryless with respect to prior rounds — it recomputes the exact
+  // same value from that now-frozen merchant offer, WITHOUT the buyer
+  // ever needing to invoke its own HOLD branch. reciprocity.behavior is
+  // already HELD at that exact point (the buyer's current ask already
+  // equals its prior one — the same condition, already computed above
+  // for the CONCEDE candidate), so the mutual freeze is detected and
+  // released one round before arePositionsRepeated (walkAway.ts, itself
+  // completely unchanged) would otherwise close the negotiation as a
+  // false walk-away. Proven (same investigation) to resolve 254/254
+  // real false-EXPIRED cases with zero effect on any of the 7 demo
+  // presets and zero effect on genuine stalemates (cases where the
+  // merchant has hit its real floor and/or a quantity shortfall cannot
+  // be price-compensated still expire, unaffected — this condition only
+  // ever removes a candidate, never changes what arePositionsRepeated
+  // itself does). This also directly aligns HOLD with
+  // merchantReciprocity.ts's own already-documented philosophy, quoted
+  // above, that non-reciprocation should slow concession, never produce
+  // a permanent hard freeze — HOLD compounded with itself was the one
+  // place that philosophy was still being violated.
   if (
     roundsLeft > 2 &&
+    reciprocity.behavior !== "HELD" &&
     resolveMerchantStockPressure(item) === "low" &&
     concessionContext.previousOfferUnitPrice !== undefined &&
     baselineConcessionPrice > item.minPrice

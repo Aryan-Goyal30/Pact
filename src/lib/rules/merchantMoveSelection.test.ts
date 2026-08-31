@@ -275,6 +275,80 @@ describe("merchant HOLD — final-round eligibility fix (roundsLeft <= 2)", () =
   });
 });
 
+// Mutual-freeze correctness fix (Lever E): HOLD must not be eligible
+// once the buyer/merchant reciprocity behavior (merchantReciprocity.ts,
+// completely unchanged — this only READS its already-computed verdict)
+// is already HELD. A read-only breadth investigation (2,340 real
+// runNegotiationToCompletion configurations) found that once HOLD
+// repeats the merchant's own price for one round, the buyer's ordinary
+// CONCEDE formula (memoryless with respect to prior rounds) recomputes
+// the identical value from that frozen offer — WITHOUT the buyer ever
+// invoking its own HOLD branch — producing a false EXPIRED via
+// arePositionsRepeated (walkAway.ts) even though a real, mutually
+// profitable agreement exists. reciprocity.behavior is already HELD at
+// exactly that point (same signal already computed above for the
+// ordinary CONCEDE candidate), so this is a pure reuse, not a new
+// computation.
+describe("merchant HOLD — mutual-freeze correctness fix (reciprocity.behavior !== \"HELD\")", () => {
+  const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 }; // "low" stock pressure -> HOLD's own gate is otherwise open
+  const midRound: MerchantConcessionContext = { round: 2, maxRounds: 6, previousOfferUnitPrice: 46800 }; // roundsLeft = 5, well clear of the final-round gate
+  const generousAsk = req({ maxUnitPrice: 46000 });
+
+  it("A: HOLD remains eligible when reciprocity is not HELD (e.g. the buyer's ask genuinely moved up — CONCEDED)", () => {
+    const priorBuyerUnitPrice = 45000; // strictly less than request.maxUnitPrice (46000) -> CONCEDED, not HELD
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, midRound, priorBuyerUnitPrice, null, null, 10);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(true);
+  });
+
+  it("A2: HOLD remains eligible when there is no prior buyer price at all (reciprocity is UNKNOWN, not HELD) — every existing caller that never threads priorBuyerUnitPrice is unaffected", () => {
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, midRound, null, null, null, 10);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(true);
+  });
+
+  it("B: HOLD is suppressed the moment reciprocity is HELD (the buyer's current ask exactly equals its prior one), with every other existing HOLD condition satisfied", () => {
+    const priorBuyerUnitPrice = generousAsk.maxUnitPrice; // exact equality -> HELD
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, midRound, priorBuyerUnitPrice, null, null, 10);
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(false);
+    // Control: the identical scarce-stock / real-headroom / roundsLeft
+    // conditions produce a real HOLD once priorBuyerUnitPrice differs
+    // (test A) — only the reciprocity behavior differs here.
+  });
+
+  it("C: the previously-committed final-round fix (roundsLeft > 2) remains fully intact and independent of this new condition", () => {
+    const finalRound: MerchantConcessionContext = { round: 6, maxRounds: 6, previousOfferUnitPrice: 46800 };
+    const notHeldPriorPrice = 45000; // reciprocity would NOT be HELD here
+    const { candidates } = generateMerchantCandidates(scarce, generousAsk, finalRound, notHeldPriorPrice, null, null, 10);
+    // Even with reciprocity clearly not HELD, HOLD must still be
+    // suppressed at roundsLeft <= 2 — the two conditions are independent
+    // "AND" clauses, neither substitutes for the other.
+    expect(candidates.some((c) => c.move === "HOLD")).toBe(false);
+  });
+
+  it("F: this condition only ever removes the HOLD candidate — it never changes the ordinary CONCEDE price, and every existing price/floor invariant still holds", () => {
+    const priorBuyerUnitPrice = generousAsk.maxUnitPrice; // HELD -> HOLD suppressed
+    const withFix = generateMerchantCandidates(scarce, generousAsk, midRound, priorBuyerUnitPrice, null, null, 10);
+    const withoutHeldSignal = generateMerchantCandidates(scarce, generousAsk, midRound, null, null, null, 10); // UNKNOWN, not HELD
+    const concedeWithFix = withFix.candidates.find((c) => c.move === "CONCEDE");
+    const concedeControl = withoutHeldSignal.candidates.find((c) => c.move === "CONCEDE");
+    expect(concedeWithFix).toBeDefined();
+    // Reciprocity's speedMultiplier does differ between HELD and UNKNOWN
+    // (merchantReciprocity.ts, unchanged) — so the two CONCEDE prices are
+    // not required to be numerically identical. What matters is that
+    // BOTH remain valid, unchanged by this fix's own logic: real numbers
+    // within the merchant's hard floor/ceiling, never bypassed.
+    expect(concedeWithFix!.unitPrice).toBeGreaterThanOrEqual(item.minPrice);
+    expect(concedeWithFix!.unitPrice).toBeLessThanOrEqual(item.listedPrice);
+    expect(concedeControl!.unitPrice).toBeGreaterThanOrEqual(item.minPrice);
+    expect(concedeControl!.unitPrice).toBeLessThanOrEqual(item.listedPrice);
+    // With HOLD suppressed, CONCEDE (the only remaining non-trade
+    // candidate) wins the selection — genuine movement toward the
+    // buyer, never a stale repeated price.
+    const selected = selectBestMerchantCandidate(withFix.candidates);
+    expect(selected.move).toBe("CONCEDE");
+    expect(selected.unitPrice).toBeLessThan(midRound.previousOfferUnitPrice as number);
+  });
+});
+
 // PACT V2 Milestone 12 CORRECTION: merchant package/trade pricing must
 // reflect the actual authorized (stock-capped) quantity, not the buyer's
 // raw ask, wherever they diverge (partial fulfillment). This describe

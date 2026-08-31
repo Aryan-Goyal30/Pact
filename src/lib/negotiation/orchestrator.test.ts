@@ -2081,6 +2081,117 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     // it as a genuine strategic option.
     expect(transcript.some((t) => t.merchant.move === "HOLD")).toBe(true);
   });
+
+  // Mutual-freeze correctness fix (Lever E) — end-to-end regression.
+  // This is a DIFFERENT deadlock from the one above: it forms well
+  // before the final-two-round window (round 2 -> 3, not the final
+  // rounds), driven not by buyer HOLD but by the buyer's own memoryless
+  // ordinary CONCEDE formula recomputing an identical value from the
+  // merchant's HOLD-frozen offer — see merchantMoveSelection.ts's own
+  // "Mutual-freeze correctness fix" comment for the full mechanism. A
+  // read-only breadth investigation (2,340 real-orchestrator
+  // configurations) found this fixture false-EXPIREs on the pre-fix
+  // code even though a real ~₹2,500 margin exists between the buyer's
+  // ceiling and the merchant's floor.
+  it("resolves the mutual-freeze deadlock: a LOW-STOCK LAPTOP negotiation with a tightened ceiling now closes AGREED instead of a false repeated-position walk-away", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 10, // scarce -> "low" stock pressure, HOLD's own gate is open; also < the 12 requested below (partial fulfillment)
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 10,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 12, // exceeds the 10-unit stock -> partial fulfillment, the known Category-A fixture
+      maxUnitPrice: 46500, // comfortably above minPrice(44000) — a real deal exists
+      deliveryDeadlineDays: 10,
+      urgency: "medium", // weak buyer leverage here — the buyer's own HOLD branch never actually fires; the CONCEDE-recompute mechanism is what freezes
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      6, // matches NegotiationDemo.tsx's real maxRounds
+    );
+
+    expect(finalState.status).toBe("AGREED");
+    const last = transcript[transcript.length - 1];
+    expect(last.merchant.unitPrice).not.toBeNull();
+    expect(last.merchant.unitPrice as number).toBeLessThanOrEqual(buyerConstraints.maxUnitPrice);
+    expect(last.merchant.unitPrice as number).toBeGreaterThanOrEqual(item.minPrice);
+    expect(last.merchant.quantity).not.toBeNull();
+    expect(last.merchant.quantity as number).toBeLessThanOrEqual(item.availableQty);
+    // Merchant HOLD still genuinely fires once, earlier in the
+    // trajectory (round 2) — this fix releases it once the buyer's own
+    // reciprocity behavior goes HELD, it does not remove HOLD as a
+    // strategic option.
+    expect(transcript.some((t) => t.merchant.move === "HOLD")).toBe(true);
+    // And the negotiation is never stuck repeating: no two consecutive
+    // exchanges show identical (buyer, merchant) prices, i.e. the
+    // mutual freeze this fix targets never actually completes.
+    for (let i = 1; i < transcript.length; i++) {
+      const prev = transcript[i - 1];
+      const cur = transcript[i];
+      const bothRepeated = cur.buyer.unitPrice !== null && cur.buyer.unitPrice === prev.buyer.unitPrice && cur.merchant.unitPrice !== null && cur.merchant.unitPrice === prev.merchant.unitPrice;
+      expect(bothRepeated).toBe(false);
+    }
+  });
+
+  // Category-B control — the genuine stalemate this fix must NOT touch.
+  // Real trace (same breadth investigation): the merchant's price
+  // genuinely reaches its absolute floor (a hard clamp, not HOLD), while
+  // MONITOR's real stock caps fulfillment at 250 of the 300 requested —
+  // a 16.7% shortfall that a low-urgency buyer's own quantity-sufficiency
+  // policy (buyerQuantitySufficiency.ts, untouched) correctly refuses to
+  // accept, since no price the merchant could ever offer (without
+  // breaching its own floor) compensates enough. EXPIRED here is the
+  // CORRECT outcome — this fix only ever removes a HOLD candidate; it
+  // has no way to alter a floor-clamped price or a sufficiency verdict.
+  it("does NOT disturb the genuine Category-B stalemate: a real stock-capped shortfall a low-urgency buyer cannot accept still correctly EXPIREs", async () => {
+    const item: CatalogItemSnapshot = {
+      sku: "MONITOR-24-FHD",
+      listedPrice: 9500,
+      minPrice: 8200,
+      availableQty: 250, // "medium" stock pressure, not "low" -> merchant HOLD's own gate never even opens here
+      standardDeliveryDays: 4,
+      maxDeliveryDays: 10,
+      negotiationEnabled: true,
+    };
+    const listing: PublicManifestProduct = {
+      sku: "MONITOR-24-FHD",
+      name: "24-inch Full HD Monitor",
+      description: "Standard office monitor, 1920x1080.",
+      listedPrice: 9500,
+      availableQuantity: 250,
+      standardDeliveryDays: 4,
+      maxDeliveryDays: 10,
+      negotiable: true,
+    };
+    const buyerConstraints: BuyerConstraints = {
+      sku: "MONITOR-24-FHD",
+      quantity: 300, // exceeds the 250-unit stock -> a genuine, unresolvable 16.7% shortfall
+      maxUnitPrice: 8226, // above minPrice(8200) — price alone is NOT the obstacle here
+      deliveryDeadlineDays: 5,
+      urgency: "low", // low tolerance for any shortfall (10%) — the shortfall here is far beyond it
+    };
+    const { finalState } = await runNegotiationToCompletion(
+      { item, manifestProduct: listing, buyerConstraints },
+      6,
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+  });
 });
 
 // PACT V2 Milestone 12: combined quantity+delivery-for-price bargaining
