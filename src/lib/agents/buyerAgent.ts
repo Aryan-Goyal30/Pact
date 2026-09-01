@@ -34,7 +34,7 @@ import {
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
-import type { BuyerMove } from "@/lib/rules/buyerMoveSelector";
+import { HOLD_LEVERAGE_THRESHOLD, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
 import type { BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
 import type { BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
 import type { BuyerPackageTradeMove } from "@/lib/rules/buyerQuantityAndDeliveryTrade";
@@ -297,7 +297,43 @@ function buildResponseToMerchantOffer(
   if (validation.outcome === "ACCEPTABLE" && concessionContext) {
     sufficiency = evaluateQuantitySufficiency(constraints, proposal.quantity, proposal.unitPrice);
     const roundsLeft = Math.max(1, concessionContext.maxRounds - concessionContext.round + 1);
-    if (sufficiency.verdict !== "INSUFFICIENT" || roundsLeft <= 2) {
+    // Negotiation Engine V2 (D4): a sufficient/price-compensated quantity
+    // no longer forces an immediate accept when the buyer's own leverage
+    // clearly favors holding out for more (reusing
+    // buyerMoveSelector.HOLD_LEVERAGE_THRESHOLD — the SAME bar the
+    // ordinary HOLD/CONCEDE decision already uses, never a new,
+    // independently-calibrated threshold). This only NARROWS the
+    // existing early-return; it never widens it — the final-2-rounds
+    // safety net below is completely unconditional, exactly as before,
+    // so the guaranteed-convergence property is untouched. When this
+    // additional check declines to auto-accept, control falls through
+    // to the SAME existing candidate generation/comparison path
+    // (HOLD/CONCEDE/trades) the "not yet acceptable" branch already
+    // uses below — no new code path, just a narrower gate on this one.
+    const buyerLeverageScore = strategyContext?.leverageScore;
+    // The leverage-driven narrowing is deliberately single-shot: it can
+    // only decline an otherwise-acceptable offer on the buyer's FIRST
+    // reactive round (no previousBuyerUnitPrice yet — nothing has been
+    // held out for yet). Without this, an extremely high-leverage buyer
+    // (>= HOLD_LEVERAGE_THRESHOLD) has no mechanism to ever relent: the
+    // merchant can genuinely hit its own floor and be forced to repeat
+    // that same, already-best-possible price every round, while this gate
+    // keeps refusing it round after round purely on leverage — producing
+    // a false EXPIRED (arePositionsRepeated trips) even though a real,
+    // mutually-acceptable deal was on the table the whole time. Limiting
+    // the gate to "have I already had at least one chance to hold out"
+    // preserves D4's intent (a strong-leverage buyer gets a genuine shot
+    // at a better offer instead of reflexively taking the first
+    // technically-acceptable one) while guaranteeing it can never itself
+    // be the cause of a repeated-position deadlock — after one round of
+    // holding out, sufficiency's original unconditional accept resumes.
+    const isFirstReactiveRound =
+      strategyContext?.previousBuyerUnitPrice === null || strategyContext?.previousBuyerUnitPrice === undefined;
+    const stronglyFavorsHolding =
+      isFirstReactiveRound &&
+      buyerLeverageScore !== undefined &&
+      buyerLeverageScore >= HOLD_LEVERAGE_THRESHOLD;
+    if ((sufficiency.verdict !== "INSUFFICIENT" && !stronglyFavorsHolding) || roundsLeft <= 2) {
       // SUFFICIENT (no meaningful shortfall, or one within tolerance),
       // INSUFFICIENT_PRICE_COMPENSATES (a real shortfall, but the price
       // is good enough to justify accepting it anyway), or the
@@ -305,9 +341,10 @@ function buildResponseToMerchantOffer(
       // never a blind quantity-fits-under-the-ceiling shortcut.
       return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null, tradeMove: null, sufficiency };
     }
-    // INSUFFICIENT, with real negotiating room still ahead — fall
-    // through to negotiate instead of accepting, exactly like the "not
-    // yet acceptable" path below.
+    // INSUFFICIENT (or sufficient but the buyer's own leverage clearly
+    // favors holding out for more), with real negotiating room still
+    // ahead — fall through to negotiate instead of accepting, exactly
+    // like the "not yet acceptable" path below.
   } else if (validation.outcome === "ACCEPTABLE") {
     // No round context (a single-shot caller) — exact pre-Milestone-6 behavior.
     return { action: { type: "accept", ...proposal }, validation, move: null, moveReason: null, tradeMove: null, sufficiency: null };

@@ -15,6 +15,7 @@ import {
 import {
   hasQuantityLeverage,
   resolveMerchantConcessionSpeedFactor,
+  resolveRoundProgressFactor,
   LARGE_ORDER_MERCHANT_DISCOUNT,
 } from "@/lib/rules/negotiationStrategy";
 
@@ -131,6 +132,19 @@ export interface MerchantConcessionContext {
    * [minPrice, listedPrice] clamp below regardless of magnitude.
    */
   reciprocitySpeedMultiplier?: number;
+  /**
+   * Negotiation Engine V2 — an already-resolved multiplier from
+   * negotiationStrategy.resolveLeverageSpeedFactor(merchantLeverage,
+   * buyerLeverage), reflecting the merchant's OWN leverage relative to
+   * the buyer's this round. Defaults to 1.0 (a complete no-op) when
+   * omitted, exactly like reciprocitySpeedMultiplier above — every
+   * caller that predates this option (including every existing test)
+   * behaves exactly as before. Computed by the caller (merchantMoveSelection.ts),
+   * never re-derived here, so this function stays a pure formula over
+   * already-resolved numbers, the same discipline reciprocitySpeedMultiplier
+   * already established.
+   */
+  leverageSpeedFactor?: number;
 }
 
 /**
@@ -194,7 +208,31 @@ export function computeMerchantConcessionPrice(
   const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
   const speedFactor = resolveMerchantConcessionSpeedFactor(item);
   const reciprocityFactor = context.reciprocitySpeedMultiplier ?? 1;
-  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * speedFactor * reciprocityFactor;
+  // Negotiation Engine V2: leverage (an already-resolved, opt-in
+  // multiplier — see MerchantConcessionContext's own doc comment) and
+  // round progression (computed directly from the round/maxRounds this
+  // context already requires — no new plumbing) both fold into the SAME
+  // combinedSpeed term the existing two factors already compose
+  // multiplicatively. Deliberately INERT on the opening round
+  // (context.previousOfferUnitPrice undefined, i.e. no prior position to
+  // measure progression or reciprocation against — the same "anchor =
+  // item.listedPrice" case this function's own doc comment already
+  // documents as producing exactly computeCounterOfferPrice's output):
+  // round 1 opening behavior is explicitly out of scope for this
+  // redesign, and this is what keeps it byte-identical. The outer clamp
+  // bounds worst-case compounding across all four factors from round 2
+  // onward; it is a documented no-op for every combination of
+  // stockSpeedFactor/reciprocityFactor alone that predates this change
+  // (their own widest possible product, ~0.42 to ~1.495 per
+  // merchantReciprocity.ts's own calibration note, sits comfortably
+  // inside [0.3, 2.0]).
+  const hasPriorPosition = context.previousOfferUnitPrice !== undefined;
+  const leverageFactor = hasPriorPosition ? (context.leverageSpeedFactor ?? 1) : 1;
+  const roundProgressFactor = hasPriorPosition
+    ? resolveRoundProgressFactor(context.round, context.maxRounds)
+    : 1;
+  const combinedSpeed = clamp(speedFactor * reciprocityFactor * leverageFactor * roundProgressFactor, 0.3, 2.0);
+  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * combinedSpeed;
 
   if (context.requestedQuantity !== undefined && hasQuantityLeverage(context.requestedQuantity)) {
     conceded -= (item.listedPrice - item.minPrice) * LARGE_ORDER_MERCHANT_DISCOUNT;

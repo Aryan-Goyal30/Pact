@@ -21,6 +21,7 @@ import {
   type BuyerConcessionContext,
   type BuyerConstraints,
 } from "@/lib/rules/buyerRules";
+import { resolveLeverageSpeedFactor } from "@/lib/rules/negotiationStrategy";
 
 export type BuyerMove = "HOLD" | "CONCEDE";
 
@@ -101,9 +102,27 @@ export function decideBuyerConcessionMove(
     };
   }
 
+  // Negotiation Engine V2: leverage becomes causal for the buyer's own
+  // CONCEDE price too, not just the HOLD-vs-CONCEDE threshold above.
+  // relativeStrength = buyerLeverage - merchantLeverage, and — since
+  // leverage.ts's own two scores are always complementary (buyer +
+  // merchant === 100, unchanged) — merchantLeverage is exactly
+  // 100 - buyerLeverageScore, never a second value that needs its own
+  // plumbing. Left undefined (a complete no-op) whenever no leverage
+  // signal is available at all — the same technical, not strategic,
+  // opt-out every leverage-aware buyer function in this codebase already
+  // uses (see buyerQuantityTrade.ts's own identical convention).
+  const leverageSpeedFactor =
+    buyerLeverageScore !== undefined
+      ? resolveLeverageSpeedFactor(buyerLeverageScore, 100 - buyerLeverageScore)
+      : undefined;
+
   return {
     move: "CONCEDE",
-    unitPrice: computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext),
+    unitPrice: computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, {
+      ...concessionContext,
+      leverageSpeedFactor,
+    }),
     reason: merchantMoved
       ? "The merchant moved, so the buyer reciprocates with its own concession."
       : "The buyer's bargaining position favors continuing to concede toward agreement.",

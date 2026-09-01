@@ -114,6 +114,7 @@ export function generateBuyerCandidates(
     constraints,
     merchantOfferUnitPrice,
     concessionContext,
+    strategyContext?.previousBuyerUnitPrice,
     strategyContext?.leverageScore,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,
     maxDeliveryDays,

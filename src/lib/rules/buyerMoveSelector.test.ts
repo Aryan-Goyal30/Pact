@@ -123,3 +123,38 @@ describe("decideBuyerConcessionMove — no prior merchant history (buyer's first
     expect(decision.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
   });
 });
+
+// Negotiation Engine V2 (D1/D2): leverage now also causally affects the
+// CONCEDE branch's own PRICE, not just the HOLD-vs-CONCEDE threshold —
+// this is the actual integration point (buyerMoveSelector.ts wiring
+// buyerRules.computeBuyerConcessionPrice's new leverageSpeedFactor
+// parameter) proved here, distinct from the formula-level tests in
+// buyerRules.test.ts.
+describe("decideBuyerConcessionMove — G: leverage is causal for the CONCEDE price itself (D1/D2)", () => {
+  it("weaker buyer leverage produces a HIGHER concede price than stronger buyer leverage, same merchant offer/history otherwise", () => {
+    // Both stay in the CONCEDE branch (moderate leverage, well clear of
+    // the HOLD_LEVERAGE_THRESHOLD=60 boundary) — isolates the price
+    // effect from the branch-selection effect already covered by F above.
+    const weakBuyer = decideBuyerConcessionMove(constraints, 46800, ctx(3, 8), 47500, 44000, 20);
+    const strongerBuyer = decideBuyerConcessionMove(constraints, 46800, ctx(3, 8), 47500, 44000, 45);
+    expect(weakBuyer.move).toBe("CONCEDE");
+    expect(strongerBuyer.move).toBe("CONCEDE");
+    expect(weakBuyer.unitPrice).toBeGreaterThan(strongerBuyer.unitPrice);
+  });
+});
+
+// Test requirement E (history/opponent movement matters): a side that
+// has already conceded (merchant's price genuinely dropped) behaves
+// differently from one that has not (merchant repeated the same price),
+// all else — including leverage — held equal. Complements section E
+// above (which proves the move flips HOLD/CONCEDE); this proves the
+// SAME underlying history signal survives, unaffected, now that leverage
+// is also in the mix.
+describe("decideBuyerConcessionMove — history/opponent movement still matters with leverage in the mix", () => {
+  it("identical leverage, only the merchant's movement history differs, still produces a different move", () => {
+    const afterMerchantMoved = decideBuyerConcessionMove(constraints, 46800, ctx(3, 8), 47500, 44000, 50);
+    const afterMerchantStalled = decideBuyerConcessionMove(constraints, 47000, ctx(3, 8), 47000, 44000, 50);
+    expect(afterMerchantMoved.move).toBe("CONCEDE");
+    expect(afterMerchantStalled.move).toBe("HOLD");
+  });
+});

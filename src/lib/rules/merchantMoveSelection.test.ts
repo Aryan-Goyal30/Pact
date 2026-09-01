@@ -192,13 +192,80 @@ describe("merchant HOLD candidate — real, gated on stock scarcity (not leverag
     expect(candidates.some((c) => c.move === "HOLD")).toBe(false);
   });
 
-  it("is never gated by leverage — merchantMoveSelection.ts never imports or references a leverage score at all", () => {
-    // Structural proof: generateMerchantCandidates's signature has no
-    // leverage parameter, unlike buyerMoveSelection.ts's strategyContext
-    // — there is no leverage input this test could even vary. HOLD's
-    // gate is entirely resolveMerchantStockPressure(item) (a static,
-    // catalog-derived signal) plus the floor-safety check above.
-    expect(generateMerchantCandidates.length).toBe(7); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays, authorizedQuantity — no leverage slot
+  // Negotiation Engine V2: generateMerchantCandidates now DOES accept a
+  // leverage input (the 8th, optional parameter) — leverage is causal
+  // for the merchant's own concession PRICE (see the "leverage causally
+  // affects merchant concession" describe block below). What remains
+  // true, unchanged, and still worth proving explicitly is the narrower
+  // claim this test originally existed for: HOLD's own ELIGIBILITY gate
+  // — whether HOLD is generated as a candidate AT ALL — is still keyed
+  // purely on resolveMerchantStockPressure(item) (static) plus the
+  // floor-safety/roundsLeft/reciprocity checks, never on leverage. This
+  // is exactly the distinction the original Milestone 9 spec drew
+  // ("not a leverage-based gate") and this redesign deliberately does
+  // not revisit: leverage may now shape HOW MUCH the merchant concedes,
+  // never WHETHER it is allowed to consider holding firm at all.
+  it("HOLD's own eligibility gate remains leverage-blind — leverage only ever changes the resulting PRICE, never whether HOLD is generated", () => {
+    expect(generateMerchantCandidates.length).toBe(8); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays, authorizedQuantity, leverageScores (optional)
+
+    const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+    const withoutLeverage = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null, 10);
+    // A strong buyer leverage that would (if it gated eligibility) plausibly
+    // suppress a firm HOLD, and a strong merchant leverage that would
+    // plausibly force one — HOLD's presence is identical either way,
+    // proving the gate itself never reads either score.
+    const withBuyerFavoredLeverage = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null, 10, { buyer: 90, merchant: 10 });
+    const withMerchantFavoredLeverage = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null, 10, { buyer: 10, merchant: 90 });
+    const holdPresent = (r: typeof withoutLeverage) => r.candidates.some((c) => c.move === "HOLD");
+    expect(holdPresent(withoutLeverage)).toBe(true);
+    expect(holdPresent(withBuyerFavoredLeverage)).toBe(true);
+    expect(holdPresent(withMerchantFavoredLeverage)).toBe(true);
+  });
+});
+
+// Negotiation Engine V2 (D1/D2): leverage becomes causal for the
+// merchant's own concession PRICE — stronger merchant leverage (relative
+// to the buyer's) should mean LESS concession (a higher resulting
+// price); weaker merchant leverage should mean MORE concession (a lower
+// price) — while every existing hard bound ([minPrice, listedPrice])
+// and every existing factor (stock pressure, reciprocity, large-order
+// discount, delivery-trade discount) remains completely unchanged and
+// unconditionally still applies.
+describe("merchant concession price — leverage becomes causal (Negotiation Engine V2, D1/D2)", () => {
+  const midRound: MerchantConcessionContext = { round: 2, maxRounds: 10, previousOfferUnitPrice: 46500 };
+  const request = req({ maxUnitPrice: 44500 });
+
+  it("A: strong merchant leverage (relative to the buyer) makes the merchant concede LESS than with equal leverage", () => {
+    const equal = generateMerchantCandidates(item, request, midRound, null, null, null, 10, { buyer: 50, merchant: 50 });
+    const strongMerchant = generateMerchantCandidates(item, request, midRound, null, null, null, 10, { buyer: 20, merchant: 80 });
+    const equalPrice = equal.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    const strongPrice = strongMerchant.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    expect(strongPrice).toBeGreaterThan(equalPrice); // holds firmer -> higher price
+  });
+
+  it("B: weak merchant leverage (relative to the buyer) makes the merchant concede MORE than with equal leverage", () => {
+    const equal = generateMerchantCandidates(item, request, midRound, null, null, null, 10, { buyer: 50, merchant: 50 });
+    const weakMerchant = generateMerchantCandidates(item, request, midRound, null, null, null, 10, { buyer: 80, merchant: 20 });
+    const equalPrice = equal.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    const weakPrice = weakMerchant.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    expect(weakPrice).toBeLessThan(equalPrice); // concedes further -> lower price
+  });
+
+  it("C: omitting leverage entirely reproduces exactly the pre-Negotiation-Engine-V2 price (leverageSpeedFactor defaults to a no-op)", () => {
+    const withoutLeverage = generateMerchantCandidates(item, request, midRound, null, null, null, 10);
+    const withNeutralLeverage = generateMerchantCandidates(item, request, midRound, null, null, null, 10, { buyer: 50, merchant: 50 });
+    const priceWithout = withoutLeverage.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    const priceNeutral = withNeutralLeverage.candidates.find((c) => c.move === "CONCEDE")!.unitPrice;
+    expect(priceWithout).toBe(priceNeutral);
+  });
+
+  it("D: every leverage combination still respects [minPrice, listedPrice], even at the most extreme relative strengths", () => {
+    for (const leverageScores of [{ buyer: 0, merchant: 100 }, { buyer: 100, merchant: 0 }]) {
+      const { candidates } = generateMerchantCandidates(item, req({ maxUnitPrice: 1 }), midRound, null, null, null, 10, leverageScores);
+      const concede = candidates.find((c) => c.move === "CONCEDE")!;
+      expect(concede.unitPrice).toBeGreaterThanOrEqual(item.minPrice);
+      expect(concede.unitPrice).toBeLessThanOrEqual(item.listedPrice);
+    }
   });
 });
 

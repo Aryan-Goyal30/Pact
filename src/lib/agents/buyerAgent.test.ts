@@ -651,7 +651,7 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
       type: "counter_offer",
       sku: "LAPTOP-14-I5",
       quantity: 30, // still adopts the merchant's supply-constrained quantity
-      unitPrice: 44625,
+      unitPrice: 44255,
       deliveryDays: 10, // 8 + round(8 * 0.3) — resolveDeliveryUrgencyFactor("high"), negotiation calibration task
     });
     expect(response.strategicReasons.some((r) => r.includes("accept delivery in 10 days"))).toBe(true);
@@ -740,7 +740,7 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
   // LLM message contains all required conditional-trade numbers.
   it("passes through an LLM message that correctly states the delivery trade's terms", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
-      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44625 each.",
+      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44255 each.",
     );
 
     const response = await runBuyerAgent(
@@ -752,7 +752,7 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     );
 
     expect(response.message).toBe(
-      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44625 each.",
+      "For 30 units, I can accept delivery in 10 days if you can bring the price down to 44255 each.",
     );
   });
 
@@ -770,10 +770,10 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
 
     // The structured decision itself is completely unaffected...
     expect(response.action.deliveryDays).toBe(10);
-    expect(response.action.unitPrice).toBe(44625);
+    expect(response.action.unitPrice).toBe(44255);
     // ...but the fallback caption states the real numbers, not the vague LLM text.
     expect(response.message).toContain("10");
-    expect(response.message).toContain("44625");
+    expect(response.message).toContain("44255");
     expect(response.message).not.toContain("help on price");
   });
 
@@ -792,7 +792,7 @@ describe("runBuyerAgent — delivery-for-price bargaining strategy", () => {
     expect(response.message).not.toContain("999");
     expect(response.message).not.toContain("1 each");
     expect(response.message).toContain("10");
-    expect(response.message).toContain("44625");
+    expect(response.message).toContain("44255");
   });
 });
 
@@ -930,6 +930,103 @@ describe("runBuyerAgent — quantity sufficiency (partial fulfillment is not aut
 
     expect(response.sufficiency).toBeNull();
     expect(response.action.type).toBe("accept");
+  });
+
+  // Negotiation Engine V2 (D4): a sufficient quantity no longer forces an
+  // automatic accept when the buyer's own leverage clearly favors holding
+  // out for more — reusing buyerMoveSelector.HOLD_LEVERAGE_THRESHOLD.
+  // Test requirement #6. The narrowing is deliberately single-shot (see
+  // buyerAgent.ts's own doc comment on stronglyFavorsHolding) — it only
+  // ever applies on the buyer's FIRST reactive round, so these fixtures
+  // omit previousBuyerUnitPrice throughout.
+  describe("leverage-aware sufficiency narrowing (D4)", () => {
+    const fullySufficientResult: NegotiationResult = {
+      outcome: "COUNTER_OFFER",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 150, // fully sufficient — no shortfall at all
+      unitPrice: 46900,
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    it("a strong-leverage buyer does NOT auto-accept a sufficient offer on its first reactive round — it holds out instead", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 2, maxRounds: 10 }, // plenty of rounds left
+        { leverageScore: 80 }, // strongly favors holding (>= HOLD_LEVERAGE_THRESHOLD = 60)
+      );
+
+      expect(response.sufficiency!.verdict).toBe("SUFFICIENT");
+      expect(response.action.type).not.toBe("accept");
+    });
+
+    it("a weak-leverage buyer still auto-accepts the same sufficient offer — the narrowing only fires for strong leverage", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 2, maxRounds: 10 },
+        { leverageScore: 30 }, // below HOLD_LEVERAGE_THRESHOLD
+      );
+
+      expect(response.action.type).toBe("accept");
+    });
+
+    it("no leverage signal at all reproduces the pre-D4 unconditional accept", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 2, maxRounds: 10 },
+      );
+
+      expect(response.action.type).toBe("accept");
+    });
+
+    // Test requirement #7: the final-two-round safety net still forces
+    // convergence, completely unconditionally — a strongly-leveraged
+    // buyer that would otherwise hold out is still made to accept once
+    // no real negotiating room remains.
+    it("still accepts within the final-two-round safety net, even at strong leverage that would otherwise hold out", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 9, maxRounds: 10 }, // roundsLeft = 2 -> the safety net
+        { leverageScore: 80 },
+      );
+
+      expect(response.action.type).toBe("accept");
+    });
+
+    // The narrowing is single-shot by design (see buyerAgent.ts's own doc
+    // comment): once the buyer already has a previous offer of its own on
+    // the table, sufficiency's original unconditional accept resumes —
+    // this is what guarantees the leverage-driven narrowing can never
+    // itself cause a repeated-position deadlock (a real regression found
+    // and fixed during this milestone: a permanently strong-leverage
+    // buyer facing an already floor-clamped merchant had no mechanism to
+    // ever relent, producing a false EXPIRED against a genuinely
+    // achievable deal).
+    it("resumes the unconditional accept from the buyer's second reactive round onward, even at strong leverage", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 3, maxRounds: 10 },
+        { leverageScore: 80, previousBuyerUnitPrice: 45000 }, // a previous offer already exists
+      );
+
+      expect(response.action.type).toBe("accept");
+    });
   });
 });
 

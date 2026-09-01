@@ -293,11 +293,19 @@ export async function runNegotiationTurn(
   // never context.item itself, preserving buyerAgent.ts's existing
   // invariant that it never sees item.minPrice or any other private
   // catalog field.
-  const buyerLeverageScore = computeLeverage({
+  //
+  // Negotiation Engine V2: this SAME computeLeverage call already
+  // produces the merchant's own complementary score (buyer + merchant
+  // === 100, leverage.ts unchanged) — captured here too so it can be
+  // threaded into runMerchantAgent below, making leverage causal for
+  // both sides from the exact same, single, per-round computation
+  // rather than a second call or a re-derivation.
+  const preRoundLeverage = computeLeverage({
     item: context.item,
     buyerConstraints: context.buyerConstraints,
     currentMerchantUnitPrice: previousMerchantResult?.unitPrice ?? null,
-  }).buyerLeverage;
+  });
+  const buyerLeverageScore = preRoundLeverage.buyerLeverage;
 
   const buyerResponse = await runBuyerAgent(
     context.buyerConstraints,
@@ -399,6 +407,9 @@ export async function runNegotiationTurn(
     // Milestone 7: lets the merchant recognize a genuine round-over-round
     // delivery extension (buyerResponse.action.deliveryDays, above).
     previousBuyerDeliveryDays,
+    // Negotiation Engine V2: the same pre-round leverage snapshot the
+    // buyer's own decision above already used, in {buyer, merchant} form.
+    { buyer: preRoundLeverage.buyerLeverage, merchant: preRoundLeverage.merchantLeverage },
   );
   const merchantResult = merchantAgentResponse.decision;
 

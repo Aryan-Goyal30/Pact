@@ -348,6 +348,64 @@ export function resolveMerchantConcessionSpeedFactor(
 }
 
 // ---------------------------------------------------------------------------
+// Negotiation Engine V2 — shared leverage/round-progression factors, used
+// by BOTH sides' middle-round concession formulas
+// (computeMerchantConcessionPrice / computeBuyerConcessionPrice). Neither
+// function is symmetric to the other (each keeps its own existing
+// stock-pressure / urgency / reciprocity factors, its own anchor, its own
+// direction) — these two functions only supply the two NEW ingredients
+// each side folds in on top of what it already had. Both are pure,
+// generic, and take every input explicitly (never re-deriving one side's
+// leverage from the other via the 0-100 complementary relationship
+// internally) — the caller supplies whichever pair of leverage scores
+// belongs to it, in "own, opponent" order, matching the spec's
+// `relativeStrength = ownLeverage - opponentLeverage` exactly.
+// ---------------------------------------------------------------------------
+
+/**
+ * How much slower or faster a side should concede given its OWN leverage
+ * relative to its opponent's, on a 0-100 scale each (leverage.ts's own
+ * complementary buyer/merchant score). Symmetric in shape for both
+ * sides — the caller decides which score is "own" and which is
+ * "opponent." Centered at relativeStrength=0 (equal leverage) -> 1.0, a
+ * complete no-op reproducing today's formula exactly; a side with
+ * substantially MORE leverage than its opponent gets a SMALLER factor
+ * (concedes less), a side with substantially LESS leverage gets a
+ * LARGER factor (concedes more) — bounded to [0.5, 1.5], the same band
+ * buyerQuantityTrade.ts's own resolveLeverageAskMultiplier already uses
+ * for the identical "how much should leverage scale an ask" question,
+ * kept consistent rather than inventing a new curve shape.
+ */
+export function resolveLeverageSpeedFactor(ownLeverage: number, opponentLeverage: number): number {
+  const relativeStrength = ownLeverage - opponentLeverage;
+  return clamp(1 - relativeStrength / 200, 0.5, 1.5);
+}
+
+/**
+ * How much additional pressure to converge builds up purely from how far
+ * through the negotiation's round budget the current round already is —
+ * NOT "later round = concede more" on its own (that's exactly what this
+ * codebase's existing final-2-rounds override already guarantees
+ * unconditionally; this factor only ever applies in the middle-round
+ * branch, never touching that override). Early rounds (roundProgress
+ * near 0) land near 0.7 — real anchoring, smaller concessions, more room
+ * to hold; later middle rounds (roundProgress approaching 1, i.e. right
+ * up against the final-2-rounds cutoff) land near 1.3 — genuinely
+ * greater pressure to close the gap while a real strategic choice still
+ * exists. Bounded [0.7, 1.3] — the same band this codebase's own
+ * stock-pressure speed factor already uses (0.7 low / 1.3 high), kept
+ * consistent rather than inventing a new one. At the round/maxRounds
+ * ratio every existing "middle round" test fixture in this codebase
+ * already uses (round 2 of 4 -> roundProgress exactly 0.5), this
+ * resolves to exactly 1.0 — a genuine no-op for every currently-pinned
+ * shape assertion, not a coincidence avoided by opting out.
+ */
+export function resolveRoundProgressFactor(round: number, maxRounds: number): number {
+  const roundProgress = clamp(round / Math.max(1, maxRounds), 0, 1);
+  return clamp(0.7 + 0.6 * roundProgress, 0.7, 1.3);
+}
+
+// ---------------------------------------------------------------------------
 // Multi-variable trade: delivery flexibility for a price concession.
 // ---------------------------------------------------------------------------
 

@@ -164,6 +164,13 @@ function applyMerchantConcession(
    * legacy, always-on resolveDeliveryTrade formula applies.
    */
   previousBuyerDeliveryDays?: number | null,
+  /**
+   * Negotiation Engine V2 — the live buyer-vs-merchant leverage score
+   * (leverage.ts, unchanged) for this round, threaded straight through
+   * to generateMerchantCandidates. Optional and additive: omitted, every
+   * price computed here reduces to exactly its pre-this-milestone value.
+   */
+  leverageScores?: { buyer: number; merchant: number },
 ): { decision: NegotiationResult; move?: CandidateMoveType } {
   if (
     request.maxUnitPrice === undefined ||
@@ -199,6 +206,7 @@ function applyMerchantConcession(
     // clause above already returned early otherwise), so offeredQuantity
     // is guaranteed non-null (only REJECTED ever sets it null).
     decision.offeredQuantity as number,
+    leverageScores,
   );
   const selected = selectBestMerchantCandidate(candidates);
 
@@ -341,6 +349,15 @@ export async function runMerchantAgent(
    * would already silently apply. See applyMerchantConcession.
    */
   previousBuyerDeliveryDays?: number | null,
+  /**
+   * Negotiation Engine V2 — the live buyer-vs-merchant leverage score
+   * (leverage.ts, unchanged) for this round, supplied by the orchestrator
+   * (which already computes it once per round for the buyer's own
+   * decision). Optional and additive: omitted, every price computed
+   * here reduces to exactly its pre-this-milestone value. See
+   * applyMerchantConcession's own doc comment.
+   */
+  leverageScores?: { buyer: number; merchant: number },
 ): Promise<MerchantAgentResponse> {
   let decision = evaluateNegotiationRequest(item, request);
   let move: CandidateMoveType | undefined;
@@ -353,6 +370,7 @@ export async function runMerchantAgent(
       priorBuyerUnitPrice,
       previousBuyerQuantity,
       previousBuyerDeliveryDays,
+      leverageScores,
     );
     decision = concession.decision;
     move = concession.move;

@@ -227,7 +227,7 @@ describe("decideBuyerQuantityAndDeliveryTrade — urgency-calibrated delivery ex
     const { decideBuyerDeliveryTrade } = await import("./buyerDeliveryTrade");
     for (const urgency of ["low", "medium", "high"] as const) {
       const withUrgency: BuyerConstraints = { ...comfortable, urgency };
-      const solo = decideBuyerDeliveryTrade(withUrgency, 46800, ctx(3), 60, false, 12);
+      const solo = decideBuyerDeliveryTrade(withUrgency, 46800, ctx(3), undefined, 60, false, 12);
       const combined = decideBuyerQuantityAndDeliveryTrade(withUrgency, 46800, 50, ctx(3), null, 60, false, false, 12);
       expect(combined.deliveryDays).toBe(solo.deliveryDays);
     }

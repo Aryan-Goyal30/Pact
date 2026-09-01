@@ -190,4 +190,58 @@ describe("computeBuyerConcessionPrice", () => {
     expect(price).toBeGreaterThan(target);
     expect(price).toBeLessThanOrEqual(monitorConstraints.maxUnitPrice);
   });
+
+  // Negotiation Engine V2 (D1/D2): leverageSpeedFactor — symmetric
+  // treatment to the merchant side's own leverageSpeedFactor
+  // (negotiationEngine.test.ts). "Own" leverage here is the BUYER's.
+  describe("leverageSpeedFactor (D1/D2)", () => {
+    it("omitting it reproduces the exact formula from before this option existed", () => {
+      const withoutLeverage = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+      const withNeutralLeverage = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1,
+      });
+      expect(withoutLeverage).toBe(withNeutralLeverage);
+    });
+
+    it("a factor above 1 (weaker buyer leverage) concedes further (a higher price); below 1 (stronger buyer leverage) concedes less", () => {
+      const baseline = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+      const weakerBuyer = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1.5,
+      });
+      const strongerBuyer = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 0.5,
+      });
+      expect(weakerBuyer).toBeGreaterThan(baseline); // concedes further -> moves closer to the merchant, a higher price
+      expect(strongerBuyer).toBeLessThan(baseline); // concedes less -> stays closer to target, a lower price
+    });
+
+    it("never exceeds maxUnitPrice, even with the most extreme leverage factor", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(price).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    });
+
+    it("does not apply in the final-2-rounds settle-at-ceiling branch — the guaranteed-convergence safety net is unaffected", () => {
+      const withheld = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(4),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(withheld).toBe(constraints.maxUnitPrice);
+    });
+  });
+
+  // Negotiation Engine V2 (D3): round progression, symmetric to the
+  // merchant side's own equivalent test.
+  describe("round progression (D3)", () => {
+    it("the SAME opposing offer concedes further (moves closer to it) in a later-progress round than an earlier one, all else equal", () => {
+      const early = computeBuyerConcessionPrice(constraints, 45375, { round: 2, maxRounds: 10 });
+      const late = computeBuyerConcessionPrice(constraints, 45375, { round: 8, maxRounds: 10 });
+      expect(late).toBeGreaterThan(early); // later progress -> more pressure to converge -> moves further toward the merchant
+    });
+  });
 });

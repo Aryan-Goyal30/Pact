@@ -184,7 +184,15 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
     expect(first.body.merchant.unitPrice).toBe(46163);
 
     const second = await callTurn(sessionId); // round 2: buyer's ask rose
-    expect(second.body.buyer.unitPrice).toBe(44457);
+    // Negotiation Engine V2: at this severe a shortfall, buyer leverage is
+    // extremely weak (~12/100 — fulfillability fully saturated against the
+    // buyer), so D1's own "weaker leverage -> greater concession pressure"
+    // now genuinely pushes the buyer all the way to its true ceiling by
+    // round 2 of 4 — still economically rational (a buyer in an almost
+    // powerless position concedes fast to secure any deal at all), and
+    // still never exceeds maxUnitPrice (the formula's own final clamp).
+    // Re-verified live via the real route handler, not hand-derived.
+    expect(second.body.buyer.unitPrice).toBe(45000);
     // Merchant holds at the SAME 46163 both rounds — under this severe a
     // shortfall (fulfillability fully saturated), the merchant's
     // round-aware formula's output lands on the identical clamped value

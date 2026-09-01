@@ -87,11 +87,26 @@ function clamp(value: number, min: number, max: number): number {
  * is clamped to it, and if that clamp leaves no real extension over the
  * buyer's own stated deadline, this is correctly not a valid delivery
  * give at all — see the clamp below.
+ *
+ * `previousBuyerUnitPrice` (Negotiation Engine V2, D5) — the same hard
+ * invariant buyerQuantityTrade.ts / buyerQuantityAndDeliveryTrade.ts
+ * already enforce: a conditional trade must read as "give something
+ * more, pay no more than I already said I would," never "give more AND
+ * pay more." Previously this trade's price was only ever bounded by
+ * `constraints.maxUnitPrice`, so it could ask for a price ABOVE the
+ * buyer's own last visible offer whenever the round's ordinary ask
+ * happened to be high — a real, observed inconsistency (the "trade" then
+ * reads as a price increase, not a concession, from the buyer's own
+ * stated position). The upper bound is now the tighter of the two —
+ * `constraints.maxUnitPrice` when no previous offer exists yet (identical
+ * to the pre-D5 behavior), otherwise `previousBuyerUnitPrice` — exactly
+ * mirroring the sibling trades' own clamp.
  */
 export function decideBuyerDeliveryTrade(
   constraints: BuyerConstraints,
   merchantOfferUnitPrice: number,
   concessionContext: BuyerConcessionContext,
+  previousBuyerUnitPrice: number | null | undefined,
   buyerLeverageScore: number | undefined,
   deliveryTradeAlreadyUsed: boolean,
   maxDeliveryDays: number,
@@ -145,10 +160,14 @@ export function decideBuyerDeliveryTrade(
   }
   const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
   const askMultiplier = resolveLeverageAskMultiplier(buyerLeverageScore);
+  const upperBound =
+    previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
+      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
+      : constraints.maxUnitPrice;
   const tradeUnitPrice = clamp(
     Math.round(normalAsk * (1 - DELIVERY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier)),
     target,
-    constraints.maxUnitPrice,
+    upperBound,
   );
 
   return {

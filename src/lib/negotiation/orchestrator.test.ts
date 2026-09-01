@@ -200,14 +200,16 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
 
     // Buyer: target (42750) on the opening ask, then a progressive
     // counter, never touching its true ceiling (45000) until it has to.
-    // Milestone 4: the buyer's round-2 ask (44063) is a genuine concession
-    // over its round-1 ask (42750) — CONCEDED reciprocity — so the
-    // merchant meets it with a larger-than-baseline concession on round 2,
-    // and the buyer's final accept price drops accordingly (44621, was
-    // 44719 before reciprocity existed). Verified empirically by running
-    // this test after wiring reciprocitySpeedMultiplier through the
-    // orchestrator, not hand-derived.
-    expect(transcript.map((t) => t.buyer.unitPrice)).toEqual([42750, 44063, 44621]);
+    // Milestone 4: the buyer's round-2 ask is a genuine concession over
+    // its round-1 ask — CONCEDED reciprocity — so the merchant meets it
+    // with a larger-than-baseline concession on round 2. Negotiation
+    // Engine V2: leverage is now also causal on both sides (D1/D2) —
+    // round 1 is unaffected (leverage/round-progression are both
+    // deliberately inert on the opening round, see
+    // computeMerchantConcessionPrice/computeBuyerConcessionPrice's own
+    // doc comments), but round 2's exact values shift accordingly.
+    // Re-verified live via the real orchestrator, not hand-derived.
+    expect(transcript.map((t) => t.buyer.unitPrice)).toEqual([42750, 44128, 44694]);
     // Merchant: gradual concession from its listed-price anchor, closing
     // the moment the buyer's own ceiling is actually met.
     expect(transcript.map((t) => t.merchant.type)).toEqual([
@@ -215,10 +217,11 @@ describe("runNegotiationToCompletion — demo scenario (200 laptops requested, 1
       "counter_offer",
       "accept",
     ]);
-    // Round 1 is unaffected (no prior buyer ask yet -> UNKNOWN -> neutral
-    // 1.0 multiplier, same 45375 as before Milestone 4). Round 2 reflects
-    // the CONCEDED reciprocity bonus (44621 instead of 44719).
-    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([45375, 44621, 44621]);
+    // Round 1 is unaffected (no prior buyer ask yet -> UNKNOWN reciprocity
+    // -> neutral 1.0 multiplier, AND leverage/round-progression both
+    // deliberately inert on the opening round -> same 45375 as before
+    // this milestone). Round 2 reflects reciprocity + leverage together.
+    expect(transcript.map((t) => t.merchant.unitPrice)).toEqual([45375, 44694, 44694]);
 
     // Every merchant counter strictly decreases — genuine gradual
     // concession, not a static repeat.
@@ -1154,29 +1157,31 @@ describe("buyer-initiated quantity-for-price trade through the real orchestrator
     // invariant correctly has nothing to improve on yet (round 1's ask
     // already sat at target), so the buyer's own candidate comparison
     // genuinely selects CONCEDE (the only eligible candidate this round).
+    // Negotiation Engine V2: leverage + round-progression are now genuinely
+    // active from this round onward — re-verified live, not hand-derived.
     expect(transcript[1].buyer.quantity).toBe(50);
     expect(transcript[1].buyer.move).toBe("CONCEDE");
-    expect(transcript[1].buyer.unitPrice).toBe(44403);
-    expect(transcript[1].merchant.unitPrice).toBe(44756);
+    expect(transcript[1].buyer.unitPrice).toBe(44149);
+    expect(transcript[1].merchant.unitPrice).toBe(44753);
 
     // Round 3: NOW the buyer has real room above target (its own round-2
-    // ask, 44403) to construct a genuine improvement — the trade fires.
+    // ask, 44149) to construct a genuine improvement — the trade fires.
     expect(transcript[2].buyer.move).toBe("QUANTITY_FOR_PRICE");
     expect(transcript[2].buyer.quantity).toBe(57);
     expect(transcript[2].buyer.unitPrice).toBe(42465);
-    expect(transcript[2].buyer.unitPrice!).toBeLessThanOrEqual(44403); // never exceeds the buyer's own previous ask
+    expect(transcript[2].buyer.unitPrice!).toBeLessThanOrEqual(44149); // never exceeds the buyer's own previous ask
     // The merchant evaluated the whole package: it authorizes and prices
     // against its REAL stock (52), never the buyer's raw 57-unit ask —
     // the existing, unmodified Milestone 12 quantity-fidelity guarantee.
     expect(transcript[2].merchant.type).toBe("counter_offer");
     expect(transcript[2].merchant.quantity).toBe(52);
-    expect(transcript[2].merchant.unitPrice).toBe(44069);
+    expect(transcript[2].merchant.unitPrice).toBe(44161);
 
     // Round 4: a genuine AGREED close — the trade did not force agreement
     // on its own; the buyer still only accepts once the merchant's own
     // (package-evaluated) offer actually satisfies its ceiling.
     expect(transcript[3].buyer.type).toBe("accept");
-    expect(transcript[3].buyer.unitPrice).toBe(44069);
+    expect(transcript[3].buyer.unitPrice).toBe(44161);
     expect(finalState.status).toBe("AGREED");
 
     // The trade is never used a second time, even though four rounds ran
@@ -1295,29 +1300,43 @@ describe("buyer-initiated delivery-for-price trade through the real orchestrator
     // Negotiation calibration task: deliveryDeadlineDays=8 with
     // urgency="high" now resolves via resolveDeliveryUrgencyFactor
     // ("high"=0.3), not the flat 0.5 every urgency used before — 8 +
-    // round(8*0.3) = 10, not 12. Re-verified against the real
-    // orchestrator (not hand-derived) — the merchant's own package price
-    // shifts too, since its own delivery discount is sized off the
-    // SAME (now smaller) extra-days figure.
+    // round(8*0.3) = 10, not 12.
+    //
+    // Negotiation Engine V2 (D5): the trade's price is now also bounded
+    // by the buyer's own previous price (43225, round 1's opening ask) —
+    // the raw discount math would otherwise have asked for MORE than
+    // that (a real inconsistency the invariant exists to close), so it
+    // clamps down to exactly 43225, identical to round 1. This makes the
+    // trade flat on price this round (all the value is in the delivery
+    // extension alone) — a real, direct consequence of the invariant,
+    // not a defect — and the negotiation takes longer to converge as a
+    // result (the merchant no longer treats this as a big enough
+    // concession to accept quickly). Re-verified against the real
+    // orchestrator, not hand-derived.
     expect(transcript[1].buyer.deliveryDays).toBe(10); // 8 + round(8 * 0.3)
     expect(transcript[1].buyer.quantity).toBe(30); // unchanged — this round's move is delivery, not quantity
-    expect(transcript[1].buyer.unitPrice).toBe(44625);
+    expect(transcript[1].buyer.unitPrice).toBe(43225); // D5: clamped to the buyer's own round-1 price
     // The merchant evaluated the whole package: the countered price
     // reflects a real stock-driven delivery discount on top of the
     // baseline, and honors the buyer's own extended date.
     expect(transcript[1].merchant.type).toBe("counter_offer");
     expect(transcript[1].merchant.deliveryDays).toBe(10);
-    expect(transcript[1].merchant.unitPrice).toBe(45221);
+    expect(transcript[1].merchant.unitPrice).toBe(45721);
 
-    // Round 3: a genuine AGREED close — the trade did not force
-    // agreement on its own.
-    expect(transcript[2].buyer.type).toBe("accept");
-    expect(transcript[2].buyer.unitPrice).toBe(45221);
+    // The negotiation still reaches a genuine AGREED close — D5's tighter
+    // (flatter) trade price means more rounds of ordinary back-and-forth
+    // are needed once the trade itself no longer closes the gap alone,
+    // but convergence is never lost.
+    const last = transcript[transcript.length - 1];
+    expect(last.buyer.type).toBe("accept");
     expect(finalState.status).toBe("AGREED");
 
-    // The delivery chip is never used a second time.
+    // The delivery chip is never used a second time — every round from
+    // the trade onward mirrors the SAME (now 10-day) delivery window,
+    // never a third, escalating value.
     const buyerDeliveryDays = transcript.map((t) => t.buyer.deliveryDays);
-    expect(buyerDeliveryDays.filter((d) => d === 10)).toHaveLength(2); // round 2's trade, then round 3 mirrors it back
+    expect(buyerDeliveryDays[0]).toBe(8); // round 1: the buyer's original deadline, pre-trade
+    expect(buyerDeliveryDays.slice(1).every((d) => d === 10)).toBe(true); // every round from the trade onward
     expect(buyerDeliveryDays.every((d) => d === 8 || d === 10)).toBe(true); // never a third, escalating value
   });
 
@@ -1456,11 +1475,11 @@ describe("real browser scenarios (Milestone 6 regression fixtures)", () => {
     // what the quantity trade would ask for (43032), so the comparator
     // correctly declines the trade in favor of the cheaper ordinary move.
     expect(transcript[1].buyer.quantity).toBe(50); // unchanged — the trade was outranked, not merely skipped
-    expect(transcript[1].buyer.unitPrice).toBe(42750); // held, not traded
-    expect(transcript[1].merchant.unitPrice).toBe(44391);
+    expect(transcript[1].buyer.unitPrice).toBe(42750); // held, not traded — Negotiation Engine V2 leaves buyer HOLD's own price completely unaffected
+    expect(transcript[1].merchant.unitPrice).toBe(44223); // Negotiation Engine V2: round-progression now genuinely active (re-verified live)
 
     expect(transcript[2].buyer.type).toBe("accept");
-    expect(transcript[2].buyer.unitPrice).toBe(44391);
+    expect(transcript[2].buyer.unitPrice).toBe(44223);
     expect(finalState.status).toBe("AGREED");
   });
 
@@ -1540,14 +1559,18 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
       deliveryDeadlineDays: 10,
       urgency: "high",
     };
+    // Negotiation Engine V2: leverage score re-verified live (48, not the
+    // pre-redesign 54 — leverage/round-progression are now genuinely
+    // wired into the ordinary CONCEDE path too, so the round-2 anchor
+    // values below shifted accordingly; not hand-derived).
     const candidates = generateBuyerCandidates(
       constraints,
-      44756, // the real merchant round-2 offer
+      44753, // the real merchant round-2 offer
       50, // the real merchant round-2 offered quantity (full stock covers it)
       { round: 3, maxRounds: 10 },
       {
-        previousBuyerUnitPrice: 44403, // the real buyer round-2 ask
-        leverageScore: 54,
+        previousBuyerUnitPrice: 44149, // the real buyer round-2 ask
+        leverageScore: 48,
         quantityTradeAlreadyUsed: false,
         deliveryTradeAlreadyUsed: false,
       },
@@ -1558,7 +1581,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
 
     const ordinary = candidates.find((c) => c.move === "CONCEDE" || c.move === "HOLD");
     const trade = candidates.find((c) => c.move === "QUANTITY_FOR_PRICE");
-    expect(ordinary?.unitPrice).toBe(44069);
+    expect(ordinary?.unitPrice).toBe(43903);
     expect(trade?.unitPrice).toBe(42465);
     expect(trade!.unitPrice).toBeLessThan(ordinary!.unitPrice);
 
@@ -1599,8 +1622,14 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     expect(candidates.some((c) => c.move === "QUANTITY_FOR_PRICE")).toBe(false); // confirms isolation, not a lucky absence
     const ordinary = candidates.find((c) => c.move === "CONCEDE" || c.move === "HOLD");
     const trade = candidates.find((c) => c.move === "DELIVERY_FOR_PRICE");
-    expect(ordinary?.unitPrice).toBe(45314);
-    expect(trade?.unitPrice).toBe(44625);
+    expect(ordinary?.unitPrice).toBe(45349);
+    // Negotiation Engine V2 (D5): the trade's price is bounded by the
+    // buyer's own previousBuyerUnitPrice (43225, passed above) — the raw
+    // discount math would otherwise ask for more than that, so it clamps
+    // down to exactly 43225. Still a genuine, real DELIVERY_FOR_PRICE
+    // candidate — just one whose value this round is entirely in the
+    // delivery extension, not a further price cut.
+    expect(trade?.unitPrice).toBe(43225);
     expect(trade!.unitPrice).toBeLessThan(ordinary!.unitPrice);
 
     const selected = selectBestBuyerCandidate(candidates, constraints, 30, 8);
@@ -1795,7 +1824,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     // the merchant picks the combined package, whose own reason
     // correctly attributes the value to quantity alone.
     expect(abundantResponse.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
-    expect(abundantResponse.decision.unitPrice).toBe(44745);
+    expect(abundantResponse.decision.unitPrice).toBe(44891);
     expect(
       abundantResponse.decision.reasons.some((r) => r.includes("delivery window offered has little additional value")),
     ).toBe(true);
@@ -1808,7 +1837,7 @@ describe("Milestone 9: strategic move selection — realistic integration scenar
     // existing, unmodified tie-break), using the EXACT SAME candidate
     // generation/selection code path.
     expect(constrainedResponse.move).toBe("DELIVERY_FOR_PRICE");
-    expect(constrainedResponse.decision.unitPrice).toBe(44985);
+    expect(constrainedResponse.decision.unitPrice).toBe(45064);
     expect(
       constrainedResponse.decision.reasons.some((r) => r.includes("extra delivery time offered is genuinely valuable")),
     ).toBe(true);
@@ -1875,7 +1904,7 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     expect(transcript[3].buyer.move).toBeUndefined();
   });
 
-  it("a delivery-for-price round reports move === DELIVERY_FOR_PRICE for BOTH buyer and merchant (reusing the delivery-trade fixture)", async () => {
+  it("a delivery-for-price round reports move === DELIVERY_FOR_PRICE for the buyer, and the merchant's own independently-selected move (reusing the delivery-trade fixture)", async () => {
     const item: CatalogItemSnapshot = {
       sku: "LAPTOP-14-I5",
       listedPrice: 48000,
@@ -1912,10 +1941,18 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     // Negotiation calibration task: 8 + round(8*0.3) = 10 (high urgency) —
     // see the identical, fully re-verified fixture above.
     expect(transcript[1].buyer.deliveryDays).toBe(10);
-    // The merchant independently evaluated and selected the SAME
-    // dimension this round too — both sides' selected moves reach the
-    // transcript, not just the buyer's.
-    expect(transcript[1].merchant.move).toBe("DELIVERY_FOR_PRICE");
+    // Negotiation Engine V2 (D5): the buyer's own delivery-for-price ask
+    // is now clamped to its previous round's price (see the identical
+    // fixture above), so it no longer reads as a real price concession
+    // this round from the merchant's own perspective — the merchant's
+    // independent trade evaluation now finds ordinary concession more
+    // advantageous than matching the buyer's trade, so it reports
+    // CONCEDE rather than mirroring DELIVERY_FOR_PRICE. Both sides'
+    // selected moves still independently reach the transcript — this is
+    // exactly what this test observes; they are simply no longer
+    // guaranteed to be the SAME move once D5's tighter invariant is in
+    // play. Re-verified against the real orchestrator, not hand-derived.
+    expect(transcript[1].merchant.move).toBe("CONCEDE");
   });
 
   it("a HOLD round reports buyer.move === HOLD (reusing the buyer-HOLD fixture)", async () => {
@@ -2137,12 +2174,21 @@ describe("Milestone 10: move observability through the real orchestrator", () =>
     // reciprocity behavior goes HELD, it does not remove HOLD as a
     // strategic option.
     expect(transcript.some((t) => t.merchant.move === "HOLD")).toBe(true);
-    // And the negotiation is never stuck repeating: no two consecutive
-    // exchanges show identical (buyer, merchant) prices, i.e. the
-    // mutual freeze this fix targets never actually completes.
+    // And the negotiation is never stuck repeating DURING actual
+    // back-and-forth counter-offering: no two consecutive counter_offer
+    // exchanges show identical (buyer, merchant) prices, i.e. the mutual
+    // freeze this fix targets never actually completes. The final
+    // "accept" turn is deliberately excluded from this check — an
+    // accept legitimately mirrors whatever price the negotiation just
+    // converged to one round earlier (that repetition IS the successful
+    // close, not a freeze; Negotiation Engine V2's own round-progression
+    // factor now makes the buyer's own price move every counter_offer
+    // round even while merchant HOLD repeats its own price, which is
+    // exactly what this loop is confirming).
     for (let i = 1; i < transcript.length; i++) {
       const prev = transcript[i - 1];
       const cur = transcript[i];
+      if (cur.buyer.type === "accept" || cur.buyer.type === "reject") continue;
       const bothRepeated = cur.buyer.unitPrice !== null && cur.buyer.unitPrice === prev.buyer.unitPrice && cur.merchant.unitPrice !== null && cur.merchant.unitPrice === prev.merchant.unitPrice;
       expect(bothRepeated).toBe(false);
     }
@@ -2268,7 +2314,12 @@ describe("buyer-initiated combined quantity+delivery-for-price package through t
     expect(transcript[1].buyer.move).toBe("DELIVERY_FOR_PRICE");
     expect(transcript[1].buyer.quantity).toBe(40);
     expect(transcript[1].buyer.deliveryDays).toBe(10); // 8 + round(8*0.3), high urgency — delivery math unchanged
-    expect(transcript[1].buyer.unitPrice).toBe(43784);
+    // Negotiation Engine V2 (D5): the trade's price is bounded by the
+    // buyer's own previous price (round 1's own 43130) — the raw
+    // discount math would otherwise have asked for more than that, so it
+    // clamps down to exactly 43130, identical to round 1. Re-verified
+    // against the real orchestrator, not hand-derived.
+    expect(transcript[1].buyer.unitPrice).toBe(43130);
     expect(transcript[1].merchant.quantity).toBe(40);
     expect(transcript[1].merchant.deliveryDays).toBe(10);
 
@@ -2372,7 +2423,7 @@ describe("buyer-initiated combined quantity+delivery-for-price package through t
 // own price (45445 -> 44577) never does. No change to walkAway.ts was
 // needed; this test documents and locks in why.
 describe("Milestone 12: combined package round never falsely triggers repeated-position walk-away", () => {
-  it("the buyer's price can coincidentally repeat (target-clamped) on a combined round, but the merchant's own price never does, so no false walk-away fires", async () => {
+  it("the buyer's price can genuinely repeat (D5-clamped to its own previous offer) on a trade round, but the merchant's own price never does, so no false walk-away fires", async () => {
     const item: CatalogItemSnapshot = {
       sku: "LAPTOP-14-I5",
       listedPrice: 48000,
@@ -2405,19 +2456,18 @@ describe("Milestone 12: combined package round never falsely triggers repeated-p
       10,
     );
 
-    // Buyer Quantity-for-Price Redesign: under the old formula this exact
-    // fixture produced a genuine coincidental buyer-price repeat (the
-    // combined ask clamped to the same target its round-1 opening request
-    // already stated) — re-verified live, that specific coincidence no
-    // longer arises here (the redesigned delivery trade, which now wins
+    // Negotiation Engine V2 (D5): the buyer's delivery trade (which wins
     // this round instead of the combined package — see the describe block
-    // above — asks a genuinely different price than round 1). walkAway.ts
-    // itself is completely unmodified; this test's own regression value
-    // (repeated-position walk-away must never falsely fire, even across
-    // real trade dynamics) is preserved by simply confirming a real
-    // multi-round trajectory with genuinely-changing terms still reaches
-    // AGREED, never an incorrect EXPIRED.
-    expect(transcript[1].buyer.unitPrice).not.toBe(transcript[0].buyer.unitPrice);
+    // above) now deliberately clamps its price to the buyer's own
+    // previous round's price (round 1's opening ask) — so the buyer's own
+    // price DOES coincidentally repeat here, by direct construction of
+    // the D5 invariant, not by coincidence. walkAway.ts itself is
+    // completely unmodified; this test's own regression value (repeated-
+    // position walk-away must never falsely fire) is proven by exactly
+    // this scenario: the buyer's own price repeats for one round while
+    // the merchant's own price keeps moving, and the negotiation still
+    // reaches a genuine AGREED, never an incorrect EXPIRED.
+    expect(transcript[1].buyer.unitPrice).toBe(transcript[0].buyer.unitPrice); // D5: deliberately repeats
     expect(transcript[1].merchant.unitPrice).not.toBe(transcript[0].merchant.unitPrice);
     expect(finalState.status).toBe("AGREED");
   });

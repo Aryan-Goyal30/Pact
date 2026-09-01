@@ -39,6 +39,7 @@ import {
   hasQuantityLeverage,
   resolveDeliveryTrade,
   resolveMerchantStockPressure,
+  resolveLeverageSpeedFactor,
 } from "@/lib/rules/negotiationStrategy";
 import { evaluateMerchantTrade } from "@/lib/rules/merchantTradeEvaluator";
 import { evaluateMerchantDeliveryTrade } from "@/lib/rules/merchantDeliveryTradeEvaluator";
@@ -110,6 +111,21 @@ export function generateMerchantCandidates(
    * runs) — this only makes the PRICE math consistent with it.
    */
   authorizedQuantity: number,
+  /**
+   * Negotiation Engine V2 — the SAME live buyer-vs-merchant leverage
+   * (leverage.ts, itself completely unchanged) already computed once per
+   * round by the orchestrator for the buyer's own decision this round,
+   * simply also read here for the merchant's. Optional and additive:
+   * omitted (or undefined), every price this function computes reduces
+   * to exactly its pre-this-milestone value — leverageSpeedFactor
+   * defaults to a no-op 1.0 (see computeMerchantConcessionPrice's own
+   * doc comment) exactly like reciprocitySpeedMultiplier already does.
+   * Deliberately NOT used to gate HOLD's own eligibility above (section
+   * 5 of the original Milestone 9 spec explicitly forbids that, and
+   * this redesign does not revisit it) — only the PRICE the ordinary
+   * CONCEDE/blind-baseline candidates compute.
+   */
+  leverageScores?: { buyer: number; merchant: number },
 ): MerchantCandidateResult {
   const trade =
     request.deliveryDeadlineDays !== undefined
@@ -117,11 +133,15 @@ export function generateMerchantCandidates(
       : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
 
   const reciprocity = evaluateBuyerReciprocity(request.maxUnitPrice, priorBuyerUnitPrice);
+  const leverageSpeedFactor = leverageScores
+    ? resolveLeverageSpeedFactor(leverageScores.merchant, leverageScores.buyer)
+    : undefined;
 
   const baselineConcessionPrice = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
     ...concessionContext,
     deliveryTradeDiscount: trade.discount,
     reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
+    leverageSpeedFactor,
   });
 
   const candidates: CandidateMove[] = [
@@ -300,6 +320,7 @@ export function generateMerchantCandidates(
     const deliveryBlindBaseline = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
       ...concessionContext,
       reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
+      leverageSpeedFactor,
     });
     const deliveryEvaluation = evaluateMerchantDeliveryTrade(
       item,
@@ -348,6 +369,7 @@ export function generateMerchantCandidates(
     const jointBlindBaseline = computeMerchantConcessionPrice(item, request.maxUnitPrice, {
       ...concessionContext,
       reciprocitySpeedMultiplier: reciprocity.speedMultiplier,
+      leverageSpeedFactor,
     });
     // Milestone 12 correction: same discipline as the solo quantity
     // block above — eligibility (checked before this block) stays keyed

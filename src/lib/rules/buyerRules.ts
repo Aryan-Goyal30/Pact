@@ -10,6 +10,7 @@ import type { NegotiationRequest, ProposedAgreement } from "@/lib/rules/negotiat
 import {
   hasQuantityLeverage,
   resolveUrgencyConcessionFactor,
+  resolveRoundProgressFactor,
   LARGE_ORDER_TARGET_DISCOUNT,
   type UrgencyLevel,
 } from "@/lib/rules/negotiationStrategy";
@@ -230,6 +231,19 @@ export interface BuyerConcessionContext {
   /** Which buyer response this is, 1-indexed — the opening request is round 1. */
   round: number;
   maxRounds: number;
+  /**
+   * Negotiation Engine V2 — an already-resolved multiplier from
+   * negotiationStrategy.resolveLeverageSpeedFactor(buyerLeverage,
+   * merchantLeverage), reflecting the buyer's OWN leverage relative to
+   * the merchant's this round. Defaults to 1.0 (a complete no-op) when
+   * omitted — every caller that predates this option (including every
+   * existing test) behaves exactly as before. Computed by the caller
+   * (buyerMoveSelector.ts), never re-derived here — this function stays
+   * a pure formula over already-resolved numbers, the same discipline
+   * negotiationEngine.ts's own reciprocitySpeedMultiplier already
+   * established for the symmetric merchant-side case.
+   */
+  leverageSpeedFactor?: number;
 }
 
 /**
@@ -277,6 +291,20 @@ export function computeBuyerConcessionPrice(
   }
 
   const urgencyFactor = resolveUrgencyConcessionFactor(constraints.urgency);
-  const conceded = target + ((merchantOfferUnitPrice - target) / 2) * urgencyFactor;
+  // Negotiation Engine V2: leverage (opt-in, see BuyerConcessionContext's
+  // own doc comment) and round progression receive the symmetric
+  // treatment to the merchant side's own combinedSpeed — same outer
+  // clamp band, same "no-op when omitted / at the round-2-of-4 midpoint"
+  // properties. Deliberately inert on round 1, mirroring
+  // computeMerchantConcessionPrice's own opening-round exemption exactly
+  // (this function is never actually called on the buyer's real round 1
+  // in this codebase — buildOpeningRequest/resolveBuyerTarget handles
+  // that directly — but the guard keeps this function correct in
+  // isolation too, never dependent on that calling convention).
+  const isOpeningRound = context.round <= 1;
+  const leverageFactor = isOpeningRound ? 1 : (context.leverageSpeedFactor ?? 1);
+  const roundProgressFactor = isOpeningRound ? 1 : resolveRoundProgressFactor(context.round, context.maxRounds);
+  const combinedFactor = clamp(urgencyFactor * leverageFactor * roundProgressFactor, 0.3, 2.0);
+  const conceded = target + ((merchantOfferUnitPrice - target) / 2) * combinedFactor;
   return clamp(Math.round(conceded), target, constraints.maxUnitPrice);
 }

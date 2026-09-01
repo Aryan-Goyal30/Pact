@@ -325,7 +325,7 @@ describe("runMerchantAgent", () => {
 
       expect(response.decision.outcome).toBe("COUNTER_OFFER");
       expect(response.decision.offeredQuantity).toBe(100);
-      expect(response.decision.unitPrice).toBe(44485);
+      expect(response.decision.unitPrice).toBe(44609); // Negotiation Engine V2: round-progression is now genuinely active from round 2 onward (re-verified live)
       expect(
         response.decision.reasons.some((r) => r.includes("increased its requested quantity from 50 to 100")),
       ).toBe(true);
@@ -454,11 +454,11 @@ describe("runMerchantAgent", () => {
       );
 
       expect(response.decision.offeredQuantity).toBe(100);
-      expect(response.decision.unitPrice).toBe(44485);
+      expect(response.decision.unitPrice).toBe(44609); // Negotiation Engine V2: round-progression is now genuinely active from round 2 onward (re-verified live)
       expect(response.offer).toEqual({
         sku: item.sku,
         quantity: 100,
-        unitPrice: 44485,
+        unitPrice: 44609,
         deliveryDays: item.standardDeliveryDays,
       });
     });
@@ -498,7 +498,7 @@ describe("runMerchantAgent", () => {
 
       expect(response.decision.outcome).toBe("COUNTER_OFFER");
       expect(response.decision.deliveryDays).toBe(12);
-      expect(response.decision.unitPrice).toBe(45055);
+      expect(response.decision.unitPrice).toBe(45101);
       expect(
         response.decision.reasons.some((r) => r.includes("offered a longer delivery window (from 8 to 12")),
       ).toBe(true);
@@ -622,7 +622,7 @@ describe("runMerchantAgent", () => {
       );
 
       expect(response.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
-      expect(response.decision.unitPrice).toBe(44875);
+      expect(response.decision.unitPrice).toBe(44960);
       expect(
         response.decision.reasons.some(
           (r) => r.includes("increased its requested quantity") && r.includes("offered a longer delivery window"),
@@ -934,7 +934,7 @@ describe("Milestone 10: move observability (MerchantAgentResponse.move)", () => 
       { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
     );
     expect(response.move).toBe("QUANTITY_FOR_PRICE");
-    expect(response.decision.unitPrice).toBe(44345);
+    expect(response.decision.unitPrice).toBe(44443); // Negotiation Engine V2: round-progression now genuinely active (re-verified live)
   });
 
   it("a delivery-for-price trade round reports move === DELIVERY_FOR_PRICE", async () => {
