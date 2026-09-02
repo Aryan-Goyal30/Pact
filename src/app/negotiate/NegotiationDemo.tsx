@@ -9,6 +9,7 @@ import type {
   NegotiationTurnResponse,
   PersistedAgreementDTO,
 } from "@/types/negotiation";
+import type { AgentDecisionRecord, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import {
   buyerThinkingLabel,
@@ -47,6 +48,8 @@ interface TranscriptTurn {
   buyer: NegotiationMessageDTO | null;
   merchant: NegotiationMessageDTO | null;
   leverage: LeverageScoreDTO | null;
+  /** Agentic Decision + Audit Trail: both sides' captured deterministic decisions for this round — see agentDecision.ts. Null until the turn is fully revealed (alongside merchant/leverage), or when the server genuinely made no agent decision this round (a structural walk-away). */
+  decisionAudit: TurnDecisionAudit | null;
 }
 
 interface NegotiationDemoProps {
@@ -177,7 +180,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
         await delay(REVEAL_DELAY_MS);
         setTranscript((prev) => [
           ...prev,
-          { turn: turn.turn, buyer: turn.buyer, merchant: null, leverage: null },
+          { turn: turn.turn, buyer: turn.buyer, merchant: null, leverage: null, decisionAudit: null },
         ]);
 
         // Then show the merchant "thinking" before revealing its response
@@ -192,7 +195,9 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
 
         setTranscript((prev) =>
           prev.map((t) =>
-            t.turn === turn.turn ? { ...t, merchant: turn.merchant, leverage: turn.leverage } : t,
+            t.turn === turn.turn
+              ? { ...t, merchant: turn.merchant, leverage: turn.leverage, decisionAudit: turn.decisionAudit ?? null }
+              : t,
           ),
         );
         setRound(turn.round);
@@ -427,6 +432,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
                 <div className="flex flex-col gap-3">
                   <MessageBubble side="buyer" msg={turn.buyer} />
                   <MessageBubble side="merchant" msg={turn.merchant} />
+                  <AgentDecisionPanel decisionAudit={turn.decisionAudit} />
                 </div>
               </li>
             ))}
@@ -735,6 +741,88 @@ function MessageBubble({
           <dd>{msg.deliveryDays !== null ? `${msg.deliveryDays} day(s)` : "—"}</dd>
         </div>
       </dl>
+    </div>
+  );
+}
+
+/**
+ * Agentic Decision + Audit Trail (first layer): a concise, per-round view
+ * of WHY each side chose HOLD / CONCEDE / a trade — deterministic
+ * reasons and strategic factors the rule engine already computed (see
+ * agentDecision.ts), never the LLM's own reasoning and never hidden
+ * chain-of-thought (the LLM never even sees this data — see
+ * buyerAgent.ts / merchantAgent.ts). Renders nothing when there's
+ * nothing to show (a structural walk-away closed before either agent
+ * made a fresh decision this round).
+ */
+function AgentDecisionPanel({ decisionAudit }: { decisionAudit: TurnDecisionAudit | null }) {
+  if (!decisionAudit) {
+    return null;
+  }
+
+  return (
+    <details className="rounded-lg border border-dashed border-black/[.1] px-3 py-2 text-xs dark:border-white/[.15]">
+      <summary className="cursor-pointer select-none font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+        Agent activity
+      </summary>
+      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <AgentDecisionSide label="Buyer" record={decisionAudit.buyer} />
+        <AgentDecisionSide label="Merchant" record={decisionAudit.merchant ?? null} />
+      </div>
+    </details>
+  );
+}
+
+function AgentDecisionSide({ label, record }: { label: string; record: AgentDecisionRecord | null }) {
+  if (!record) {
+    return (
+      <div className="text-zinc-400 dark:text-zinc-600">
+        <p className="font-semibold">{label}</p>
+        <p>No fresh decision this round.</p>
+      </div>
+    );
+  }
+
+  const reasons = [...record.deterministicReasons, ...record.strategicReasons];
+
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="flex items-center gap-1.5 font-semibold text-zinc-700 dark:text-zinc-300">
+        {label}
+        {record.move && (
+          <span
+            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(record.move)}`}
+          >
+            {negotiationMoveLabel(record.move)}
+          </span>
+        )}
+      </p>
+      {record.sufficiency && (
+        <p className="text-zinc-500 dark:text-zinc-500">Quantity sufficiency: {record.sufficiency.verdict}</p>
+      )}
+      {reasons.length > 0 ? (
+        <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
+          {reasons.map((reason, i) => (
+            <li key={i}>{reason}</li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-zinc-400 dark:text-zinc-600">No additional factors this round.</p>
+      )}
+      {record.candidates && record.candidates.length > 1 && (
+        <details>
+          <summary className="cursor-pointer text-zinc-400 dark:text-zinc-600">
+            {record.candidates.length} option(s) considered
+          </summary>
+          <ul className="mt-1 list-disc pl-4 text-zinc-500 dark:text-zinc-500">
+            {record.candidates.map((candidate, i) => (
+              <li key={i}>
+                {negotiationMoveLabel(candidate.move)}: {formatInr(candidate.unitPrice)}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

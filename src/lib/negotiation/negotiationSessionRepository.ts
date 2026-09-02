@@ -19,6 +19,22 @@ import type {
 } from "@/lib/negotiation/protocol";
 import type { NegotiationMessageDTO } from "@/types/negotiation";
 
+/**
+ * Agentic Decision + Audit Trail (first layer): the event type recorded
+ * in the EXISTING AuditLog table (see agreementRepository.ts /
+ * paymentRepository.ts for the same convention — a named
+ * AUDIT_EVENT_* constant plus a JSON `payload`) whenever a turn carries
+ * a decisionAudit. Deliberately reuses AuditLog rather than adding new
+ * NegotiationMessage columns — no schema migration needed. The payload
+ * is `turn.decisionAudit` (NegotiationTurnResult) plus the turn number,
+ * a self-contained snapshot: both sides' deterministic move/reasons/
+ * sufficiency/candidates-considered and the leverage they were made
+ * against — see agentDecision.ts for the full shape. Never written when
+ * decisionAudit is absent (a structural walk-away, where neither agent
+ * made a decision this round at all) — nothing fabricated to fill the gap.
+ */
+export const AUDIT_EVENT_NEGOTIATION_DECISION = "NEGOTIATION_DECISION";
+
 /** Creates a new OPEN session and returns its id. Executes no turns. */
 export async function createNegotiationSession(
   sku: string,
@@ -121,6 +137,22 @@ export async function persistNegotiationTurn(
           : null,
       },
     }),
+    // Agentic Decision + Audit Trail: same transaction as the messages
+    // it describes, so a session can never end up with a turn but a
+    // missing (or orphaned) decision record. Only written when this
+    // turn actually carries one — see AUDIT_EVENT_NEGOTIATION_DECISION's
+    // own doc comment.
+    ...(turn.decisionAudit
+      ? [
+          prisma.auditLog.create({
+            data: {
+              eventType: AUDIT_EVENT_NEGOTIATION_DECISION,
+              sessionId,
+              payload: JSON.stringify({ turn: turnNumber, ...turn.decisionAudit }),
+            },
+          }),
+        ]
+      : []),
   ]);
 
   return { turnNumber };

@@ -1098,3 +1098,62 @@ describe("Milestone 10: move observability (MerchantAgentResponse.move)", () => 
     expect(response.move).toBe("CONCEDE");
   });
 });
+
+// Agentic Decision + Audit Trail (first layer): agentDecision mirrors
+// the same already-proven scenarios above — it never changes what move
+// was picked or what price resulted, only captures it alongside the
+// candidates genuinely compared and the deterministic reasons behind
+// the pick.
+describe("runMerchantAgent — agentDecision (Agentic Decision + Audit Trail)", () => {
+  beforeEach(() => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+  });
+
+  it("captures move === HOLD, the real candidates considered, and terms matching the decision", async () => {
+    const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+    const response = await runMerchantAgent(
+      scarce,
+      { sku: item.sku, quantity: 300, maxUnitPrice: 44100 },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+    );
+
+    expect(response.agentDecision.side).toBe("merchant");
+    expect(response.agentDecision.move).toBe("HOLD");
+    expect(response.agentDecision.candidates).toBeDefined();
+    expect(response.agentDecision.candidates!.some((c) => c.move === "HOLD")).toBe(true);
+    expect(response.agentDecision.terms).toEqual({
+      quantity: response.decision.offeredQuantity,
+      unitPrice: response.decision.unitPrice,
+      deliveryDays: response.decision.deliveryDays,
+    });
+  });
+
+  it("captures move === CONCEDE with the winning candidate's own reason as a deterministic reason", async () => {
+    const response = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+      { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      44000,
+    );
+
+    expect(response.agentDecision.move).toBe("CONCEDE");
+    expect(response.agentDecision.terms.unitPrice).toBe(45638);
+    // Merchant has no separate strategic-factor concept (unlike buyer) —
+    // strategicReasons is always empty, never fabricated.
+    expect(response.agentDecision.strategicReasons).toEqual([]);
+    expect(response.agentDecision.deterministicReasons.length).toBeGreaterThan(0);
+  });
+
+  it("has no move/candidates on a single-shot call — no candidate selection ran, nothing to report", async () => {
+    const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10, maxUnitPrice: 45000 });
+
+    expect(response.agentDecision.side).toBe("merchant");
+    expect(response.agentDecision.move).toBeUndefined();
+    expect(response.agentDecision.candidates).toBeUndefined();
+    expect(response.agentDecision.terms).toEqual({
+      quantity: response.decision.offeredQuantity,
+      unitPrice: response.decision.unitPrice,
+      deliveryDays: response.decision.deliveryDays,
+    });
+  });
+});

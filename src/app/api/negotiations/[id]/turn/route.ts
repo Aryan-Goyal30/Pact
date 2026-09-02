@@ -208,6 +208,7 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
       maxRounds: turn.state.maxRounds,
       agreement,
       leverage: toLeverageDTO(turn.leverage),
+      decisionAudit: turn.decisionAudit,
     };
     return jsonResponse(response, 200);
   } catch (error) {

@@ -21,10 +21,11 @@ import {
   resolveDeliveryTrade,
 } from "@/lib/rules/negotiationStrategy";
 import { generateMerchantCandidates, selectBestMerchantCandidate } from "@/lib/rules/merchantMoveSelection";
-import type { CandidateMoveType } from "@/lib/rules/candidateMove";
+import type { CandidateMove, CandidateMoveType } from "@/lib/rules/candidateMove";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/provider";
+import type { AgentDecisionRecord } from "@/lib/negotiation/agentDecision";
 
 export interface MerchantAgentOffer {
   sku: string;
@@ -52,6 +53,16 @@ export interface MerchantAgentResponse {
    * to build `decision.reasons`, never recomputed here.
    */
   move?: CandidateMoveType;
+  /**
+   * Agentic Decision + Audit Trail (first layer): a captured snapshot of
+   * this same response's own decision (move, decision.reasons, the
+   * candidates considered) — assembled once, here, so orchestrator.ts and
+   * the persistence/UI layers have one uniform shape to consume instead
+   * of reconstructing it from `decision`/`move` individually. Never
+   * derived from anything OTHER than those existing fields — purely
+   * observational.
+   */
+  agentDecision: AgentDecisionRecord;
 }
 
 const MERCHANT_SYSTEM_PROMPT = `You are PACT's Merchant Agent, communicating with an AI buyer agent on behalf of the merchant.
@@ -187,7 +198,7 @@ function applyMerchantConcession(
    * exactly as before this parameter existed.
    */
   catalogListedPrice?: number,
-): { decision: NegotiationResult; move?: CandidateMoveType } {
+): { decision: NegotiationResult; move?: CandidateMoveType; candidates?: CandidateMove[] } {
   if (
     request.maxUnitPrice === undefined ||
     request.maxUnitPrice >= item.listedPrice ||
@@ -234,7 +245,7 @@ function applyMerchantConcession(
     // so there's nothing to override. The move itself is real and must
     // still be reported — this is exactly the early-return gap flagged
     // in the Milestone 10 design review.
-    return { decision, move: selected.move };
+    return { decision, move: selected.move, candidates };
   }
 
   const quantityIncreasedFromPrior =
@@ -309,7 +320,11 @@ function applyMerchantConcession(
       ),
     );
 
-  return { decision: { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons }, move: selected.move };
+  return {
+    decision: { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons },
+    move: selected.move,
+    candidates,
+  };
 }
 
 /**
@@ -433,6 +448,7 @@ export async function runMerchantAgent(
 
   let decision = evaluateNegotiationRequest(effectiveItem, request);
   let move: CandidateMoveType | undefined;
+  let candidates: CandidateMove[] | undefined;
   if (effectiveItem && concessionContext) {
     const concession = applyMerchantConcession(
       effectiveItem,
@@ -449,7 +465,25 @@ export async function runMerchantAgent(
     );
     decision = concession.decision;
     move = concession.move;
+    candidates = concession.candidates;
   }
+
+  // Agentic Decision + Audit Trail (first layer): a captured snapshot of
+  // this same decision (decision.reasons is the merchant's own
+  // deterministic "why" — never LLM-authored; merchant has no separate
+  // strategicReasons concept the way the buyer does, so that field stays
+  // empty here). `candidates` is only ever present once the real
+  // candidate comparison ran (applyMerchantConcession) — undefined for
+  // REJECTED, EXACT_MATCH, or a caller without a round context, exactly
+  // like `move` already is.
+  const agentDecision: AgentDecisionRecord = {
+    side: "merchant",
+    move,
+    deterministicReasons: decision.reasons,
+    strategicReasons: [],
+    candidates,
+    terms: { quantity: decision.offeredQuantity, unitPrice: decision.unitPrice, deliveryDays: decision.deliveryDays },
+  };
 
   const context = {
     ...toPublicContext(decision),
@@ -503,6 +537,7 @@ export async function runMerchantAgent(
     offer: toOffer(decision),
     message,
     move,
+    agentDecision,
   };
 }
 

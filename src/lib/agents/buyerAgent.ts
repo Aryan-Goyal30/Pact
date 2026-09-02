@@ -34,6 +34,8 @@ import {
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
+import type { AgentDecisionRecord } from "@/lib/negotiation/agentDecision";
+import type { CandidateMove } from "@/lib/rules/candidateMove";
 import { HOLD_LEVERAGE_THRESHOLD, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
 import type { BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
 import type { BuyerDeliveryTradeMove } from "@/lib/rules/buyerDeliveryTrade";
@@ -100,6 +102,16 @@ export interface BuyerAgentResponse {
    * context).
    */
   sufficiency: QuantitySufficiencyDecision | null;
+  /**
+   * Agentic Decision + Audit Trail (first layer): a captured snapshot of
+   * this same response's own decision fields above (move/tradeMove/
+   * strategicReasons/sufficiency), plus the candidates considered —
+   * assembled once, here, so orchestrator.ts and the persistence/UI
+   * layers have one uniform shape to consume instead of reconstructing
+   * it from the individual fields above. Never derived from anything
+   * OTHER than those existing fields — purely observational.
+   */
+  agentDecision: AgentDecisionRecord;
 }
 
 /**
@@ -216,6 +228,8 @@ function buildResponseToMerchantOffer(
   moveReason: string | null;
   tradeMove: BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove | null;
   sufficiency: QuantitySufficiencyDecision | null;
+  /** Agentic Decision + Audit Trail: every candidate move genuinely considered this round (buyerMoveSelection.ts), not just the winner — undefined whenever no candidate comparison happened (see AgentDecisionRecord.candidates's own doc comment). */
+  candidates?: CandidateMove[];
 } {
   if (
     merchantResult.outcome === "REJECTED" ||
@@ -440,6 +454,7 @@ function buildResponseToMerchantOffer(
       ? (selected.move as BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove)
       : "NO_TRADE",
     sufficiency,
+    candidates,
   };
 }
 
@@ -504,7 +519,7 @@ export async function runBuyerAgent(
   concessionContext?: BuyerConcessionContext,
   strategyContext?: BuyerStrategyContext,
 ): Promise<BuyerAgentResponse> {
-  const { action, validation, move, moveReason, tradeMove, sufficiency } =
+  const { action, validation, move, moveReason, tradeMove, sufficiency, candidates } =
     merchantResult === null
       ? {
           action: buildOpeningRequest(constraints, manifestProduct, concessionContext),
@@ -513,6 +528,7 @@ export async function runBuyerAgent(
           moveReason: null,
           tradeMove: null,
           sufficiency: null,
+          candidates: undefined,
         }
       : buildResponseToMerchantOffer(
           constraints,
@@ -541,14 +557,12 @@ export async function runBuyerAgent(
   // already-computed strings this round's LLM context includes.
   const isFirstReactiveRound = !concessionContext || concessionContext.round <= 2;
   const buyerFactors = explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft);
+  const relevantBuyerFactors = buyerFactors.filter(
+    (reason) => isFirstReactiveRound || reason.startsWith("Few negotiation rounds remain"),
+  );
   const strategicReasons =
     action.type === "request" || action.type === "counter_offer"
-      ? [
-          ...buyerFactors.filter(
-            (reason) => isFirstReactiveRound || reason.startsWith("Few negotiation rounds remain"),
-          ),
-          ...(moveReason ? [moveReason] : []),
-        ]
+      ? [...relevantBuyerFactors, ...(moveReason ? [moveReason] : [])]
       : // Milestone 6: an "accept" is explainable too when it followed a
         // real sufficiency judgment (a genuine shortfall the buyer
         // decided was acceptable) — never populated merely because
@@ -557,6 +571,27 @@ export async function runBuyerAgent(
         action.type === "accept" && sufficiency && sufficiency.shortfallFraction > 0
         ? [sufficiency.reason]
         : [];
+
+  // Agentic Decision + Audit Trail (first layer): a captured snapshot of
+  // this same decision, kept SEPARATE from strategicReasons above (which
+  // exists purely to feed the LLM prompt and stays completely unchanged)
+  // — deterministicReasons is just the winning candidate's own rationale
+  // (moveReason), never the urgency/leverage factors; strategicReasons
+  // here is the pure factor list, never mixed with moveReason the way
+  // the LLM-facing field above deliberately is. `candidates` is only
+  // ever present on a counter_offer that reached the real candidate
+  // comparison (buildResponseToMerchantOffer) — undefined for the
+  // opening request, an accept/reject, or a caller without a round
+  // context, exactly like `move`/`tradeMove` already are.
+  const agentDecision: AgentDecisionRecord = {
+    side: "buyer",
+    move: tradeMove && tradeMove !== "NO_TRADE" ? tradeMove : (move ?? undefined),
+    deterministicReasons: moveReason ? [moveReason] : [],
+    strategicReasons: relevantBuyerFactors,
+    sufficiency: sufficiency ?? undefined,
+    candidates,
+    terms: { quantity: action.quantity, unitPrice: action.unitPrice, deliveryDays: action.deliveryDays },
+  };
 
   // The block the LLM must treat as immutable fact — every number here
   // is what checkAgentMessageIntegrity requires the final message to
@@ -635,7 +670,7 @@ export async function runBuyerAgent(
     }
   }
 
-  return { action, validation, message, strategicReasons, move, tradeMove, sufficiency };
+  return { action, validation, message, strategicReasons, move, tradeMove, sufficiency, agentDecision };
 }
 
 /**

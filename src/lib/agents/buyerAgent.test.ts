@@ -1058,6 +1058,115 @@ describe("runBuyerAgent — quantity sufficiency (partial fulfillment is not aut
   });
 });
 
+// Agentic Decision + Audit Trail (first layer): agentDecision is a
+// captured snapshot of fields this response ALREADY exposes (move,
+// tradeMove, sufficiency) plus the candidates considered — never a new
+// decision. These tests prove the capture is faithful, not that any
+// negotiation behavior changed (the response's own pre-existing fields,
+// asserted throughout every describe block above, are the proof of
+// that).
+describe("runBuyerAgent — agentDecision (Agentic Decision + Audit Trail)", () => {
+  const stuckMerchantResult: NegotiationResult = {
+    outcome: "COUNTER_OFFER",
+    sku: "LAPTOP-14-I5",
+    requestedQuantity: 200,
+    offeredQuantity: 200,
+    unitPrice: 46500,
+    deliveryDays: 10,
+    reasons: [],
+  };
+
+  it("has no move/candidates on the opening request — nothing was decided yet, only proposed", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(constraints, manifestProduct, null, { round: 1, maxRounds: 8 });
+
+    expect(response.agentDecision.side).toBe("buyer");
+    expect(response.agentDecision.move).toBeUndefined();
+    expect(response.agentDecision.candidates).toBeUndefined();
+    expect(response.agentDecision.terms).toEqual({
+      quantity: response.action.quantity,
+      unitPrice: response.action.unitPrice,
+      deliveryDays: response.action.deliveryDays,
+    });
+  });
+
+  it("captures move === HOLD and the real candidates considered, for the exact same HOLD round proven above", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 },
+    );
+
+    expect(response.move).toBe("HOLD"); // pre-existing field, unaffected
+    expect(response.agentDecision.move).toBe("HOLD");
+    expect(response.agentDecision.terms.unitPrice).toBe(43700);
+    // At least one real candidate (HOLD) was genuinely considered —
+    // never fabricated when the real comparison ran.
+    expect(response.agentDecision.candidates).toBeDefined();
+    expect(response.agentDecision.candidates!.length).toBeGreaterThan(0);
+    expect(response.agentDecision.candidates!.some((c) => c.move === "HOLD")).toBe(true);
+  });
+
+  it("deterministicReasons and strategicReasons are genuinely separate — strategicReasons never includes the winning candidate's own reason", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 },
+    );
+
+    // strategicReasons (the pre-existing, LLM-facing field) DOES fold the
+    // winning candidate's own reason in — that's unchanged, existing
+    // behavior (see runBuyerAgent's own comment on why).
+    // agentDecision keeps the two apart: deterministicReasons is ONLY
+    // the winning candidate's own reason; agentDecision.strategicReasons
+    // is ONLY the broader factor list, never mixed with it.
+    for (const reason of response.agentDecision.strategicReasons) {
+      expect(response.agentDecision.deterministicReasons).not.toContain(reason);
+    }
+  });
+
+  it("captures sufficiency exactly as the pre-existing field reports it", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+    const shortfallConstraints: BuyerConstraints = {
+      sku: "LAPTOP-14-I5",
+      quantity: 150,
+      maxUnitPrice: 47000,
+      deliveryDeadlineDays: 10,
+      urgency: "medium",
+    };
+    const partialResult: NegotiationResult = {
+      outcome: "PARTIAL_FULFILLMENT",
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 150,
+      offeredQuantity: 145, // a 3% shortfall — within tolerance
+      unitPrice: 46950,
+      deliveryDays: 10,
+      reasons: [],
+    };
+
+    const response = await runBuyerAgent(shortfallConstraints, manifestProduct, partialResult, {
+      round: 2,
+      maxRounds: 10,
+    });
+
+    expect(response.sufficiency).not.toBeNull();
+    expect(response.agentDecision.sufficiency).toEqual({
+      verdict: response.sufficiency!.verdict,
+      shortfallFraction: response.sufficiency!.shortfallFraction,
+      reason: response.sufficiency!.reason,
+    });
+  });
+});
+
 // PACT V2 Milestone 2: the buyer's deterministic walk-away decision.
 describe("runBuyerWalkAway", () => {
   it("the message states the buyer's own maximum budget and the merchant's offer that exceeded it", async () => {

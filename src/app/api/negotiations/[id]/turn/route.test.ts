@@ -10,7 +10,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { prisma } from "@/lib/prisma";
 import { AUDIT_EVENT_AGREEMENT_CREATED } from "@/lib/negotiation/agreementRepository";
-import { createNegotiationSession } from "@/lib/negotiation/negotiationSessionRepository";
+import {
+  AUDIT_EVENT_NEGOTIATION_DECISION,
+  createNegotiationSession,
+} from "@/lib/negotiation/negotiationSessionRepository";
 import { getLlmProvider } from "@/lib/llm/provider";
 import { POST } from "./route";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
@@ -304,5 +307,60 @@ describe("POST /api/negotiations/:id/turn — Milestone 10: move observability",
     // Confirms JSON omission, not a serialized `"move":null`.
     const raw = JSON.stringify(closing.body.buyer);
     expect(raw).not.toContain("move");
+  });
+});
+
+describe("POST /api/negotiations/:id/turn — Agentic Decision + Audit Trail", () => {
+  it("the HTTP response carries decisionAudit with both sides' decisions, and a matching AuditLog row is persisted", async () => {
+    const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
+
+    const first = await callTurn(sessionId); // turn 1: ordinary counter_offer — both agents ran
+
+    expect(first.body.decisionAudit).toBeDefined();
+    expect(first.body.decisionAudit!.buyer.side).toBe("buyer");
+    expect(first.body.decisionAudit!.merchant?.side).toBe("merchant");
+    expect(first.body.decisionAudit!.leverage).toEqual(first.body.leverage);
+
+    const rows = await prisma.auditLog.findMany({
+      where: { sessionId, eventType: AUDIT_EVENT_NEGOTIATION_DECISION },
+    });
+    expect(rows).toHaveLength(1);
+    const payload = JSON.parse(rows[0].payload) as { turn: number; buyer: { side: string } };
+    expect(payload.turn).toBe(1);
+    expect(payload.buyer.side).toBe("buyer");
+  });
+
+  it("carries only the buyer's decision on a plain-accept close, and persists exactly one AuditLog row per turn (never for the accept round itself)", async () => {
+    const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
+
+    await callTurn(sessionId); // turn 1: counter_offer — both agents ran
+    const closing = await callTurn(sessionId); // turn 2: AGREED via a plain accept — merchant never ran
+
+    expect(closing.body.status).toBe("AGREED");
+    expect(closing.body.decisionAudit).toBeDefined();
+    expect(closing.body.decisionAudit!.buyer.side).toBe("buyer");
+    expect(closing.body.decisionAudit!.merchant).toBeUndefined();
+
+    // Both turns carried a genuine buyer decision, so both wrote a row —
+    // proves the accept round's audit row is written too, distinctly
+    // from turn 1's, not merely that persistence happens at all.
+    const rows = await prisma.auditLog.findMany({
+      where: { sessionId, eventType: AUDIT_EVENT_NEGOTIATION_DECISION },
+      orderBy: { createdAt: "asc" },
+    });
+    expect(rows).toHaveLength(2);
+  });
+
+  it("a repeated POST after AGREED replays without writing a second AuditLog row for the same closing turn", async () => {
+    const sessionId = await createTestSession(AGREEING_CONSTRAINTS);
+
+    await callTurn(sessionId); // turn 1
+    await callTurn(sessionId); // turn 2: AGREED
+    await callTurn(sessionId); // replay — no new orchestrator turn
+
+    const rows = await prisma.auditLog.findMany({
+      where: { sessionId, eventType: AUDIT_EVENT_NEGOTIATION_DECISION },
+    });
+    expect(rows).toHaveLength(2); // unchanged from the two genuine turns above
   });
 });

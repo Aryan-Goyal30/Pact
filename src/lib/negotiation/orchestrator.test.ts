@@ -2489,6 +2489,157 @@ describe("Milestone 12: combined package round never falsely triggers repeated-p
 // availability — this proves it end to end through the real
 // orchestrator, not just buyerAgent.ts/merchantAgent.ts's own isolated
 // unit tests.
+// Agentic Decision + Audit Trail (first layer): decisionAudit is an
+// additive, observational snapshot — these tests prove it is present
+// with both sides' captured decisions whenever both agents genuinely
+// ran this round, present with only the buyer when only the buyer
+// decided (accept), and absent entirely when neither agent ran at all
+// (a structural walk-away, detected before any agent call). None of
+// these assert anything about the negotiated terms themselves — those
+// are already covered by the pinned-value tests throughout this file,
+// which all still pass unmodified.
+describe("decisionAudit (Agentic Decision + Audit Trail)", () => {
+  it("is present with both sides' decisions on an ordinary round where both agents ran", async () => {
+    const state = createNegotiationState(4);
+    const turn = await runNegotiationTurn(demoContext(), state, null);
+
+    expect(turn.decisionAudit).toBeDefined();
+    expect(turn.decisionAudit!.buyer.side).toBe("buyer");
+    expect(turn.decisionAudit!.merchant?.side).toBe("merchant");
+    expect(turn.decisionAudit!.leverage).toEqual({
+      buyer: turn.leverage.buyerLeverage,
+      merchant: turn.leverage.merchantLeverage,
+      reasons: turn.leverage.reasons,
+    });
+  });
+
+  it("carries only the buyer's decision when the buyer closes by accepting — the merchant never ran this round", async () => {
+    // Reuses the exact fixture from "a negotiation that closes on the
+    // buyer's accept makes zero LLM calls for that final round" above.
+    const generousBudget: NegotiationContext = {
+      item: laptop,
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: { ...demoBuyerConstraints, quantity: 10, maxUnitPrice: 47500 },
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(generousBudget, 6);
+
+    expect(finalState.status).toBe("AGREED");
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("accept");
+    expect(closingTurn.decisionAudit).toBeDefined();
+    expect(closingTurn.decisionAudit!.buyer.side).toBe("buyer");
+    expect(closingTurn.decisionAudit!.merchant).toBeUndefined();
+  });
+
+  it("is present with both sides' decisions on an EXACT_MATCH merchant accept", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: laptop,
+        manifestProduct: laptopManifestListing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 90000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+
+    expect(finalState.status).toBe("AGREED");
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.decisionAudit).toBeDefined();
+    expect(closingTurn.decisionAudit!.buyer.side).toBe("buyer");
+    expect(closingTurn.decisionAudit!.merchant?.side).toBe("merchant");
+  });
+
+  it("is absent entirely on a structural (price-gap-unbridgeable) walk-away — neither agent ran this round", async () => {
+    const laptop2: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const laptop2Listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 30000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+    // Round 1 genuinely ran both agents (the merchant's real,
+    // floor-clamped counter) — decisionAudit is present there.
+    expect(transcript[0].decisionAudit).toBeDefined();
+    // The closing round is the structural walk-away itself: detected
+    // BEFORE either agent runs, so nothing was decided this round.
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("reject");
+    expect(closingTurn.decisionAudit).toBeUndefined();
+  });
+
+  it("is present with both sides' decisions on a detected repeated-position walk-away — both agents had already run before the deadlock was found", async () => {
+    mockedArePositionsRepeated.mockReturnValueOnce(true);
+
+    const laptop2: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const laptop2Listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const state = { status: "COUNTERED" as const, round: 2, maxRounds: 6 };
+    const previousMerchantResult = {
+      outcome: "COUNTER_OFFER" as const,
+      sku: "LAPTOP-14-I5",
+      requestedQuantity: 10,
+      offeredQuantity: 10,
+      unitPrice: 47000,
+      deliveryDays: 5,
+      reasons: [],
+    };
+
+    const turn = await runNegotiationTurn(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 46000, deliveryDeadlineDays: 10 },
+      },
+      state,
+      previousMerchantResult,
+      44000,
+    );
+
+    expect(turn.state.status).toBe("EXPIRED");
+    expect(turn.buyer.type).toBe("reject");
+    expect(turn.decisionAudit).toBeDefined();
+    expect(turn.decisionAudit!.buyer.side).toBe("buyer");
+    expect(turn.decisionAudit!.merchant?.side).toBe("merchant");
+  });
+});
+
 describe("provider-failure handling: a rate-limited LLM never stops the negotiation", () => {
   it("a negotiation still reaches AGREED, with every message carrying real authoritative numbers, when the LLM provider is rate-limited on every call", async () => {
     mockedGetLlmProvider.mockReturnValue({

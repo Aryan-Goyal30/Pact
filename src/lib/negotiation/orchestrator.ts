@@ -41,6 +41,7 @@ import type { StructuredNegotiationMessage } from "@/lib/negotiation/protocol";
 import { computeLeverage, type LeverageScore } from "@/lib/rules/leverage";
 import { arePositionsRepeated, isPriceGapUnbridgeable, type WalkAwayReason } from "@/lib/rules/walkAway";
 import type { CandidateMoveType } from "@/lib/rules/candidateMove";
+import type { AgentDecisionRecord, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 
 export interface NegotiationContext {
   item: CatalogItemSnapshot;
@@ -56,10 +57,26 @@ export interface NegotiationTurnResult {
   nextMerchantResult: NegotiationResult | null;
   /** Live buyer-vs-merchant leverage score for this turn — see leverage.ts. Recomputed fresh every turn from the same deterministic factors driving the price/quantity/delivery math; never derived from or shown to the LLM. */
   leverage: LeverageScore;
+  /**
+   * Agentic Decision + Audit Trail (first layer): both sides' captured
+   * decision snapshots for this turn (buyerAgent.ts's/merchantAgent.ts's
+   * own agentDecision, lifted here unchanged) plus this turn's leverage,
+   * bundled for persistence/display. Absent only when no agent decision
+   * was genuinely made this round at all — a structural walk-away closed
+   * before either agent ran (see the price-gap-unbridgeable check
+   * below); every other path (including a repeated-position walk-away,
+   * which still runs both agents first) carries at least the buyer's
+   * decision. Never influences `state`/`buyer`/`merchant`/`nextMerchantResult`
+   * above — purely observational.
+   */
+  decisionAudit?: TurnDecisionAudit;
 }
 
-/** The turn result shape before its leverage score is attached — see attachLeverage. */
-type NegotiationTurnResultCore = Omit<NegotiationTurnResult, "leverage">;
+/** The turn result shape before its leverage score (and the decisionAudit it feeds) are attached — see finish(). */
+type NegotiationTurnResultCore = Omit<NegotiationTurnResult, "leverage" | "decisionAudit"> & {
+  buyerDecision?: AgentDecisionRecord;
+  merchantDecision?: AgentDecisionRecord;
+};
 
 const TERMINAL_STATUSES: NegotiationStatus[] = ["AGREED", "REJECTED", "EXPIRED"];
 
@@ -128,6 +145,10 @@ function closeNegotiation(
   accepted: boolean,
   rejectionReasons: string[],
   acceptMessage = "Accepted.",
+  /** Agentic Decision + Audit Trail: the buyer's own captured decision that led to this accept — absent when there is none to report (defensive default, every real caller has one). */
+  buyerDecision?: AgentDecisionRecord,
+  /** Only present when a fresh merchant agent call actually happened this same round (the EXACT_MATCH path) — absent for a buyer accepting a PRIOR round's already-known merchant offer, since no merchant decision was made this round. */
+  merchantDecision?: AgentDecisionRecord,
 ): NegotiationTurnResultCore {
   return {
     state: accepted ? acceptNegotiation(state) : rejectNegotiation(state),
@@ -142,6 +163,8 @@ function closeNegotiation(
       message: accepted ? acceptMessage : rejectionReasons.join(" ") || "Rejected.",
     },
     nextMerchantResult: null,
+    buyerDecision,
+    merchantDecision,
   };
 }
 
@@ -227,7 +250,18 @@ export async function runNegotiationTurn(
       buyerConstraints: context.buyerConstraints,
       currentMerchantUnitPrice: core.merchant.unitPrice,
     });
-    return { ...core, leverage };
+    const { buyerDecision, merchantDecision, ...rest } = core;
+    return {
+      ...rest,
+      leverage,
+      decisionAudit: buyerDecision
+        ? {
+            buyer: buyerDecision,
+            merchant: merchantDecision,
+            leverage: { buyer: leverage.buyerLeverage, merchant: leverage.merchantLeverage, reasons: leverage.reasons },
+          }
+        : undefined,
+    };
   }
 
   // Milestone 2: closes the negotiation as a legitimate walk-away
@@ -240,6 +274,9 @@ export async function runNegotiationTurn(
     reason: WalkAwayReason,
     merchantOfferUnitPrice: number,
     buyerAskUnitPrice: number,
+    /** Agentic Decision + Audit Trail: whichever counter-offer decision each side had already computed THIS round before the deadlock was detected — absent for a structural (price-gap-unbridgeable) walk-away, where neither agent ran this round at all. */
+    buyerDecision?: AgentDecisionRecord,
+    merchantDecision?: AgentDecisionRecord,
   ): Promise<NegotiationTurnResultCore> {
     const [buyerWalkAway, merchantWalkAway] = await Promise.all([
       runBuyerWalkAway(context.buyerConstraints, merchantOfferUnitPrice, reason),
@@ -264,6 +301,8 @@ export async function runNegotiationTurn(
       buyer: walkAwayMessage("buyer", buyerWalkAway.message),
       merchant: walkAwayMessage("merchant", merchantWalkAway.message),
       nextMerchantResult: null,
+      buyerDecision,
+      merchantDecision,
     };
   }
 
@@ -346,6 +385,8 @@ export async function runNegotiationTurn(
         buyerResponse.action,
         agreementCheck.outcome === "ACCEPTED",
         agreementCheck.reasons,
+        undefined,
+        buyerResponse.agentDecision,
       ),
     );
   }
@@ -366,6 +407,7 @@ export async function runNegotiationTurn(
         message: "Negotiation closed without an agreement.",
       },
       nextMerchantResult: null,
+      buyerDecision: buyerResponse.agentDecision,
     });
   }
 
@@ -439,6 +481,8 @@ export async function runNegotiationTurn(
         agreementCheck.outcome === "ACCEPTED",
         agreementCheck.reasons,
         merchantAgentResponse.message,
+        buyerResponse.agentDecision,
+        merchantAgentResponse.agentDecision,
       ),
     );
   }
@@ -462,6 +506,8 @@ export async function runNegotiationTurn(
         "repeated_positions",
         merchantResult.unitPrice as number,
         buyerResponse.action.unitPrice as number,
+        buyerResponse.agentDecision,
+        merchantAgentResponse.agentDecision,
       ),
     );
   }
@@ -480,6 +526,8 @@ export async function runNegotiationTurn(
       move: merchantAgentResponse.move,
     },
     nextMerchantResult: nextState.status === "COUNTERED" ? merchantResult : null,
+    buyerDecision: buyerResponse.agentDecision,
+    merchantDecision: merchantAgentResponse.agentDecision,
   });
 }
 

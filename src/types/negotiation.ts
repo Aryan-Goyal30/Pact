@@ -11,6 +11,7 @@ import type {
 } from "@/lib/negotiation/protocol";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { CandidateMoveType } from "@/lib/rules/candidateMove";
+import type { TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 
 /** The buyer request a client submits to start a negotiation run. */
 export interface NegotiationRunRequest {
@@ -137,4 +138,15 @@ export interface NegotiationTurnResponse {
   agreement: PersistedAgreementDTO | null;
   /** Live leverage score for this turn — see LeverageScoreDTO. */
   leverage: LeverageScoreDTO;
+  /**
+   * Agentic Decision + Audit Trail (first layer): both sides' captured
+   * deterministic decisions this turn (move, reasons, sufficiency,
+   * candidates considered) — see agentDecision.ts. Absent only when no
+   * agent decision was genuinely made this round at all (a structural
+   * walk-away) — never fabricated. Also persisted to AuditLog (see
+   * negotiationSessionRepository.ts) but not yet re-read on the
+   * AGREED-replay path, so a repeated POST after AGREED may omit it even
+   * though the live turn originally carried one.
+   */
+  decisionAudit?: TurnDecisionAudit;
 }
