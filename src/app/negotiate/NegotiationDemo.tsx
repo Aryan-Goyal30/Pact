@@ -760,68 +760,146 @@ function AgentDecisionPanel({ decisionAudit }: { decisionAudit: TurnDecisionAudi
     return null;
   }
 
+  const buyerMove = decisionAudit.buyer.move;
+  const merchantMove = decisionAudit.merchant?.move;
+
   return (
-    <details className="rounded-lg border border-dashed border-black/[.1] px-3 py-2 text-xs dark:border-white/[.15]">
-      <summary className="cursor-pointer select-none font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-        Agent activity
+    <details className="rounded-lg border border-dashed border-black/[.12] px-3 py-2 text-xs dark:border-white/[.18]">
+      {/* Collapsed by default — but the summary line alone already answers
+          "what did each side just do," via the same move badges used on
+          the message bubbles above, so a reader gets the headline without
+          expanding anything. */}
+      <summary className="flex cursor-pointer select-none flex-wrap items-center gap-2 font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+        <span>Agent activity</span>
+        <span className="flex flex-wrap items-center gap-1.5 normal-case tracking-normal">
+          {buyerMove && (
+            <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(buyerMove)}`}>
+              Buyer: {negotiationMoveLabel(buyerMove)}
+            </span>
+          )}
+          {merchantMove && (
+            <span
+              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(merchantMove)}`}
+            >
+              Merchant: {negotiationMoveLabel(merchantMove)}
+            </span>
+          )}
+        </span>
       </summary>
-      <div className="mt-2 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <AgentDecisionSide label="Buyer" record={decisionAudit.buyer} />
-        <AgentDecisionSide label="Merchant" record={decisionAudit.merchant ?? null} />
+      <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <AgentDecisionSide label="Buyer" tone="blue" record={decisionAudit.buyer} />
+        <AgentDecisionSide label="Merchant" tone="amber" record={decisionAudit.merchant ?? null} />
       </div>
     </details>
   );
 }
 
-function AgentDecisionSide({ label, record }: { label: string; record: AgentDecisionRecord | null }) {
+function AgentDecisionSide({
+  label,
+  tone,
+  record,
+}: {
+  label: string;
+  tone: "blue" | "amber";
+  record: AgentDecisionRecord | null;
+}) {
+  const toneClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+
   if (!record) {
     return (
       <div className="text-zinc-400 dark:text-zinc-600">
-        <p className="font-semibold">{label}</p>
+        <p className={`font-semibold ${toneClass}`}>{label}</p>
         <p>No fresh decision this round.</p>
       </div>
     );
   }
 
-  const reasons = [...record.deterministicReasons, ...record.strategicReasons];
+  const { terms } = record;
+  const hasTerms = terms.quantity !== null || terms.unitPrice !== null || terms.deliveryDays !== null;
+  const hasReasons = record.deterministicReasons.length > 0 || record.strategicReasons.length > 0;
 
   return (
-    <div className="flex flex-col gap-1">
-      <p className="flex items-center gap-1.5 font-semibold text-zinc-700 dark:text-zinc-300">
-        {label}
-        {record.move && (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-1.5">
+        <p className={`font-semibold ${toneClass}`}>{label}</p>
+        {record.move ? (
           <span
             className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(record.move)}`}
           >
             {negotiationMoveLabel(record.move)}
           </span>
+        ) : (
+          <span className="text-[10px] text-zinc-400 dark:text-zinc-600">no move this round</span>
         )}
-      </p>
+      </div>
+
       {record.sufficiency && (
-        <p className="text-zinc-500 dark:text-zinc-500">Quantity sufficiency: {record.sufficiency.verdict}</p>
+        <p className="text-zinc-500 dark:text-zinc-500">
+          Sufficiency:{" "}
+          <span className="font-medium text-zinc-700 dark:text-zinc-300">{record.sufficiency.verdict}</span> —{" "}
+          {record.sufficiency.reason}
+        </p>
       )}
-      {reasons.length > 0 ? (
-        <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
-          {reasons.map((reason, i) => (
-            <li key={i}>{reason}</li>
-          ))}
-        </ul>
+
+      {hasReasons ? (
+        <div className="flex flex-col gap-1.5">
+          {record.deterministicReasons.length > 0 && (
+            <div>
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
+                Deterministic
+              </p>
+              <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
+                {record.deterministicReasons.map((reason, i) => (
+                  <li key={i}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {record.strategicReasons.length > 0 && (
+            <div>
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
+                Strategic factors
+              </p>
+              <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
+                {record.strategicReasons.map((reason, i) => (
+                  <li key={i}>{reason}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
       ) : (
         <p className="text-zinc-400 dark:text-zinc-600">No additional factors this round.</p>
       )}
-      {record.candidates && record.candidates.length > 1 && (
-        <details>
-          <summary className="cursor-pointer text-zinc-400 dark:text-zinc-600">
-            {record.candidates.length} option(s) considered
-          </summary>
-          <ul className="mt-1 list-disc pl-4 text-zinc-500 dark:text-zinc-500">
-            {record.candidates.map((candidate, i) => (
-              <li key={i}>
-                {negotiationMoveLabel(candidate.move)}: {formatInr(candidate.unitPrice)}
-              </li>
-            ))}
+
+      {hasTerms && (
+        <p className="text-zinc-500 dark:text-zinc-500">
+          Result: {terms.quantity ?? "—"} unit(s) ·{" "}
+          {terms.unitPrice !== null ? formatInr(terms.unitPrice) : "—"} ·{" "}
+          {terms.deliveryDays !== null ? `${terms.deliveryDays} day(s)` : "—"}
+        </p>
+      )}
+
+      {record.candidates && record.candidates.length > 0 && (
+        <div>
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
+            Options considered ({record.candidates.length})
+          </p>
+          <ul className="mt-0.5 flex flex-col gap-0.5">
+            {record.candidates.map((candidate, i) => {
+              const selected = candidate.move === record.move;
+              return (
+                <li
+                  key={i}
+                  className={selected ? `font-medium ${toneClass}` : "text-zinc-400 dark:text-zinc-600"}
+                >
+                  {selected ? "✓" : "–"} {negotiationMoveLabel(candidate.move)}: {formatInr(candidate.unitPrice)}
+                  {!selected && " (not chosen)"}
+                </li>
+              );
+            })}
           </ul>
-        </details>
+        </div>
       )}
     </div>
   );
