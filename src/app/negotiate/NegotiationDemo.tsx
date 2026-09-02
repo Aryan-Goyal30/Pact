@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, type ReactNode } from "react";
 import type { PublicManifestProduct } from "@/types/manifest";
 import type {
   LeverageScoreDTO,
@@ -422,6 +422,8 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
               .filter((t): t is TranscriptTurn & { leverage: LeverageScoreDTO } => t.leverage !== null)
               .map((t) => ({ turn: t.turn, leverage: t.leverage }))}
           />
+
+          <AgentLoopPanel transcript={transcript} />
 
           <ol className="flex flex-col gap-4">
             {transcript.map((turn) => (
@@ -900,6 +902,224 @@ function AgentDecisionSide({
             })}
           </ul>
         </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Agent Loop visualization: reframes data already computed and already
+ * shown elsewhere (message terms, leverage, decisionAudit — see
+ * AgentDecisionPanel above) as an observe → evaluate → decide → act →
+ * adapt pipeline, one row per round, so it's immediately visible that
+ * the agents are repeatedly reading the negotiation state, weighing
+ * options, choosing a strategy, acting on it, and reacting to the
+ * result next round. Computes nothing new server-side and infers
+ * nothing beyond what's already on the wire: every value below is a
+ * direct read of turn.buyer/turn.merchant/turn.leverage/turn.decisionAudit,
+ * or a plain comparison between two consecutive rounds' own values.
+ * Collapsed by default — it summarizes data already visible in the
+ * transcript and Agent Activity panel, just reordered as a pipeline, so
+ * it stays out of the way until a reader wants the bigger picture.
+ */
+function AgentLoopPanel({ transcript }: { transcript: TranscriptTurn[] }) {
+  const revealed = transcript.filter(
+    (t): t is TranscriptTurn & { merchant: NegotiationMessageDTO; leverage: LeverageScoreDTO } =>
+      t.merchant !== null && t.leverage !== null,
+  );
+  if (revealed.length === 0) {
+    return null;
+  }
+
+  return (
+    <details className="rounded-lg border border-dashed border-black/[.12] px-3 py-2 text-xs dark:border-white/[.18]">
+      <summary className="cursor-pointer select-none font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
+        Agent loop: observe → evaluate → decide → act → adapt ({revealed.length} round
+        {revealed.length === 1 ? "" : "s"})
+      </summary>
+      <p className="mt-1 text-[11px] text-zinc-400 dark:text-zinc-600">
+        Built entirely from the same decision data shown in Agent Activity below — reordered as a pipeline, nothing new computed.
+      </p>
+      <ol className="mt-3 flex flex-col gap-3">
+        {revealed.map((turn, i) => (
+          <li key={turn.turn} className="border-l-2 border-black/[.08] pl-3 dark:border-white/[.12]">
+            <p className="mb-1 font-semibold text-zinc-500 dark:text-zinc-500">Round {turn.turn}</p>
+            <AgentLoopRound turn={turn} previous={revealed[i - 1] ?? null} />
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+function LoopStage({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <span className="inline-flex flex-wrap items-baseline gap-1">
+      <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
+        {label}:
+      </span>
+      <span className="text-zinc-600 dark:text-zinc-400">{children}</span>
+    </span>
+  );
+}
+
+function LoopArrow() {
+  return (
+    <span aria-hidden className="text-zinc-300 dark:text-zinc-700">
+      →
+    </span>
+  );
+}
+
+type RevealedTranscriptTurn = TranscriptTurn & {
+  merchant: NegotiationMessageDTO;
+  leverage: LeverageScoreDTO;
+};
+
+function AgentLoopRound({
+  turn,
+  previous,
+}: {
+  turn: RevealedTranscriptTurn;
+  previous: RevealedTranscriptTurn | null;
+}) {
+  const buyerPrice = turn.buyer?.unitPrice ?? null;
+  const merchantPrice = turn.merchant.unitPrice;
+  const gap = buyerPrice !== null && merchantPrice !== null ? Math.abs(merchantPrice - buyerPrice) : null;
+  const quantity = turn.merchant.quantity ?? turn.buyer?.quantity ?? null;
+  const delivery = turn.merchant.deliveryDays ?? turn.buyer?.deliveryDays ?? null;
+
+  const buyerRecord = turn.decisionAudit?.buyer ?? null;
+  const merchantRecord = turn.decisionAudit?.merchant ?? null;
+
+  // "Decide" always has something to show: the winning strategic move
+  // when a genuine candidate comparison happened this round, otherwise
+  // the plain accept/reject/request decision the message itself already
+  // carries — never fabricated, always one of the two real fields.
+  const buyerDecideLabel = buyerRecord?.move
+    ? negotiationMoveLabel(buyerRecord.move)
+    : turn.buyer
+      ? negotiationMessageTypeLabel(turn.buyer.type)
+      : null;
+  const merchantDecideLabel = merchantRecord?.move
+    ? negotiationMoveLabel(merchantRecord.move)
+    : negotiationMessageTypeLabel(turn.merchant.type);
+
+  const buyerOptionCount = buyerRecord?.candidates?.length ?? 0;
+  const merchantOptionCount = merchantRecord?.candidates?.length ?? 0;
+
+  // Adaptation: only concrete, comparable deltas against the previous
+  // round's own values — never a claim that the agent "learned"
+  // anything, only what measurably changed (or didn't).
+  const adaptations: string[] = [];
+  if (previous) {
+    if (previous.leverage.buyer !== turn.leverage.buyer || previous.leverage.merchant !== turn.leverage.merchant) {
+      adaptations.push(
+        `Leverage shifted — Buyer ${previous.leverage.buyer}% → ${turn.leverage.buyer}%, Merchant ${previous.leverage.merchant}% → ${turn.leverage.merchant}%`,
+      );
+    }
+
+    const prevBuyerPrice = previous.buyer?.unitPrice ?? null;
+    const prevMerchantPrice = previous.merchant.unitPrice;
+    const prevGap =
+      prevBuyerPrice !== null && prevMerchantPrice !== null ? Math.abs(prevMerchantPrice - prevBuyerPrice) : null;
+    if (prevGap !== null && gap !== null && prevGap !== gap) {
+      adaptations.push(
+        `Price gap ${gap < prevGap ? "narrowed" : "widened"} — ${formatInr(prevGap)} → ${formatInr(gap)}`,
+      );
+    }
+
+    const prevBuyerLabel = previous.decisionAudit?.buyer.move
+      ? negotiationMoveLabel(previous.decisionAudit.buyer.move)
+      : previous.buyer
+        ? negotiationMessageTypeLabel(previous.buyer.type)
+        : null;
+    if (prevBuyerLabel && buyerDecideLabel && prevBuyerLabel !== buyerDecideLabel) {
+      adaptations.push(`Buyer's decision changed — ${prevBuyerLabel} → ${buyerDecideLabel}`);
+    }
+
+    const prevMerchantLabel = previous.decisionAudit?.merchant?.move
+      ? negotiationMoveLabel(previous.decisionAudit.merchant.move)
+      : negotiationMessageTypeLabel(previous.merchant.type);
+    if (prevMerchantLabel !== merchantDecideLabel) {
+      adaptations.push(`Merchant's response changed — ${prevMerchantLabel} → ${merchantDecideLabel}`);
+    }
+
+    if (adaptations.length === 0) {
+      adaptations.push("No material change from the previous round — positions held.");
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <LoopStage label="Observe">
+          {[
+            quantity !== null ? `qty ${quantity}` : null,
+            gap !== null ? `gap ${formatInr(gap)}` : null,
+            `leverage ${turn.leverage.buyer}/${turn.leverage.merchant}`,
+            delivery !== null ? `delivery ${delivery}d` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </LoopStage>
+
+        {(buyerOptionCount > 0 || merchantOptionCount > 0) && (
+          <>
+            <LoopArrow />
+            <LoopStage label="Evaluate">
+              {[
+                buyerOptionCount > 0 ? `Buyer weighed ${buyerOptionCount} option${buyerOptionCount === 1 ? "" : "s"}` : null,
+                merchantOptionCount > 0
+                  ? `Merchant weighed ${merchantOptionCount} option${merchantOptionCount === 1 ? "" : "s"}`
+                  : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </LoopStage>
+          </>
+        )}
+
+        <LoopArrow />
+        <LoopStage label="Decide">
+          {buyerDecideLabel && (
+            <span
+              className={
+                buyerRecord?.move
+                  ? `rounded px-1 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(buyerRecord.move)}`
+                  : ""
+              }
+            >
+              Buyer: {buyerDecideLabel}
+            </span>
+          )}
+          {buyerDecideLabel && merchantDecideLabel && " · "}
+          <span
+            className={
+              merchantRecord?.move
+                ? `rounded px-1 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(merchantRecord.move)}`
+                : ""
+            }
+          >
+            Merchant: {merchantDecideLabel}
+          </span>
+        </LoopStage>
+
+        <LoopArrow />
+        <LoopStage label="Act / Result">
+          {[
+            buyerPrice !== null ? `buyer → ${formatInr(buyerPrice)}` : null,
+            merchantPrice !== null
+              ? `merchant → ${formatInr(merchantPrice)} (${negotiationMessageTypeLabel(turn.merchant.type)})`
+              : `merchant ${negotiationMessageTypeLabel(turn.merchant.type)}`,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
+        </LoopStage>
+      </div>
+
+      {adaptations.length > 0 && (
+        <p className="text-[11px] italic text-zinc-500 dark:text-zinc-500">↻ {adaptations.join(" · ")}</p>
       )}
     </div>
   );
