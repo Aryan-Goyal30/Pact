@@ -15,12 +15,16 @@ import {
   type NegotiationRequest,
   type NegotiationResult,
 } from "@/lib/rules/negotiationEngine";
-import { explainMerchantFactors, resolveDeliveryTrade } from "@/lib/rules/negotiationStrategy";
+import {
+  explainMerchantFactors,
+  resolveDeliveryRushPremiumFraction,
+  resolveDeliveryTrade,
+} from "@/lib/rules/negotiationStrategy";
 import { generateMerchantCandidates, selectBestMerchantCandidate } from "@/lib/rules/merchantMoveSelection";
 import type { CandidateMoveType } from "@/lib/rules/candidateMove";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
-import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/provider";
 
 export interface MerchantAgentOffer {
   sku: string;
@@ -56,12 +60,13 @@ You will be given the AUTHORITATIVE result of a deterministic negotiation engine
 
 Your only job is to phrase that result as a short, professional message to the buyer. Rules:
 - Speak in first person as the merchant (e.g. "We can offer...", "We're unable to...").
-- Be concise: 2-4 sentences, plain text only (no markdown, no JSON).
+- Be concise: one or two sentences, plain text only (no markdown, no JSON). Do not pad the message with a full restatement of every reason available to you — state the current terms plainly and, at most, one brief reason that directly explains this round's move.
 - State only the outcome, quantity, unit price, delivery days, and reasons EXACTLY as given in the JSON. Never invent, round, or otherwise change any number, product name, policy, or reason that isn't present in the JSON.
 - Render every number exactly as given, in full — never truncate, abbreviate, or drop a digit (e.g. write 45375 in full, never 4537 or 45). Whenever an outcome carries a quantity, unit price, and delivery days, state all three.
 - Do not claim a deal is agreed or final unless the outcome is "EXACT_MATCH" — for "COUNTER_OFFER" or "PARTIAL_FULFILLMENT", present the terms as an offer awaiting the buyer's response, not a completed deal.
 - For "REJECTED", briefly explain why using only the given reasons, and do not propose alternative terms of your own.
-- Never offer to negotiate further or suggest numbers beyond what was given to you.`;
+- Never offer to negotiate further or suggest numbers beyond what was given to you.
+- This is one round in an ongoing back-and-forth — vary your sentence structure and wording from what a typical templated message would produce, so consecutive rounds don't read as copies of each other, while never changing the substance.`;
 
 /**
  * Strips a NegotiationResult down to exactly the fields the LLM is
@@ -171,6 +176,17 @@ function applyMerchantConcession(
    * price computed here reduces to exactly its pre-this-milestone value.
    */
   leverageScores?: { buyer: number; merchant: number },
+  /**
+   * Message-grounding fix: the REAL, catalog/manifest listed price —
+   * see generateMerchantCandidates's own doc comment on this same
+   * parameter for the full reasoning. `item` here is whatever the
+   * caller substituted (possibly the rush-adjusted effectiveItem — see
+   * runMerchantAgent), so its own `.listedPrice` cannot be trusted for
+   * "the listed price" in any reason text. Optional and additive:
+   * omitted, every reason string falls back to `item.listedPrice`
+   * exactly as before this parameter existed.
+   */
+  catalogListedPrice?: number,
 ): { decision: NegotiationResult; move?: CandidateMoveType } {
   if (
     request.maxUnitPrice === undefined ||
@@ -207,6 +223,7 @@ function applyMerchantConcession(
     // is guaranteed non-null (only REJECTED ever sets it null).
     decision.offeredQuantity as number,
     leverageScores,
+    catalogListedPrice,
   );
   const selected = selectBestMerchantCandidate(candidates);
 
@@ -235,10 +252,33 @@ function applyMerchantConcession(
       ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
       : { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
 
+  // Message-quality fix: explainMerchantFactors's LOW-stock reason
+  // ("Merchant is holding firm because inventory is limited...") is
+  // round-INVARIANT — item's stock level doesn't change mid-negotiation
+  // — so including it unconditionally every round is what drove the LLM
+  // to restate the same rationale verbatim round after round (observed
+  // directly: identical "limited inventory / demand is high" prose
+  // across many rounds, in exactly this low-stock scenario). Worse, that
+  // specific sentence claims the merchant is "holding firm" even on
+  // rounds where selected.move is a genuine CONCEDE — actively
+  // contradicting the round's own real action. It's still genuinely
+  // useful context on the merchant's first round (establishing the
+  // negotiating posture once) and whenever HOLD is actually the selected
+  // move (where it IS the true, current reason) — kept in both those
+  // cases, dropped otherwise. The HIGH-stock-pressure reason ("...
+  // increased its concession") is left completely unconditional: it
+  // doesn't contradict an active concession (it explains one) and isn't
+  // part of the reported repetition (both reported scenarios are
+  // low-stock items). Nothing here changes what explainMerchantFactors
+  // itself computes (negotiationStrategy.ts, untouched) — only which of
+  // its already-computed strings this round's LLM context includes.
+  const isFirstRound = concessionContext.round <= 1;
+  const merchantFactors = explainMerchantFactors(item, false, trade);
+  const isLowStockHoldingFirmReason = (reason: string) => reason.startsWith("Merchant is holding firm");
+
   const reasons = decision.reasons
     .filter((reason) => !reason.startsWith("Countering with an adjusted unit price"))
     .concat(
-      `Countering with an adjusted unit price of ${selected.unitPrice} instead of the listed ${item.listedPrice}.`,
       ...(reciprocityReason ? [reciprocityReason] : []),
       // Only the reasoning behind the WINNING candidate is stated —
       // never a dimension the comparison considered but didn't select.
@@ -257,12 +297,16 @@ function applyMerchantConcession(
             `The buyer increased its requested quantity from ${previousBuyerQuantity} to ${request.quantity} and offered a longer delivery window (from ${previousBuyerDeliveryDays} to ${trade.deliveryDays} days) together, in exchange for a better price, so the merchant evaluated the complete combined package as one proposal.`,
           ]
         : []),
+      // selected.reason already states the winning candidate's own
+      // price/terms rationale (e.g. "Countering with an adjusted unit
+      // price of X instead of the listed Y" for a plain CONCEDE, now
+      // correctly grounded in the real catalog listed price — see
+      // merchantMoveSelection.ts's own catalogListedPrice parameter) —
+      // no separate reconstruction of the same sentence is needed here.
       selected.reason,
-      // quantityLeveraged is false here — the winning candidate's own
-      // reason above already supplies a more specific quantity/delivery
-      // reason when relevant, so explainMerchantFactors only contributes
-      // generic stock/delivery-trade reasons.
-      ...explainMerchantFactors(item, false, trade),
+      ...merchantFactors.filter(
+        (reason) => isFirstRound || selected.move === "HOLD" || !isLowStockHoldingFirmReason(reason),
+      ),
     );
 
   return { decision: { ...decision, unitPrice: selected.unitPrice, deliveryDays, reasons }, move: selected.move };
@@ -359,11 +403,39 @@ export async function runMerchantAgent(
    */
   leverageScores?: { buyer: number; merchant: number },
 ): Promise<MerchantAgentResponse> {
-  let decision = evaluateNegotiationRequest(item, request);
+  // Scenario-behavior fix: rush delivery. A deadline faster than
+  // item.standardDeliveryDays is no longer an impossibility (see
+  // checkDeliveryAchievable) — the merchant can meet it, but at a price
+  // premium. Rather than teaching every pricing formula in
+  // negotiationEngine.ts / negotiationStrategy.ts about delivery
+  // urgency, this derives a per-negotiation, price-only adjusted item
+  // (listedPrice and minPrice both scaled by the SAME premium fraction,
+  // preserving the width of the negotiable band) and uses it in place of
+  // the real catalog item for every price computation below — stock,
+  // delivery-day fields, and negotiationEnabled are untouched, so
+  // quantity/delivery logic elsewhere is completely unaffected. A no-op
+  // (effectiveItem === item) whenever the requested deadline is at or
+  // after standard, which is every existing caller/test.
+  const rushPremiumFraction = item
+    ? resolveDeliveryRushPremiumFraction(
+        item.standardDeliveryDays,
+        request.deliveryDeadlineDays ?? item.standardDeliveryDays,
+      )
+    : 0;
+  const effectiveItem: CatalogItemSnapshot | null =
+    item && rushPremiumFraction > 0
+      ? {
+          ...item,
+          listedPrice: Math.round(item.listedPrice * (1 + rushPremiumFraction)),
+          minPrice: Math.round(item.minPrice * (1 + rushPremiumFraction)),
+        }
+      : item;
+
+  let decision = evaluateNegotiationRequest(effectiveItem, request);
   let move: CandidateMoveType | undefined;
-  if (item && concessionContext) {
+  if (effectiveItem && concessionContext) {
     const concession = applyMerchantConcession(
-      item,
+      effectiveItem,
       request,
       decision,
       concessionContext,
@@ -371,12 +443,27 @@ export async function runMerchantAgent(
       previousBuyerQuantity,
       previousBuyerDeliveryDays,
       leverageScores,
+      // The REAL catalog listed price (item, not effectiveItem) — see
+      // applyMerchantConcession's own doc comment on this parameter.
+      item?.listedPrice,
     );
     decision = concession.decision;
     move = concession.move;
   }
 
-  const context = toPublicContext(decision);
+  const context = {
+    ...toPublicContext(decision),
+    // Message-quality fix: the strategic move actually selected this
+    // round (HOLD / CONCEDE / a trade — see MerchantAgentResponse.move's
+    // own doc comment), so the prompt can vary tone/phrasing by what's
+    // ACTUALLY happening this round instead of defaulting to one
+    // "explain everything" voice every time. A string, never a number —
+    // completely inert for checkAgentMessageIntegrity's own numeric
+    // check. Undefined (e.g. EXACT_MATCH, REJECTED, no round context)
+    // simply omits the field, exactly like every other optional context
+    // value in this codebase.
+    move,
+  };
   const requiredNumbers =
     decision.outcome === "REJECTED"
       ? []
@@ -388,7 +475,7 @@ export async function runMerchantAgent(
       systemPrompt: MERCHANT_SYSTEM_PROMPT,
       context,
       instruction:
-        "Generate only the natural-language message explaining this already-decided negotiation result, from the merchant's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative.",
+        "Generate only the natural-language message explaining this already-decided negotiation result, from the merchant's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. Keep it short: one or two sentences, never a paragraph — state the quantity, unit price, and delivery days plainly as the current offer. If `move` is \"HOLD\", say the merchant is holding at these terms, not that it's making a fresh concession — vary HOW you express that each time rather than reusing one construction: sometimes emphasize that the terms are staying the same, sometimes note that the buyer's offer hasn't closed the gap yet, sometimes leave the door open to reconsider if the buyer moves closer. Pick whichever single angle fits best this round and phrase it freshly, in your own words. If `move` is \"CONCEDE\" or a trade move (\"QUANTITY_FOR_PRICE\", \"DELIVERY_FOR_PRICE\", \"QUANTITY_AND_DELIVERY_FOR_PRICE\"), phrase it as a new offer (e.g. \"We can come down to 46000 per unit for 10 units, with delivery in 5 days.\"). When `reasons` supplies something relevant to this round, express its underlying idea in your own natural words — never copy a sentence from `reasons` verbatim into your message, and mention at most one reason. If a reason mentions \"stock pressure\" in connection with increasing or improving the concession (i.e. ample stock, not a shortage), never use the phrase \"stock pressure\" itself — a reader could easily mistake it for a shortage. Explain that kind of concession instead in terms of the order's size or volume, the commercial value of fulfilling a large order, or moving to close the remaining price gap. Never reuse the same sentence structure or wording you might have used in a previous round of this same negotiation — vary your phrasing naturally each time, the way a real person negotiating would, while never inventing a reason, number, or claim that isn't in the given data.",
     });
     const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
     if (check.valid) {
@@ -401,10 +488,13 @@ export async function runMerchantAgent(
     if (!(error instanceof LlmUnavailableError)) {
       throw error;
     }
-    // No LLM provider is configured — fall back to a deterministic
-    // caption instead of failing the whole negotiation turn. The
-    // decision itself (every number and the outcome) is completely
-    // unaffected; only the phrasing differs.
+    if (error instanceof ProviderRateLimitedError) {
+      console.warn(`Merchant Agent: ${error.message}`);
+    }
+    // No LLM provider is configured, or it's rate-limited — fall back
+    // to a deterministic caption instead of failing the whole
+    // negotiation turn. The decision itself (every number and the
+    // outcome) is completely unaffected; only the phrasing differs.
     message = buildFallbackMerchantMessage(decision);
   }
 
@@ -469,6 +559,9 @@ export async function runMerchantWalkAway(
   } catch (error) {
     if (!(error instanceof LlmUnavailableError)) {
       throw error;
+    }
+    if (error instanceof ProviderRateLimitedError) {
+      console.warn(`Merchant Agent (walk-away): ${error.message}`);
     }
     message = buildFallbackMerchantWalkAwayMessage(reason, buyerAskUnitPrice);
   }

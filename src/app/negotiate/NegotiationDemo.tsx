@@ -83,6 +83,23 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
 
   const [maxRounds, setMaxRounds] = useState<number | null>(null);
   const [round, setRound] = useState(0);
+  // UI display fix: the engine's own `round` (state.round, above) is a
+  // round-BUDGET counter for the deterministic concession formulas
+  // (roundsLeft, etc.) — an explicit accept/reject/walk-away closes the
+  // negotiation without consuming a new round of that budget (see
+  // negotiationState.ts's acceptNegotiation/rejectNegotiation, both
+  // deliberately unchanged here), so on the turn that actually closes
+  // the negotiation, `round` stays one behind the round a person can see
+  // in the transcript. `turn.turn` (turnNumber — negotiationSessionRepository.ts)
+  // already increments on every persisted turn, including that closing
+  // one, and is already what each transcript entry's own "Round N" label
+  // uses (below) — this just also drives the header's summary count, so
+  // both agree. Deliberately a SEPARATE state variable: OutcomeCard's own
+  // `round` prop still needs the engine's round-budget value (it compares
+  // round === maxRounds to distinguish an early walk-away from genuine
+  // round-exhaustion — see negotiationFailureExplanation) and must stay
+  // exactly as it was.
+  const [displayRound, setDisplayRound] = useState(0);
   const [status, setStatus] = useState<NegotiationStatus | null>(null);
   const [transcript, setTranscript] = useState<TranscriptTurn[]>([]);
   const [thinking, setThinking] = useState<{ agent: "buyer" | "merchant"; label: string } | null>(
@@ -114,6 +131,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     setTranscript([]);
     setAgreement(null);
     setRound(0);
+    setDisplayRound(0);
     setStatus(null);
     setThinking({ agent: "buyer", label: buyerThinkingLabel(1) });
 
@@ -178,6 +196,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
           ),
         );
         setRound(turn.round);
+        setDisplayRound(turn.turn);
         setStatus(turn.status);
         currentStatus = turn.status;
 
@@ -388,7 +407,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
         <section className="flex flex-col gap-4">
           <NegotiationStateHeader
             status={status}
-            round={round}
+            round={displayRound}
             maxRounds={maxRounds}
             buyerOffer={latestBuyerOffer}
             merchantOffer={latestMerchantOffer}
@@ -496,6 +515,7 @@ function NegotiationStateHeader({
   leverageHistory,
 }: {
   status: NegotiationStatus | null;
+  /** The visible transcript round to display (displayRound / turn.turn) — deliberately NOT the engine's own round-budget counter (see displayRound's own doc comment). */
   round: number;
   maxRounds: number | null;
   buyerOffer: NegotiationMessageDTO | null;
