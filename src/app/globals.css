@@ -1,26 +1,135 @@
 @import "tailwindcss";
 
+/*
+ * PACT design system — dark-first, unconditional (no light mode).
+ *
+ * Forces Tailwind's `dark:` variant to be driven by a class on <html>
+ * (see layout.tsx, which always sets it) rather than the OS's
+ * prefers-color-scheme. Every existing `dark:*` utility class already
+ * used throughout the app (built up across many prior milestones)
+ * therefore becomes the ACTIVE style everywhere, automatically — this
+ * is what makes a dark-first redesign tractable without rewriting every
+ * component's className from scratch.
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Near-black, not pure black — a hair of warmth so large surfaces
+     don't read as a plain dev-tool #000. */
+  --background: #0a0a0c;
+  --surface: #0f0f12;
+  --surface-raised: #15151a;
+  --foreground: #f2efe9;
+  --muted: #9c9a95;
+
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  /* The single restrained brand accent — a muted copper, distinct from
+     the buyer(blue)/merchant(amber)/success(green)/error(red) semantic
+     colors already used throughout the negotiation UI, so it never
+     competes with them. Used sparingly: primary marks, focus rings,
+     a handful of brand moments. */
+  --accent: #c98f4f;
+  --accent-foreground: #0a0a0c;
+
+  --radius: 0.75rem;
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-raised: var(--surface-raised);
   --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: dark;
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-sans), ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-feature-settings: "cv11", "ss01";
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1,
+h2,
+h3 {
+  letter-spacing: -0.02em;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+  color: var(--foreground);
+}
+
+/* Subtle, state-communicating motion only — see design brief: no
+   floating/glow/particle decoration. */
+@keyframes pact-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-fade-in {
+  animation: pact-fade-in 0.35s ease-out both;
+}
+
+/* The agent-status stepper (Observing/Evaluating/Deciding/Acting) — a
+   left-to-right opacity wave over already-real pacing delays, never a
+   claim about literal backend sub-phases. See NegotiationDemo.tsx's
+   AgentStatusStepper. */
+@keyframes pact-slide-in-right {
+  from {
+    transform: translateX(24px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in-right {
+  animation: pact-slide-in-right 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes pact-step {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  40% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
 }

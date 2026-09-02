@@ -10,7 +10,7 @@ import type {
   NegotiationTurnResponse,
   PersistedAgreementDTO,
 } from "@/types/negotiation";
-import type { AgentDecisionRecord, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
+import type { AgentDecisionRecord, AgentObservation, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
 // Only the pure, dependency-free mapping helper and its types are used
 // client-side — parseBuyerIntent itself (which calls the LLM provider)
@@ -27,11 +27,8 @@ import {
   getScenarioPresets,
   merchantThinkingLabel,
   negotiationFailureExplanation,
-  negotiationMessageTypeBadgeClass,
-  negotiationMessageTypeLabel,
   negotiationMoveBadgeClass,
   negotiationMoveLabel,
-  negotiationStatusBadgeClass,
   negotiationStatusLabel,
   parseBuyerRequestForm,
   type BuyerRequestFormValues,
@@ -350,283 +347,98 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     setIntentNotice(null);
   }
 
+  // Presentation-only reset (no negotiation/API call): returns to the
+  // request-entry step so a finished negotiation doesn't strand the
+  // user on a dead-end screen. Nothing about the just-completed
+  // session's persisted data changes — its audit trail/agreement remain
+  // exactly as recorded; this only clears local UI state so a NEW
+  // session can start.
+  function handleStartOver() {
+    setStarted(false);
+    setParsedIntent(null);
+    setIntentText("");
+    setIntentNotice(null);
+    setEntryMode("intent");
+  }
+
   const lastTurn = transcript[transcript.length - 1];
-  const previousTurn = transcript[transcript.length - 2];
   const latestBuyerOffer = lastTurn?.buyer ?? null;
   const latestMerchantOffer = lastTurn?.merchant ?? null;
+  const isTerminal = status !== null && TERMINAL_STATUSES.includes(status);
+  const productLabel = selectedProduct?.name ?? form.sku;
+  const productQuantity = latestMerchantOffer?.quantity ?? latestBuyerOffer?.quantity ?? null;
 
   return (
     <div className="flex flex-col gap-8">
-      <AgentObjectivesHeader />
-
-      <section className="flex flex-col gap-3">
-        {entryMode === "intent" ? (
-          parsedIntent ? (
-            <IntentConfirmation
-              intent={parsedIntent}
-              running={running}
-              onStart={handleStartFromIntent}
-              onEdit={() => setEntryMode("form")}
-              onReset={handleDescribeSomethingElse}
-            />
-          ) : (
-            <IntentEntry
-              value={intentText}
-              onChange={setIntentText}
-              onSubmit={handleUnderstandRequest}
-              loading={intentLoading}
-              notice={intentNotice}
-              disabled={running}
-              onSkipToForm={() => setEntryMode("form")}
-            />
-          )
-        ) : (
-          <>
-            <button
-              type="button"
-              disabled={running}
-              onClick={() => setEntryMode("intent")}
-              className="self-start text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
-            >
-              ← Back to natural language
-            </button>
-
-            {intentNotice && (
-              <p className="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
-                {intentNotice}
-              </p>
-            )}
-
-            <div>
-              <h2 className="text-lg font-medium text-black dark:text-zinc-50">
-                Start a negotiation
-              </h2>
-              <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                Tell the Buyer Agent what it&apos;s shopping for. It will negotiate with
-                the Merchant Agent on your behalf, one real exchange at a time.
-              </p>
-            </div>
-
-            {presets.length > 0 && (
-              <div className="flex flex-wrap gap-2">
-                {presets.map((preset) => (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    disabled={running}
-                    title={preset.description}
-                    onClick={() => setForm(preset.values)}
-                    className="rounded-full border border-black/[.12] px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-            )}
-
-        <form
-          onSubmit={handleSubmit}
-          className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]"
-        >
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">Product</span>
-              <select
-                value={form.sku}
-                disabled={running}
-                onChange={(e) => setForm({ ...form, sku: e.target.value })}
-                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-              >
-                {products.map((product) => (
-                  <option key={product.sku} value={product.sku}>
-                    {product.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">Quantity</span>
-              <input
-                type="number"
-                min={1}
-                disabled={running}
-                value={form.quantity}
-                onChange={(e) => setForm({ ...form, quantity: e.target.value })}
-                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                Maximum price per unit (₹)
-              </span>
-              <input
-                type="number"
-                min={1}
-                disabled={running}
-                value={form.maxUnitPrice}
-                onChange={(e) => setForm({ ...form, maxUnitPrice: e.target.value })}
-                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                Delivery deadline (days)
-              </span>
-              <input
-                type="number"
-                min={1}
-                disabled={running}
-                value={form.deliveryDeadlineDays}
-                onChange={(e) => setForm({ ...form, deliveryDeadlineDays: e.target.value })}
-                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-              />
-            </label>
-
-            <label className="flex flex-col gap-1.5 text-sm">
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">Buyer urgency</span>
-              <select
-                value={form.urgency}
-                disabled={running}
-                onChange={(e) =>
-                  setForm({ ...form, urgency: e.target.value as BuyerRequestFormValues["urgency"] })
-                }
-                className="rounded-md border border-black/[.15] bg-white px-3 py-2 text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-              >
-                <option value="low">Low — can wait</option>
-                <option value="medium">Medium</option>
-                <option value="high">High — needs it fast</option>
-              </select>
-            </label>
-
-            <label className="flex items-center gap-2 self-end pb-2 text-sm">
-              <input
-                type="checkbox"
-                disabled={running}
-                checked={form.deliveryFlexible}
-                onChange={(e) => setForm({ ...form, deliveryFlexible: e.target.checked })}
-                className="h-4 w-4 rounded border-black/[.25] disabled:opacity-50 dark:border-white/[.3]"
-              />
-              <span className="font-medium text-zinc-700 dark:text-zinc-300">
-                Flexible on delivery (trade for a better price)
-              </span>
-            </label>
-          </div>
-
-          {selectedProduct && (
-            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg bg-black/[.03] px-4 py-3 text-xs text-zinc-600 dark:bg-white/[.04] dark:text-zinc-400">
-              <span>
-                Listed price:{" "}
-                <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {formatInr(selectedProduct.listedPrice)} / unit
-                </span>
-              </span>
-              <span>
-                Available quantity:{" "}
-                <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {selectedProduct.availableQuantity}
-                </span>
-              </span>
-              <span>
-                Standard delivery:{" "}
-                <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {selectedProduct.standardDeliveryDays} day(s)
-                </span>
-              </span>
-              <span>
-                Negotiable:{" "}
-                <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                  {selectedProduct.negotiable ? "Yes" : "No"}
-                </span>
-              </span>
-              {maxOrderValuePreview !== null && (
-                <span className="ml-auto">
-                  Maximum possible order value:{" "}
-                  <span className="font-medium text-zinc-900 dark:text-zinc-100">
-                    {formatInr(maxOrderValuePreview)}
-                  </span>
-                </span>
-              )}
-            </div>
-          )}
-
-          <div>
-            {formError && <p className="mb-2 text-sm text-red-600 dark:text-red-400">{formError}</p>}
-            {apiError && <p className="mb-2 text-sm text-red-600 dark:text-red-400">{apiError}</p>}
-            <button
-              type="submit"
-              disabled={running}
-              className="flex h-11 items-center justify-center rounded-full bg-foreground px-6 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
-            >
-              {running ? "Negotiating…" : "Start Negotiation"}
-            </button>
-          </div>
-        </form>
-          </>
-        )}
-      </section>
-
+      {/* Request entry — hidden once a negotiation is underway, so the
+          workspace below can be the sole focus (see design brief:
+          "transition into a focused negotiation workspace"). */}
       {!started && (
-        <p className="rounded-lg border border-dashed border-black/[.15] p-6 text-center text-sm text-zinc-500 dark:border-white/[.2] dark:text-zinc-500">
-          Describe what you&apos;re looking to buy above (or fill in the form manually) to
-          watch the Buyer and Merchant Agents negotiate live, one real exchange at a time.
-        </p>
+        <section className="animate-fade-in flex flex-col gap-5">
+          {entryMode === "intent" ? (
+            parsedIntent ? (
+              <IntentConfirmation
+                intent={parsedIntent}
+                running={running}
+                onStart={handleStartFromIntent}
+                onEdit={() => setEntryMode("form")}
+                onReset={handleDescribeSomethingElse}
+              />
+            ) : (
+              <IntentEntry
+                value={intentText}
+                onChange={setIntentText}
+                onSubmit={handleUnderstandRequest}
+                loading={intentLoading}
+                notice={intentNotice}
+                disabled={running}
+                onSkipToForm={() => setEntryMode("form")}
+              />
+            )
+          ) : (
+            <StructuredForm
+              form={form}
+              setForm={setForm}
+              products={products}
+              presets={presets}
+              selectedProduct={selectedProduct}
+              maxOrderValuePreview={maxOrderValuePreview}
+              running={running}
+              formError={formError}
+              apiError={apiError}
+              intentNotice={intentNotice}
+              onSubmit={handleSubmit}
+              onBackToIntent={() => setEntryMode("intent")}
+            />
+          )}
+        </section>
       )}
 
       {started && (
-        <section className="flex flex-col gap-4">
-          <NegotiationStateHeader
+        <section className="animate-fade-in flex flex-col gap-6">
+          <WorkspaceHeader
             status={status}
+            productLabel={productLabel}
+            productQuantity={productQuantity}
             round={displayRound}
             maxRounds={maxRounds}
             buyerOffer={latestBuyerOffer}
             merchantOffer={latestMerchantOffer}
-            previousBuyerOffer={previousTurn?.buyer ?? null}
-            previousMerchantOffer={previousTurn?.merchant ?? null}
+            thinking={thinking !== null}
             leverageHistory={transcript
               .filter((t): t is TranscriptTurn & { leverage: LeverageScoreDTO } => t.leverage !== null)
               .map((t) => ({ turn: t.turn, leverage: t.leverage }))}
           />
 
-          <AgentLoopPanel transcript={transcript} />
+          {apiError && (
+            <p className="rounded-xl border border-red-500/30 bg-red-500/[.06] px-4 py-3 text-sm text-red-300">
+              {apiError}
+            </p>
+          )}
 
-          <ol className="flex flex-col gap-4">
-            {transcript.map((turn) => (
-              <li key={turn.turn}>
-                <p className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">
-                  Round {turn.turn}
-                </p>
-                <div className="flex flex-col gap-3">
-                  <MessageBubble side="buyer" msg={turn.buyer} />
-                  <MessageBubble side="merchant" msg={turn.merchant} />
-                  <AgentDecisionPanel decisionAudit={turn.decisionAudit} />
-                </div>
-              </li>
-            ))}
+          <NegotiationTimeline transcript={transcript} thinking={thinking} />
 
-            {thinking && (
-              <li>
-                <div
-                  className={`flex items-center gap-2 rounded-lg border border-dashed p-3 text-sm ${
-                    thinking.agent === "buyer"
-                      ? "border-blue-200 text-blue-700 dark:border-blue-900/50 dark:text-blue-300"
-                      : "border-amber-200 text-amber-700 dark:border-amber-900/50 dark:text-amber-300"
-                  } ${thinking.agent === "buyer" ? "" : "ml-6 sm:ml-12"}`}
-                >
-                  <span className="inline-flex gap-0.5">
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.3s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current [animation-delay:-0.15s]" />
-                    <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-current" />
-                  </span>
-                  <span>{thinking.label}</span>
-                </div>
-              </li>
-            )}
-          </ol>
-
-          {status && TERMINAL_STATUSES.includes(status) && (
+          {status && isTerminal && (
             <OutcomeCard
               status={status}
               agreement={agreement}
@@ -634,42 +446,23 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
               productName={selectedProduct?.name ?? null}
               round={round}
               maxRounds={maxRounds}
+              onStartOver={handleStartOver}
             />
           )}
 
           <AuditTrailPanel sessionId={sessionId} productName={selectedProduct?.name ?? null} />
+
+          {isTerminal && (
+            <button
+              type="button"
+              onClick={handleStartOver}
+              className="self-start text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
+            >
+              ← Start a new negotiation
+            </button>
+          )}
         </section>
       )}
-    </div>
-  );
-}
-
-/** Static, always-visible explainer of what each agent is trying to do — never gated on a negotiation running. */
-function AgentObjectivesHeader() {
-  return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-      <div className="rounded-xl border border-blue-200 bg-blue-50/60 p-4 dark:border-blue-900/40 dark:bg-blue-950/20">
-        <p className="text-xs font-semibold uppercase tracking-wider text-blue-700 dark:text-blue-400">
-          Buyer Agent
-        </p>
-        <p className="mt-1 text-sm text-zinc-800 dark:text-zinc-200">
-          Goal: get the best possible price ↓
-        </p>
-        <p className="text-xs text-zinc-500 dark:text-zinc-500">
-          Constraint: maximum budget it can never exceed
-        </p>
-      </div>
-      <div className="rounded-xl border border-amber-200 bg-amber-50/60 p-4 dark:border-amber-900/40 dark:bg-amber-950/20">
-        <p className="text-xs font-semibold uppercase tracking-wider text-amber-700 dark:text-amber-400">
-          Merchant Agent
-        </p>
-        <p className="mt-1 text-sm text-zinc-800 dark:text-zinc-200">
-          Goal: get the best possible selling price ↑
-        </p>
-        <p className="text-xs text-zinc-500 dark:text-zinc-500">
-          Constraint: a private reservation price it can never go below
-        </p>
-      </div>
     </div>
   );
 }
@@ -678,9 +471,8 @@ function AgentObjectivesHeader() {
  * Natural-Language Buyer Intent (Roadmap Step 1) — the primary entry
  * point: free text in, "Understand my request" turns it into the same
  * structured request the form below has always produced (see
- * buyerIntentParser.ts). Purely a text box + two buttons — the
- * structured form itself is untouched and always one click away via
- * "Or fill in the form manually".
+ * buyerIntentParser.ts). The structured form itself is untouched and
+ * always one click away via "Or fill in the form manually".
  */
 function IntentEntry({
   value,
@@ -700,58 +492,59 @@ function IntentEntry({
   onSkipToForm: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
-      <div>
-        <h2 className="text-lg font-medium text-black dark:text-zinc-50">
+    <div className="flex flex-col gap-6">
+      <div className="flex flex-col gap-2">
+        <h1 className="text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
           What are you looking to buy?
-        </h2>
-        <p className="text-sm text-zinc-600 dark:text-zinc-400">
-          Describe it in your own words — the Buyer Agent turns this into a structured
-          request before it starts negotiating.
+        </h1>
+        <p className="text-sm leading-6 text-muted">
+          Describe it in your own words. Your Buyer Agent turns this into a structured
+          request, then negotiates it directly with the merchant&rsquo;s Agent.
         </p>
       </div>
 
-      <textarea
-        value={value}
-        disabled={disabled || loading}
-        onChange={(e) => onChange(e.target.value)}
-        rows={3}
-        placeholder="e.g. I need 300 wireless keyboard and mouse combos for our office. I need them within 5 days. I'd like to stay around ₹1,200 each, but I can pay a little more if I can get faster delivery."
-        className="resize-none rounded-md border border-black/[.15] bg-white px-3 py-2 text-sm text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
-      />
-
-      {notice && <p className="text-sm text-red-600 dark:text-red-400">{notice}</p>}
-
-      <div className="flex flex-wrap items-center gap-3">
-        <button
-          type="button"
+      <div className="flex flex-col gap-3 rounded-2xl border border-border bg-surface p-4 transition-colors focus-within:border-border-strong sm:p-5">
+        <textarea
+          value={value}
           disabled={disabled || loading}
-          onClick={onSubmit}
-          className="flex h-11 items-center justify-center rounded-full bg-foreground px-6 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
-        >
-          {loading ? "Understanding…" : "Understand my request"}
-        </button>
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={onSkipToForm}
-          className="text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
-        >
-          Or fill in the form manually
-        </button>
+          onChange={(e) => onChange(e.target.value)}
+          rows={4}
+          placeholder="I need 300 wireless keyboard and mouse combos for our office. I need them within 5 days. I'd like to stay around ₹1,200 each, but I can pay a little more if I can get faster delivery."
+          className="resize-none bg-transparent text-base leading-7 text-foreground placeholder:text-muted/70 focus:outline-none disabled:opacity-50"
+        />
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-border pt-3">
+          <button
+            type="button"
+            disabled={disabled}
+            onClick={onSkipToForm}
+            className="text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
+          >
+            Fill in the form instead
+          </button>
+          <button
+            type="button"
+            disabled={disabled || loading}
+            onClick={onSubmit}
+            className="flex h-11 items-center justify-center rounded-full bg-accent px-6 text-sm font-medium text-accent-foreground transition-colors hover:brightness-110 disabled:opacity-50"
+          >
+            {loading ? "Understanding…" : "Understand my request"}
+          </button>
+        </div>
       </div>
+
+      {notice && <p className="text-sm text-red-300">{notice}</p>}
     </div>
   );
 }
 
 /**
- * "BUYER AGENT UNDERSTOOD" confirmation/editing layer — shown after a
- * successful parse. Every value here is a direct, unmodified field of
- * the BuyerIntent the server returned (see buyerIntentParser.ts);
- * nothing is recomputed here. "Start Autonomous Negotiation" hands this
- * straight to the existing, unmodified negotiation flow; "Edit details"
- * reveals the existing structured form, pre-filled with these same
- * values, for anyone who wants to adjust something first.
+ * "Here's what your agent understood" — the confirmation/editing layer
+ * shown after a successful parse. Every value here is a direct,
+ * unmodified field of the BuyerIntent the server returned (see
+ * buyerIntentParser.ts); nothing is recomputed here. "Start autonomous
+ * negotiation" hands this straight to the existing, unmodified
+ * negotiation flow; "Edit details" reveals the structured form,
+ * pre-filled with these same values.
  */
 function IntentConfirmation({
   intent,
@@ -767,66 +560,39 @@ function IntentConfirmation({
   onReset: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
-      <p className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">
-        Buyer Agent understood
-      </p>
+    <div className="flex flex-col gap-6">
+      <div>
+        <p className="text-xs font-semibold tracking-widest text-muted uppercase">Buyer Agent understood</p>
+        <h1 className="mt-1 text-3xl font-semibold tracking-tight text-foreground sm:text-4xl">
+          {intent.productName}
+        </h1>
+        <p className="mt-1 text-lg text-muted">{intent.quantity} units</p>
+      </div>
 
-      <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Product</dt>
-          <dd className="font-medium text-zinc-900 dark:text-zinc-100">{intent.productName}</dd>
-        </div>
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Quantity</dt>
-          <dd className="font-medium text-zinc-900 dark:text-zinc-100">{intent.quantity} units</dd>
-        </div>
+      <dl className="grid grid-cols-2 gap-px overflow-hidden rounded-2xl border border-border bg-border sm:grid-cols-3">
         {intent.targetPrice !== undefined && (
-          <div>
-            <dt className="text-xs text-zinc-500 dark:text-zinc-500">Target price</dt>
-            <dd className="font-medium text-zinc-900 dark:text-zinc-100">
-              {formatInr(intent.targetPrice)} / unit
-            </dd>
-          </div>
+          <IntentField label="Target" value={`${formatInr(intent.targetPrice)} / unit`} />
         )}
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Maximum budget</dt>
-          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
-            {formatInr(intent.maxPrice)} / unit
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Delivery</dt>
-          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
-            Within {intent.deliveryDeadlineDays} day(s)
-          </dd>
-        </div>
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Priority</dt>
-          <dd className="font-medium capitalize text-zinc-900 dark:text-zinc-100">{intent.urgency}</dd>
-        </div>
-        <div>
-          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Delivery flexibility</dt>
-          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
-            {intent.deliveryFlexible ? "Yes" : "No"}
-          </dd>
-        </div>
+        <IntentField label="Maximum" value={`${formatInr(intent.maxPrice)} / unit`} />
+        <IntentField label="Delivery" value={`Within ${intent.deliveryDeadlineDays} day(s)`} />
+        <IntentField label="Priority" value={intent.urgency} capitalize />
+        <IntentField label="Delivery flexibility" value={intent.deliveryFlexible ? "Yes" : "No"} />
       </dl>
 
-      <div className="flex flex-wrap items-center gap-3">
+      <div className="flex flex-wrap items-center gap-4">
         <button
           type="button"
           disabled={running}
           onClick={onStart}
-          className="flex h-11 items-center justify-center rounded-full bg-foreground px-6 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
+          className="flex h-12 items-center justify-center rounded-full bg-accent px-7 text-base font-medium text-accent-foreground transition-colors hover:brightness-110 disabled:opacity-50"
         >
-          {running ? "Negotiating…" : "Start Autonomous Negotiation"}
+          {running ? "Negotiating…" : "Start autonomous negotiation"}
         </button>
         <button
           type="button"
           disabled={running}
           onClick={onEdit}
-          className="rounded-full border border-black/[.12] px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
+          className="text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
         >
           Edit details
         </button>
@@ -834,7 +600,7 @@ function IntentConfirmation({
           type="button"
           disabled={running}
           onClick={onReset}
-          className="text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
+          className="text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
         >
           Describe something else
         </button>
@@ -843,84 +609,277 @@ function IntentConfirmation({
   );
 }
 
-function priceTrend(current: number | null, previous: number | null): "up" | "down" | null {
-  if (current === null || previous === null || current === previous) {
-    return null;
-  }
-  return current > previous ? "up" : "down";
+function IntentField({ label, value, capitalize }: { label: string; value: string; capitalize?: boolean }) {
+  return (
+    <div className="flex flex-col gap-1 bg-background px-5 py-4">
+      <dt className="text-xs text-muted">{label}</dt>
+      <dd className={`text-lg font-medium text-foreground ${capitalize ? "capitalize" : ""}`}>{value}</dd>
+    </div>
+  );
 }
 
-function NegotiationStateHeader({
+/**
+ * The manual structured form — a secondary, always-available fallback
+ * (see design brief: "Do not remove the manual form; it can be
+ * secondary"). Every field/handler here is exactly what NegotiationDemo
+ * already owned; only the presentation changed.
+ */
+function StructuredForm({
+  form,
+  setForm,
+  products,
+  presets,
+  selectedProduct,
+  maxOrderValuePreview,
+  running,
+  formError,
+  apiError,
+  intentNotice,
+  onSubmit,
+  onBackToIntent,
+}: {
+  form: BuyerRequestFormValues;
+  setForm: (form: BuyerRequestFormValues) => void;
+  products: PublicManifestProduct[];
+  presets: ReturnType<typeof getScenarioPresets>;
+  selectedProduct: PublicManifestProduct | null;
+  maxOrderValuePreview: number | null;
+  running: boolean;
+  formError: string | null;
+  apiError: string | null;
+  intentNotice: string | null;
+  onSubmit: (event: FormEvent<HTMLFormElement>) => void;
+  onBackToIntent: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4">
+      <button
+        type="button"
+        disabled={running}
+        onClick={onBackToIntent}
+        className="self-start text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
+      >
+        ← Back to natural language
+      </button>
+
+      {intentNotice && (
+        <p className="rounded-xl border border-amber-500/30 bg-amber-500/[.06] px-4 py-3 text-sm text-amber-200">
+          {intentNotice}
+        </p>
+      )}
+
+      <div>
+        <h2 className="text-xl font-medium text-foreground">Start a negotiation</h2>
+        <p className="text-sm text-muted">
+          Tell the Buyer Agent what it&rsquo;s shopping for.
+        </p>
+      </div>
+
+      {presets.length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {presets.map((preset) => (
+            <button
+              key={preset.id}
+              type="button"
+              disabled={running}
+              title={preset.description}
+              onClick={() => setForm(preset.values)}
+              className="rounded-full border border-border px-3 py-1.5 text-xs font-medium text-muted transition-colors hover:border-border-strong hover:text-foreground disabled:opacity-50"
+            >
+              {preset.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      <form onSubmit={onSubmit} className="flex flex-col gap-4 rounded-2xl border border-border bg-surface p-5">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium text-muted">Product</span>
+            <select
+              value={form.sku}
+              disabled={running}
+              onChange={(e) => setForm({ ...form, sku: e.target.value })}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-foreground disabled:opacity-50"
+            >
+              {products.map((product) => (
+                <option key={product.sku} value={product.sku}>
+                  {product.name}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium text-muted">Quantity</span>
+            <input
+              type="number"
+              min={1}
+              disabled={running}
+              value={form.quantity}
+              onChange={(e) => setForm({ ...form, quantity: e.target.value })}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-foreground disabled:opacity-50"
+            />
+          </label>
+
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium text-muted">Maximum price per unit (₹)</span>
+            <input
+              type="number"
+              min={1}
+              disabled={running}
+              value={form.maxUnitPrice}
+              onChange={(e) => setForm({ ...form, maxUnitPrice: e.target.value })}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-foreground disabled:opacity-50"
+            />
+          </label>
+
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium text-muted">Delivery deadline (days)</span>
+            <input
+              type="number"
+              min={1}
+              disabled={running}
+              value={form.deliveryDeadlineDays}
+              onChange={(e) => setForm({ ...form, deliveryDeadlineDays: e.target.value })}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-foreground disabled:opacity-50"
+            />
+          </label>
+
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium text-muted">Buyer urgency</span>
+            <select
+              value={form.urgency}
+              disabled={running}
+              onChange={(e) => setForm({ ...form, urgency: e.target.value as BuyerRequestFormValues["urgency"] })}
+              className="rounded-lg border border-border bg-background px-3 py-2 text-foreground disabled:opacity-50"
+            >
+              <option value="low">Low — can wait</option>
+              <option value="medium">Medium</option>
+              <option value="high">High — needs it fast</option>
+            </select>
+          </label>
+
+          <label className="flex items-center gap-2 self-end pb-2 text-sm">
+            <input
+              type="checkbox"
+              disabled={running}
+              checked={form.deliveryFlexible}
+              onChange={(e) => setForm({ ...form, deliveryFlexible: e.target.checked })}
+              className="h-4 w-4 rounded border-border disabled:opacity-50"
+            />
+            <span className="font-medium text-muted">Flexible on delivery (trade for a better price)</span>
+          </label>
+        </div>
+
+        {selectedProduct && (
+          <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-white/[.03] px-4 py-3 text-xs text-muted">
+            <span>
+              Listed price: <span className="font-medium text-foreground">{formatInr(selectedProduct.listedPrice)} / unit</span>
+            </span>
+            <span>
+              Available: <span className="font-medium text-foreground">{selectedProduct.availableQuantity}</span>
+            </span>
+            <span>
+              Standard delivery: <span className="font-medium text-foreground">{selectedProduct.standardDeliveryDays}d</span>
+            </span>
+            <span>
+              Negotiable: <span className="font-medium text-foreground">{selectedProduct.negotiable ? "Yes" : "No"}</span>
+            </span>
+            {maxOrderValuePreview !== null && (
+              <span className="ml-auto">
+                Max order value: <span className="font-medium text-foreground">{formatInr(maxOrderValuePreview)}</span>
+              </span>
+            )}
+          </div>
+        )}
+
+        <div>
+          {formError && <p className="mb-2 text-sm text-red-300">{formError}</p>}
+          {apiError && <p className="mb-2 text-sm text-red-300">{apiError}</p>}
+          <button
+            type="submit"
+            disabled={running}
+            className="flex h-11 items-center justify-center rounded-full bg-accent px-6 text-sm font-medium text-accent-foreground transition-colors hover:brightness-110 disabled:opacity-50"
+          >
+            {running ? "Negotiating…" : "Start Negotiation"}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/**
+ * The focused negotiation workspace's top strip — product, live status,
+ * and the current best terms both sides are converging on. Everything
+ * here is a direct read of the turn-by-turn API responses already held
+ * in state; nothing is computed by this component beyond simple
+ * display arithmetic (the price gap).
+ */
+function WorkspaceHeader({
   status,
+  productLabel,
+  productQuantity,
   round,
   maxRounds,
   buyerOffer,
   merchantOffer,
-  previousBuyerOffer,
-  previousMerchantOffer,
+  thinking,
   leverageHistory,
 }: {
   status: NegotiationStatus | null;
-  /** The visible transcript round to display (displayRound / turn.turn) — deliberately NOT the engine's own round-budget counter (see displayRound's own doc comment). */
+  productLabel: string;
+  productQuantity: number | null;
   round: number;
   maxRounds: number | null;
   buyerOffer: NegotiationMessageDTO | null;
   merchantOffer: NegotiationMessageDTO | null;
-  previousBuyerOffer: NegotiationMessageDTO | null;
-  previousMerchantOffer: NegotiationMessageDTO | null;
+  /** Whether an agent is actively being paced onto the screen right now — drives the OBSERVING/EVALUATING/DECIDING/ACTING rail below; purely presentational, see StateProgression. */
+  thinking: boolean;
   leverageHistory: { turn: number; leverage: LeverageScoreDTO }[];
 }) {
   const buyerPrice = buyerOffer?.unitPrice ?? null;
   const merchantPrice = merchantOffer?.unitPrice ?? null;
-  const buyerTrend = priceTrend(buyerPrice, previousBuyerOffer?.unitPrice ?? null);
-  const merchantTrend = priceTrend(merchantPrice, previousMerchantOffer?.unitPrice ?? null);
   const gap = buyerPrice !== null && merchantPrice !== null ? Math.abs(merchantPrice - buyerPrice) : null;
-  const quantity = merchantOffer?.quantity ?? buyerOffer?.quantity ?? null;
-  const delivery = merchantOffer?.deliveryDays ?? buyerOffer?.deliveryDays ?? null;
+  const isTerminal = status !== null && TERMINAL_STATUSES.includes(status);
 
   return (
-    <div className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-lg font-medium text-black dark:text-zinc-50">AI-to-AI Negotiation</h2>
-        <div className="flex items-center gap-2">
-          {status && (
-            <span
-              className={`rounded-full px-3 py-1 text-xs font-medium ${negotiationStatusBadgeClass(status)}`}
-            >
-              {negotiationStatusLabel(status)}
-            </span>
-          )}
-          <span className="text-xs text-zinc-500 dark:text-zinc-500">
-            Round {round} / {maxRounds ?? "—"}
-          </span>
-        </div>
+    <div className="flex flex-col gap-6 rounded-2xl border border-border bg-surface p-6 sm:p-8">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <span className="inline-flex items-center gap-2 text-xs font-semibold tracking-widest text-muted uppercase">
+          <span
+            className={`h-1.5 w-1.5 rounded-full ${isTerminal ? "bg-white/30" : "animate-pulse bg-accent"}`}
+            aria-hidden
+          />
+          {status ? negotiationStatusLabel(status) : "Negotiating"}
+        </span>
+        <span className="text-xs text-muted">
+          Round {round} of {maxRounds ?? "—"}
+        </span>
       </div>
 
-      {/* Price convergence: both agents' current offers, moving toward each other. */}
-      <div className="flex items-center justify-center gap-3 rounded-lg bg-black/[.03] px-4 py-4 dark:bg-white/[.04] sm:gap-6">
-        <PriceStat label="Buyer offer" price={buyerPrice} trend={buyerTrend} tone="blue" />
-        <div className="flex flex-col items-center gap-1 text-zinc-400 dark:text-zinc-600">
+      <StateProgression active={thinking} agreed={status === "AGREED"} />
+
+      <div>
+        <p className="text-xs text-muted">Product</p>
+        <p className="text-xl font-medium tracking-tight text-foreground">
+          {productQuantity !== null ? `${productQuantity} × ` : ""}
+          {productLabel}
+        </p>
+      </div>
+
+      <div className="flex items-center justify-center gap-3 rounded-xl bg-white/[.03] px-4 py-5 sm:gap-8">
+        <PriceStat label="Buyer offer" price={buyerPrice} tone="blue" />
+        <div className="flex flex-col items-center gap-1 text-muted">
           <span aria-hidden className="text-lg leading-none">
             {gap === 0 ? "✓" : "↔"}
           </span>
-          <span className="whitespace-nowrap text-[11px]">
+          <span className="text-[11px] whitespace-nowrap">
             {gap === null ? "—" : gap === 0 ? "matched" : `gap ${formatInr(gap)}`}
           </span>
         </div>
-        <PriceStat label="Merchant offer" price={merchantPrice} trend={merchantTrend} tone="amber" />
-      </div>
-
-      <div className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-2">
-        <div>
-          <p className="text-xs text-zinc-500 dark:text-zinc-500">Quantity being negotiated</p>
-          <p className="font-medium text-zinc-900 dark:text-zinc-100">{quantity ?? "—"}</p>
-        </div>
-        <div>
-          <p className="text-xs text-zinc-500 dark:text-zinc-500">Delivery being negotiated</p>
-          <p className="font-medium text-zinc-900 dark:text-zinc-100">
-            {delivery !== null ? `${delivery} day(s)` : "—"}
-          </p>
-        </div>
+        <PriceStat label="Merchant offer" price={merchantPrice} tone="amber" />
       </div>
 
       {leverageHistory.length > 0 && <LeverageGraph history={leverageHistory} />}
@@ -932,51 +891,25 @@ function NegotiationStateHeader({
  * Live buyer-vs-merchant leverage visualization. Every number here comes
  * straight from the server's LeverageScoreDTO (see leverage.ts /
  * orchestrator.ts) — computed entirely from deterministic strategic
- * factors (stock, quantity, urgency, delivery flexibility, price
- * position). Nothing on this graph is generated by Gemini, and nothing
- * here can influence the real negotiation — it only visualizes state the
- * deterministic engine already decided.
+ * factors. Nothing on this graph is generated by an LLM, and nothing
+ * here can influence the real negotiation.
  */
 function LeverageGraph({ history }: { history: { turn: number; leverage: LeverageScoreDTO }[] }) {
   const latest = history[history.length - 1].leverage;
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-black/[.08] bg-black/[.02] px-4 py-4 dark:border-white/[.1] dark:bg-white/[.03]">
-      <p className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-        Negotiation leverage
-      </p>
-
-      <LeverageBar label="Buyer leverage" percent={latest.buyer} tone="blue" />
-      <LeverageBar label="Merchant leverage" percent={latest.merchant} tone="amber" />
-
-      {latest.reasons.length > 0 && (
-        <p className="text-xs text-zinc-600 dark:text-zinc-400">{latest.reasons[0]}</p>
-      )}
-
-      {history.length > 1 && (
-        <div className="flex flex-wrap gap-x-4 gap-y-1 border-t border-black/[.06] pt-2 text-[11px] text-zinc-500 dark:border-white/[.08] dark:text-zinc-500">
-          {history.map((h) => (
-            <span key={h.turn}>
-              Round {h.turn} → Buyer {h.leverage.buyer} / Merchant {h.leverage.merchant}
-            </span>
-          ))}
-        </div>
-      )}
+    <div className="flex flex-col gap-3 rounded-xl border border-border px-4 py-4">
+      <p className="text-[11px] font-semibold tracking-widest text-muted uppercase">Negotiation leverage</p>
+      <LeverageBar label="Buyer" percent={latest.buyer} tone="blue" />
+      <LeverageBar label="Merchant" percent={latest.merchant} tone="amber" />
+      {latest.reasons.length > 0 && <p className="text-xs text-muted">{latest.reasons[0]}</p>}
     </div>
   );
 }
 
-function LeverageBar({
-  label,
-  percent,
-  tone,
-}: {
-  label: string;
-  percent: number;
-  tone: "blue" | "amber";
-}) {
-  const barClass = tone === "blue" ? "bg-blue-500 dark:bg-blue-500" : "bg-amber-500 dark:bg-amber-500";
-  const textClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+function LeverageBar({ label, percent, tone }: { label: string; percent: number; tone: "blue" | "amber" }) {
+  const barClass = tone === "blue" ? "bg-blue-400" : "bg-yellow-400";
+  const textClass = tone === "blue" ? "text-blue-300" : "text-yellow-300";
 
   return (
     <div className="flex flex-col gap-1">
@@ -984,161 +917,272 @@ function LeverageBar({
         <span className={`font-medium ${textClass}`}>{label}</span>
         <span className={`font-medium ${textClass}`}>{percent}%</span>
       </div>
-      <div className="h-2 w-full overflow-hidden rounded-full bg-black/[.08] dark:bg-white/[.1]">
-        <div
-          className={`h-full rounded-full transition-all duration-500 ${barClass}`}
-          style={{ width: `${percent}%` }}
-        />
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/[.08]">
+        <div className={`h-full rounded-full transition-all duration-500 ${barClass}`} style={{ width: `${percent}%` }} />
       </div>
     </div>
   );
 }
 
-function PriceStat({
-  label,
-  price,
-  trend,
-  tone,
-}: {
-  label: string;
-  price: number | null;
-  trend: "up" | "down" | null;
-  tone: "blue" | "amber";
-}) {
-  const toneClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+function PriceStat({ label, price, tone }: { label: string; price: number | null; tone: "blue" | "amber" }) {
+  const toneClass = tone === "blue" ? "text-blue-300" : "text-yellow-300";
   return (
     <div className="text-center">
       <p className={`text-xs font-medium ${toneClass}`}>{label}</p>
-      <p className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+      <p className="text-2xl font-semibold tracking-tight text-foreground">
         {price !== null ? formatInr(price) : "—"}
       </p>
-      {trend && (
-        <p className="text-[11px] text-zinc-500 dark:text-zinc-500">
-          {trend === "up" ? "▲ increased" : "▼ decreased"}
-        </p>
-      )}
-    </div>
-  );
-}
-
-function MessageBubble({
-  side,
-  msg,
-}: {
-  side: "buyer" | "merchant";
-  msg: NegotiationMessageDTO | null;
-}) {
-  const isBuyer = side === "buyer";
-  const label = isBuyer ? "Buyer Agent" : "Merchant Agent";
-  const alignClass = isBuyer ? "" : "sm:ml-12";
-  const accentClass = isBuyer
-    ? "border-blue-200 dark:border-blue-900/40"
-    : "border-amber-200 dark:border-amber-900/40";
-
-  if (!msg) {
-    return (
-      <div className={`rounded-xl border border-dashed p-4 opacity-40 ${accentClass} ${alignClass}`}>
-        <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
-          {label}
-        </span>
-      </div>
-    );
-  }
-
-  return (
-    <div className={`rounded-xl border bg-black/[.02] p-4 dark:bg-white/[.03] ${accentClass} ${alignClass}`}>
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-500">
-          {label}
-        </span>
-        <span className="flex items-center gap-1.5">
-          {msg.move && (
-            <span
-              className={`rounded px-2 py-0.5 text-xs font-medium ${negotiationMoveBadgeClass(msg.move)}`}
-            >
-              {negotiationMoveLabel(msg.move)}
-            </span>
-          )}
-          <span
-            className={`rounded px-2 py-0.5 text-xs font-medium ${negotiationMessageTypeBadgeClass(msg.type)}`}
-          >
-            {negotiationMessageTypeLabel(msg.type)}
-          </span>
-        </span>
-      </div>
-      <p className="text-sm leading-relaxed text-zinc-800 dark:text-zinc-200">{msg.message}</p>
-      <dl className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-zinc-600 dark:text-zinc-400">
-        <div className="flex gap-1">
-          <dt className="text-zinc-400 dark:text-zinc-600">Qty:</dt>
-          <dd>{msg.quantity ?? "—"}</dd>
-        </div>
-        <div className="flex gap-1">
-          <dt className="text-zinc-400 dark:text-zinc-600">Unit price:</dt>
-          <dd>{msg.unitPrice !== null ? formatInr(msg.unitPrice) : "—"}</dd>
-        </div>
-        <div className="flex gap-1">
-          <dt className="text-zinc-400 dark:text-zinc-600">Delivery:</dt>
-          <dd>{msg.deliveryDays !== null ? `${msg.deliveryDays} day(s)` : "—"}</dd>
-        </div>
-      </dl>
     </div>
   );
 }
 
 /**
- * Agentic Decision + Audit Trail (first layer): a concise, per-round view
- * of WHY each side chose HOLD / CONCEDE / a trade — deterministic
- * reasons and strategic factors the rule engine already computed (see
- * agentDecision.ts), never the LLM's own reasoning and never hidden
- * chain-of-thought (the LLM never even sees this data — see
- * buyerAgent.ts / merchantAgent.ts). Renders nothing when there's
- * nothing to show (a structural walk-away closed before either agent
- * made a fresh decision this round).
+ * The negotiation narrative — a vertical timeline of Buyer Agent /
+ * Merchant Agent turns, connected by a running line, plus the transient
+ * "agent status" indicator while a turn is being paced onto the screen.
+ * Deliberately NOT a chat transcript: each entry is labeled by which
+ * autonomous agent acted, carries its resulting terms as the headline,
+ * and offers a "Why this move?" control for the same structured
+ * decision data already computed server-side (agentDecision.ts) —
+ * never chain-of-thought.
  */
-function AgentDecisionPanel({ decisionAudit }: { decisionAudit: TurnDecisionAudit | null }) {
-  if (!decisionAudit) {
-    return null;
-  }
+function NegotiationTimeline({
+  transcript,
+  thinking,
+}: {
+  transcript: TranscriptTurn[];
+  thinking: { agent: "buyer" | "merchant"; label: string } | null;
+}) {
+  const entries: { key: string; node: ReactNode }[] = [];
 
-  const buyerMove = decisionAudit.buyer.move;
-  const merchantMove = decisionAudit.merchant?.move;
+  transcript.forEach((turn) => {
+    entries.push({
+      key: `${turn.turn}-buyer`,
+      node: (
+        <TimelineEntry
+          side="buyer"
+          roundLabel={`Round ${turn.turn}`}
+          msg={turn.buyer}
+          decision={turn.decisionAudit?.buyer ?? null}
+        />
+      ),
+    });
+    if (turn.merchant) {
+      entries.push({
+        key: `${turn.turn}-merchant`,
+        node: (
+          <TimelineEntry
+            side="merchant"
+            roundLabel={`Round ${turn.turn}`}
+            msg={turn.merchant}
+            decision={turn.decisionAudit?.merchant ?? null}
+          />
+        ),
+      });
+    }
+  });
 
   return (
-    <details className="rounded-lg border border-dashed border-black/[.12] px-3 py-2 text-xs dark:border-white/[.18]">
-      {/* Collapsed by default — but the summary line alone already answers
-          "what did each side just do," via the same move badges used on
-          the message bubbles above, so a reader gets the headline without
-          expanding anything. */}
-      <summary className="flex cursor-pointer select-none flex-wrap items-center gap-2 font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-        <span>Agent activity</span>
-        <span className="flex flex-wrap items-center gap-1.5 normal-case tracking-normal">
-          {buyerMove && (
-            <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(buyerMove)}`}>
-              Buyer: {negotiationMoveLabel(buyerMove)}
-            </span>
-          )}
-          {merchantMove && (
+    <ol className="flex flex-col">
+      {entries.map((entry, i) => (
+        <li key={entry.key} className="flex flex-col">
+          {entry.node}
+          {i < entries.length - 1 && <TimelineConnector />}
+        </li>
+      ))}
+
+      {thinking && (
+        <li className="flex flex-col">
+          {entries.length > 0 && <TimelineConnector />}
+          <div className="flex items-center gap-3 py-1">
             <span
-              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(merchantMove)}`}
-            >
-              Merchant: {negotiationMoveLabel(merchantMove)}
-            </span>
-          )}
-        </span>
-      </summary>
-      <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <AgentDecisionSide label="Buyer" tone="blue" record={decisionAudit.buyer} />
-        <AgentDecisionSide label="Merchant" tone="amber" record={decisionAudit.merchant ?? null} />
-      </div>
-    </details>
+              className={`h-2 w-2 rounded-full ${thinking.agent === "buyer" ? "bg-blue-400" : "bg-yellow-400"}`}
+              aria-hidden
+            />
+            <AgentStatusStepper key={`${thinking.agent}-${entries.length}`} agent={thinking.agent} />
+          </div>
+        </li>
+      )}
+    </ol>
   );
+}
+
+function TimelineConnector() {
+  return (
+    <div aria-hidden className="ml-[3px] flex h-6 flex-col items-center">
+      <span className="h-full w-px bg-border-strong" />
+    </div>
+  );
+}
+
+const PROGRESSION_STAGES = ["Observing", "Evaluating", "Deciding", "Acting", "Agreed"] as const;
+
+/**
+ * The workspace-level state progression rail: OBSERVING → EVALUATING →
+ * DECIDING → ACTING → AGREED. The first four pulse together (agent-
+ * agnostic — either side may be mid-turn) exactly while a turn is being
+ * paced onto the screen; the final "Agreed" stage lights up solid, once,
+ * only when the negotiation's real persisted status is AGREED — never
+ * before, and never for REJECTED/EXPIRED (no false "agreed" claim on a
+ * failed negotiation). Purely a presentational reframing of state this
+ * component already holds (`thinking`/`status`) — never a second source
+ * of truth for negotiation state.
+ */
+function StateProgression({ active, agreed }: { active: boolean; agreed: boolean }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1" aria-hidden>
+      {PROGRESSION_STAGES.map((stage, i) => {
+        const isAgreedStage = i === PROGRESSION_STAGES.length - 1;
+        const lit = isAgreedStage ? agreed : active;
+        return (
+          <span key={stage} className="flex items-center gap-2">
+            <span
+              className={`text-[11px] font-medium tracking-wide uppercase transition-colors duration-300 ${
+                lit ? (isAgreedStage ? "text-emerald-300" : "text-accent") : "text-muted/50"
+              }`}
+              style={
+                active && !isAgreedStage
+                  ? { animation: "pact-step 1.6s ease-in-out infinite", animationDelay: `${i * 0.3}s` }
+                  : undefined
+              }
+            >
+              {stage}
+            </span>
+            {!isAgreedStage && <span className="text-muted/30">→</span>}
+          </span>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Cycles the four agent-loop phase labels while a turn is being computed/paced onto the screen — purely presentational motion over the same real delay window this component already used before the redesign; see the design brief's "Observing / Evaluating / Deciding / Acting" requirement. Never a claim about literal sub-turn backend phases. */
+function AgentStatusStepper({ agent }: { agent: "buyer" | "merchant" }) {
+  const steps = ["Observing", "Evaluating", "Deciding", "Acting"];
+  const toneClass = agent === "buyer" ? "text-blue-300" : "text-yellow-300";
+  return (
+    <div className="flex items-center gap-2.5 text-xs font-medium">
+      {steps.map((step, i) => (
+        <span
+          key={step}
+          className={toneClass}
+          style={{
+            opacity: 0.35,
+            animation: "pact-step 1.6s ease-in-out infinite",
+            animationDelay: `${i * 0.3}s`,
+          }}
+        >
+          {step}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+function TimelineEntry({
+  side,
+  roundLabel,
+  msg,
+  decision,
+}: {
+  side: "buyer" | "merchant";
+  roundLabel: string;
+  msg: NegotiationMessageDTO | null;
+  decision: AgentDecisionRecord | null;
+}) {
+  if (!msg) return null;
+
+  const isBuyer = side === "buyer";
+  const label = isBuyer ? "Buyer Agent" : "Merchant Agent";
+  const toneClass = isBuyer ? "text-blue-300" : "text-yellow-300";
+  const dotClass = isBuyer ? "bg-blue-400" : "bg-yellow-400";
+
+  return (
+    <div className="flex flex-col gap-2 py-1">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={`h-2 w-2 rounded-full ${dotClass}`} aria-hidden />
+        <span className={`text-xs font-semibold tracking-wide uppercase ${toneClass}`}>{label}</span>
+        <span className="text-xs text-muted">{roundLabel}</span>
+        {msg.move && (
+          <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${negotiationMoveBadgeClass(msg.move)}`}>
+            {negotiationMoveLabel(msg.move)}
+          </span>
+        )}
+      </div>
+
+      <div className="ml-[3px] flex flex-col gap-2 border-l border-border py-1 pl-6">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <span className="text-2xl font-semibold tracking-tight text-foreground">
+            {msg.unitPrice !== null ? formatInr(msg.unitPrice) : "—"}
+          </span>
+          {msg.quantity !== null && <span className="text-sm text-muted">× {msg.quantity}</span>}
+          {msg.deliveryDays !== null && <span className="text-sm text-muted">· {msg.deliveryDays} day delivery</span>}
+        </div>
+
+        <p className="max-w-2xl text-sm leading-6 text-muted">{msg.message}</p>
+
+        {decision && (
+          <details className="group w-fit">
+            <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-xs font-medium text-muted transition-colors hover:text-foreground">
+              Why this move?
+              <span className="text-[10px] transition-transform group-open:rotate-180">⌄</span>
+            </summary>
+            <div className="animate-fade-in mt-2 max-w-md rounded-xl border border-border bg-surface p-4 text-xs">
+              <AgentDecisionSide label={label} tone={isBuyer ? "blue" : "amber"} record={decision} />
+            </div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DecisionField({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] font-semibold tracking-wide text-muted uppercase">{label}</span>
+      <div className="leading-5 text-zinc-200">{children}</div>
+    </div>
+  );
+}
+
+/**
+ * What this side observed before deciding — see AgentObservation
+ * (agentDecision.ts). Every line is a direct, unmodified echo of a real
+ * input the agent already received; nothing recomputed, nothing
+ * invented.
+ */
+function buildObservedLines(observation: AgentObservation): string[] {
+  const lines: string[] = [];
+  if (observation.previousMerchantOffer?.unitPrice != null) {
+    lines.push(`Merchant offer: ${formatInr(observation.previousMerchantOffer.unitPrice)}`);
+  }
+  if (observation.buyerRequirement.quantity) {
+    lines.push(`Quantity: ${observation.buyerRequirement.quantity}`);
+  }
+  if (observation.buyerRequirement.deliveryDeadlineDays !== undefined) {
+    lines.push(`Delivery deadline: ${observation.buyerRequirement.deliveryDeadlineDays} day(s)`);
+  }
+  if (observation.round !== undefined) {
+    lines.push(`Round: ${observation.round} / ${observation.maxRounds}`);
+  }
+  if (observation.leverage?.buyer !== undefined) {
+    lines.push(
+      `Leverage: ${observation.leverage.buyer}%${
+        observation.leverage.merchant !== undefined ? ` buyer / ${observation.leverage.merchant}% merchant` : ""
+      }`,
+    );
+  }
+  return lines.length > 0 ? lines : ["Its own opening requirement — no prior offer to react to yet."];
 }
 
 /**
  * Exported so AuditTrailPanel.tsx can reuse this exact rendering for a
  * NEGOTIATION_DECISION AuditLog entry, instead of duplicating it — same
  * component, same props, whether the record came from a live turn
- * response or a persisted audit row.
+ * response or a persisted audit row. Structured as OBSERVED / EVALUATED
+ * / SELECTED / REASON — the same fields AgentDecisionRecord already
+ * carries, never chain-of-thought or LLM reasoning.
  */
 export function AgentDecisionSide({
   label,
@@ -1149,348 +1193,71 @@ export function AgentDecisionSide({
   tone: "blue" | "amber";
   record: AgentDecisionRecord | null;
 }) {
-  const toneClass = tone === "blue" ? "text-blue-700 dark:text-blue-400" : "text-amber-700 dark:text-amber-400";
+  const toneClass = tone === "blue" ? "text-blue-300" : "text-yellow-300";
 
   if (!record) {
     return (
-      <div className="text-zinc-400 dark:text-zinc-600">
-        <p className={`font-semibold ${toneClass}`}>{label}</p>
-        <p>No fresh decision this round.</p>
+      <div className="flex flex-col gap-1">
+        <span className={`text-[11px] font-semibold tracking-wide uppercase ${toneClass}`}>{label}</span>
+        <p className="text-muted">No fresh decision this round.</p>
       </div>
     );
   }
 
   const { terms } = record;
   const hasTerms = terms.quantity !== null || terms.unitPrice !== null || terms.deliveryDays !== null;
-  const hasReasons = record.deterministicReasons.length > 0 || record.strategicReasons.length > 0;
+  const reasons = [...record.deterministicReasons, ...record.strategicReasons];
+  const observedLines = buildObservedLines(record.observation);
 
   return (
-    <div className="flex flex-col gap-2">
-      <div className="flex flex-wrap items-center gap-1.5">
-        <p className={`font-semibold ${toneClass}`}>{label}</p>
-        {record.move ? (
-          <span
-            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(record.move)}`}
-          >
-            {negotiationMoveLabel(record.move)}
-          </span>
-        ) : (
-          <span className="text-[10px] text-zinc-400 dark:text-zinc-600">no move this round</span>
-        )}
-      </div>
+    <div className="flex flex-col gap-3">
+      <span className={`text-[11px] font-semibold tracking-wide uppercase ${toneClass}`}>{label}</span>
 
-      {/* State-driven agent loop (OBSERVE step): what this decision was
-          made FROM — see AgentObservation (agentDecision.ts). Every
-          value here is an unmodified echo of a real input the agent
-          already received; never recomputed, never new data. */}
-      <p className="text-zinc-500 dark:text-zinc-500">
-        Observed:{" "}
-        {(
-          [
-            record.observation.previousMerchantOffer?.unitPrice != null
-              ? `reacting to the merchant's offer of ${formatInr(record.observation.previousMerchantOffer.unitPrice)}`
-              : null,
-            record.observation.round !== undefined
-              ? `round ${record.observation.round}/${record.observation.maxRounds}`
-              : null,
-            record.observation.leverage?.buyer !== undefined
-              ? `leverage ${record.observation.leverage.buyer}%${
-                  record.observation.leverage.merchant !== undefined
-                    ? ` buyer / ${record.observation.leverage.merchant}% merchant`
-                    : ""
-                }`
-              : null,
-          ] as (string | null)[]
-        )
-          .filter((part): part is string => part !== null)
-          .join(" · ") || "its own opening requirement — no prior offer to react to yet"}
-      </p>
-
-      {record.sufficiency && (
-        <p className="text-zinc-500 dark:text-zinc-500">
-          Sufficiency:{" "}
-          <span className="font-medium text-zinc-700 dark:text-zinc-300">{record.sufficiency.verdict}</span> —{" "}
-          {record.sufficiency.reason}
-        </p>
-      )}
-
-      {hasReasons ? (
-        <div className="flex flex-col gap-1.5">
-          {record.deterministicReasons.length > 0 && (
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
-                Deterministic
-              </p>
-              <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
-                {record.deterministicReasons.map((reason, i) => (
-                  <li key={i}>{reason}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {record.strategicReasons.length > 0 && (
-            <div>
-              <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
-                Strategic factors
-              </p>
-              <ul className="list-disc pl-4 text-zinc-600 dark:text-zinc-400">
-                {record.strategicReasons.map((reason, i) => (
-                  <li key={i}>{reason}</li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      ) : (
-        <p className="text-zinc-400 dark:text-zinc-600">No additional factors this round.</p>
-      )}
-
-      {hasTerms && (
-        <p className="text-zinc-500 dark:text-zinc-500">
-          Result: {terms.quantity ?? "—"} unit(s) ·{" "}
-          {terms.unitPrice !== null ? formatInr(terms.unitPrice) : "—"} ·{" "}
-          {terms.deliveryDays !== null ? `${terms.deliveryDays} day(s)` : "—"}
-        </p>
-      )}
+      <DecisionField label="Observed">
+        <ul className="flex flex-col gap-0.5">
+          {observedLines.map((line, i) => (
+            <li key={i}>{line}</li>
+          ))}
+        </ul>
+      </DecisionField>
 
       {record.candidates && record.candidates.length > 0 && (
-        <div>
-          <p className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
-            Options considered ({record.candidates.length})
-          </p>
-          <ul className="mt-0.5 flex flex-col gap-0.5">
+        <DecisionField label="Evaluated">
+          <ul className="flex flex-col gap-0.5">
             {record.candidates.map((candidate, i) => {
               const selected = candidate.move === record.move;
               return (
-                <li
-                  key={i}
-                  className={selected ? `font-medium ${toneClass}` : "text-zinc-400 dark:text-zinc-600"}
-                >
-                  {selected ? "✓" : "–"} {negotiationMoveLabel(candidate.move)}: {formatInr(candidate.unitPrice)}
-                  {!selected && " (not chosen)"}
+                <li key={i} className={selected ? `font-medium ${toneClass}` : "text-muted"}>
+                  {selected ? "✓" : "–"} {negotiationMoveLabel(candidate.move)} · {formatInr(candidate.unitPrice)}
                 </li>
               );
             })}
           </ul>
-        </div>
+        </DecisionField>
       )}
-    </div>
-  );
-}
 
-/**
- * Agent Loop visualization: reframes data already computed and already
- * shown elsewhere (message terms, leverage, decisionAudit — see
- * AgentDecisionPanel above) as an observe → evaluate → decide → act →
- * adapt pipeline, one row per round, so it's immediately visible that
- * the agents are repeatedly reading the negotiation state, weighing
- * options, choosing a strategy, acting on it, and reacting to the
- * result next round. Computes nothing new server-side and infers
- * nothing beyond what's already on the wire: every value below is a
- * direct read of turn.buyer/turn.merchant/turn.leverage/turn.decisionAudit,
- * or a plain comparison between two consecutive rounds' own values.
- * Collapsed by default — it summarizes data already visible in the
- * transcript and Agent Activity panel, just reordered as a pipeline, so
- * it stays out of the way until a reader wants the bigger picture.
- */
-function AgentLoopPanel({ transcript }: { transcript: TranscriptTurn[] }) {
-  const revealed = transcript.filter(
-    (t): t is TranscriptTurn & { merchant: NegotiationMessageDTO; leverage: LeverageScoreDTO } =>
-      t.merchant !== null && t.leverage !== null,
-  );
-  if (revealed.length === 0) {
-    return null;
-  }
-
-  return (
-    <details className="rounded-lg border border-dashed border-black/[.12] px-3 py-2 text-xs dark:border-white/[.18]">
-      <summary className="cursor-pointer select-none font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-        Agent loop: observe → evaluate → decide → act → adapt ({revealed.length} round
-        {revealed.length === 1 ? "" : "s"})
-      </summary>
-      <p className="mt-1 text-[11px] text-zinc-400 dark:text-zinc-600">
-        Built entirely from the same decision data shown in Agent Activity below — reordered as a pipeline, nothing new computed.
-      </p>
-      <ol className="mt-3 flex flex-col gap-3">
-        {revealed.map((turn, i) => (
-          <li key={turn.turn} className="border-l-2 border-black/[.08] pl-3 dark:border-white/[.12]">
-            <p className="mb-1 font-semibold text-zinc-500 dark:text-zinc-500">Round {turn.turn}</p>
-            <AgentLoopRound turn={turn} previous={revealed[i - 1] ?? null} />
-          </li>
-        ))}
-      </ol>
-    </details>
-  );
-}
-
-function LoopStage({ label, children }: { label: string; children: ReactNode }) {
-  return (
-    <span className="inline-flex flex-wrap items-baseline gap-1">
-      <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-600">
-        {label}:
-      </span>
-      <span className="text-zinc-600 dark:text-zinc-400">{children}</span>
-    </span>
-  );
-}
-
-function LoopArrow() {
-  return (
-    <span aria-hidden className="text-zinc-300 dark:text-zinc-700">
-      →
-    </span>
-  );
-}
-
-type RevealedTranscriptTurn = TranscriptTurn & {
-  merchant: NegotiationMessageDTO;
-  leverage: LeverageScoreDTO;
-};
-
-function AgentLoopRound({
-  turn,
-  previous,
-}: {
-  turn: RevealedTranscriptTurn;
-  previous: RevealedTranscriptTurn | null;
-}) {
-  const buyerPrice = turn.buyer?.unitPrice ?? null;
-  const merchantPrice = turn.merchant.unitPrice;
-  const gap = buyerPrice !== null && merchantPrice !== null ? Math.abs(merchantPrice - buyerPrice) : null;
-  const quantity = turn.merchant.quantity ?? turn.buyer?.quantity ?? null;
-  const delivery = turn.merchant.deliveryDays ?? turn.buyer?.deliveryDays ?? null;
-
-  const buyerRecord = turn.decisionAudit?.buyer ?? null;
-  const merchantRecord = turn.decisionAudit?.merchant ?? null;
-
-  // "Decide" always has something to show: the winning strategic move
-  // when a genuine candidate comparison happened this round, otherwise
-  // the plain accept/reject/request decision the message itself already
-  // carries — never fabricated, always one of the two real fields.
-  const buyerDecideLabel = buyerRecord?.move
-    ? negotiationMoveLabel(buyerRecord.move)
-    : turn.buyer
-      ? negotiationMessageTypeLabel(turn.buyer.type)
-      : null;
-  const merchantDecideLabel = merchantRecord?.move
-    ? negotiationMoveLabel(merchantRecord.move)
-    : negotiationMessageTypeLabel(turn.merchant.type);
-
-  const buyerOptionCount = buyerRecord?.candidates?.length ?? 0;
-  const merchantOptionCount = merchantRecord?.candidates?.length ?? 0;
-
-  // Adaptation: only concrete, comparable deltas against the previous
-  // round's own values — never a claim that the agent "learned"
-  // anything, only what measurably changed (or didn't).
-  const adaptations: string[] = [];
-  if (previous) {
-    if (previous.leverage.buyer !== turn.leverage.buyer || previous.leverage.merchant !== turn.leverage.merchant) {
-      adaptations.push(
-        `Leverage shifted — Buyer ${previous.leverage.buyer}% → ${turn.leverage.buyer}%, Merchant ${previous.leverage.merchant}% → ${turn.leverage.merchant}%`,
-      );
-    }
-
-    const prevBuyerPrice = previous.buyer?.unitPrice ?? null;
-    const prevMerchantPrice = previous.merchant.unitPrice;
-    const prevGap =
-      prevBuyerPrice !== null && prevMerchantPrice !== null ? Math.abs(prevMerchantPrice - prevBuyerPrice) : null;
-    if (prevGap !== null && gap !== null && prevGap !== gap) {
-      adaptations.push(
-        `Price gap ${gap < prevGap ? "narrowed" : "widened"} — ${formatInr(prevGap)} → ${formatInr(gap)}`,
-      );
-    }
-
-    const prevBuyerLabel = previous.decisionAudit?.buyer.move
-      ? negotiationMoveLabel(previous.decisionAudit.buyer.move)
-      : previous.buyer
-        ? negotiationMessageTypeLabel(previous.buyer.type)
-        : null;
-    if (prevBuyerLabel && buyerDecideLabel && prevBuyerLabel !== buyerDecideLabel) {
-      adaptations.push(`Buyer's decision changed — ${prevBuyerLabel} → ${buyerDecideLabel}`);
-    }
-
-    const prevMerchantLabel = previous.decisionAudit?.merchant?.move
-      ? negotiationMoveLabel(previous.decisionAudit.merchant.move)
-      : negotiationMessageTypeLabel(previous.merchant.type);
-    if (prevMerchantLabel !== merchantDecideLabel) {
-      adaptations.push(`Merchant's response changed — ${prevMerchantLabel} → ${merchantDecideLabel}`);
-    }
-
-    if (adaptations.length === 0) {
-      adaptations.push("No material change from the previous round — positions held.");
-    }
-  }
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <LoopStage label="Observe">
-          {[
-            quantity !== null ? `qty ${quantity}` : null,
-            gap !== null ? `gap ${formatInr(gap)}` : null,
-            `leverage ${turn.leverage.buyer}/${turn.leverage.merchant}`,
-            delivery !== null ? `delivery ${delivery}d` : null,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        </LoopStage>
-
-        {(buyerOptionCount > 0 || merchantOptionCount > 0) && (
-          <>
-            <LoopArrow />
-            <LoopStage label="Evaluate">
-              {[
-                buyerOptionCount > 0 ? `Buyer weighed ${buyerOptionCount} option${buyerOptionCount === 1 ? "" : "s"}` : null,
-                merchantOptionCount > 0
-                  ? `Merchant weighed ${merchantOptionCount} option${merchantOptionCount === 1 ? "" : "s"}`
-                  : null,
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            </LoopStage>
-          </>
-        )}
-
-        <LoopArrow />
-        <LoopStage label="Decide">
-          {buyerDecideLabel && (
-            <span
-              className={
-                buyerRecord?.move
-                  ? `rounded px-1 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(buyerRecord.move)}`
-                  : ""
-              }
-            >
-              Buyer: {buyerDecideLabel}
-            </span>
-          )}
-          {buyerDecideLabel && merchantDecideLabel && " · "}
-          <span
-            className={
-              merchantRecord?.move
-                ? `rounded px-1 py-0.5 text-[10px] font-medium ${negotiationMoveBadgeClass(merchantRecord.move)}`
-                : ""
-            }
-          >
-            Merchant: {merchantDecideLabel}
+      <DecisionField label="Selected">
+        <span className={record.move ? `font-medium ${toneClass}` : ""}>
+          {record.move ? negotiationMoveLabel(record.move) : "—"}
+        </span>
+        {hasTerms && (
+          <span className="text-muted">
+            {" "}
+            · {terms.quantity ?? "—"} unit(s) · {terms.unitPrice !== null ? formatInr(terms.unitPrice) : "—"} ·{" "}
+            {terms.deliveryDays !== null ? `${terms.deliveryDays}d` : "—"}
           </span>
-        </LoopStage>
+        )}
+      </DecisionField>
 
-        <LoopArrow />
-        <LoopStage label="Act / Result">
-          {[
-            buyerPrice !== null ? `buyer → ${formatInr(buyerPrice)}` : null,
-            merchantPrice !== null
-              ? `merchant → ${formatInr(merchantPrice)} (${negotiationMessageTypeLabel(turn.merchant.type)})`
-              : `merchant ${negotiationMessageTypeLabel(turn.merchant.type)}`,
-          ]
-            .filter(Boolean)
-            .join(" · ")}
-        </LoopStage>
-      </div>
-
-      {adaptations.length > 0 && (
-        <p className="text-[11px] italic text-zinc-500 dark:text-zinc-500">↻ {adaptations.join(" · ")}</p>
+      {(record.sufficiency || reasons.length > 0) && (
+        <DecisionField label="Reason">
+          <ul className="flex flex-col gap-0.5">
+            {record.sufficiency && <li>{record.sufficiency.reason}</li>}
+            {reasons.map((reason, i) => (
+              <li key={i}>{reason}</li>
+            ))}
+          </ul>
+        </DecisionField>
       )}
     </div>
   );
@@ -1503,6 +1270,7 @@ function OutcomeCard({
   productName,
   round,
   maxRounds,
+  onStartOver,
 }: {
   status: NegotiationStatus;
   agreement: PersistedAgreementDTO | null;
@@ -1511,66 +1279,58 @@ function OutcomeCard({
   /** Milestone 12.5: only used to distinguish an early walk-away EXPIRED from a round-exhaustion EXPIRED — see negotiationFailureExplanation. */
   round: number;
   maxRounds: number | null;
+  onStartOver: () => void;
 }) {
+  const [showPayment, setShowPayment] = useState(false);
+
   if (status === "AGREED" && agreement) {
     return (
-      <div className="flex flex-col gap-4 rounded-xl border-2 border-green-300 bg-green-50 p-5 dark:border-green-800 dark:bg-green-950/30">
-        <div>
-          <h3 className="text-lg font-bold tracking-tight text-green-900 dark:text-green-200">
-            Agreement reached
-          </h3>
-          <p className="text-sm text-green-800/80 dark:text-green-300/80">
-            Buyer and Merchant Agents reached an agreement. It has been recorded as a
-            durable agreement record.
-          </p>
+      <div className="animate-fade-in flex flex-col gap-6 rounded-2xl border border-accent/30 bg-surface p-6 sm:p-8">
+        <div className="flex flex-col gap-1">
+          <p className="text-xs font-semibold tracking-widest text-accent uppercase">Deal agreed</p>
+          <h3 className="text-2xl font-semibold tracking-tight text-foreground">{productName ?? agreement.sku}</h3>
         </div>
-        <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-5">
+
+        <div className="flex flex-wrap items-end gap-x-8 gap-y-4">
           <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Product</dt>
-            <dd className="font-medium text-green-900 dark:text-green-200">
-              {productName ?? agreement.sku}
-            </dd>
+            <p className="text-xs text-muted">Quantity</p>
+            <p className="text-2xl font-semibold text-foreground">{agreement.quantity} units</p>
           </div>
           <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Quantity</dt>
-            <dd className="font-medium text-green-900 dark:text-green-200">
-              {agreement.quantity}
-            </dd>
+            <p className="text-xs text-muted">Unit price</p>
+            <p className="text-2xl font-semibold text-foreground">{formatInr(agreement.unitPrice)}</p>
           </div>
           <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Final unit price</dt>
-            <dd className="font-medium text-green-900 dark:text-green-200">
-              {formatInr(agreement.unitPrice)}
-            </dd>
+            <p className="text-xs text-muted">Delivery</p>
+            <p className="text-2xl font-semibold text-foreground">{agreement.deliveryDays} day(s)</p>
           </div>
-          <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Delivery</dt>
-            <dd className="font-medium text-green-900 dark:text-green-200">
-              {agreement.deliveryDays} day(s)
-            </dd>
+          <div className="ml-auto">
+            <p className="text-xs text-muted">Total</p>
+            <p className="text-3xl font-semibold tracking-tight text-accent">{formatInr(agreement.totalAmount)}</p>
           </div>
-          <div>
-            <dt className="text-green-700/70 dark:text-green-400/70">Total amount</dt>
-            <dd className="font-medium text-green-900 dark:text-green-200">
-              {formatInr(agreement.totalAmount)}
-            </dd>
-          </div>
-        </dl>
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 border-t border-green-200 pt-3 text-xs text-green-700/80 dark:border-green-900/50 dark:text-green-400/70">
+        </div>
+
+        <div className="flex items-center justify-between border-t border-border pt-4 text-xs text-muted">
           <span>
             Agreement ID: <span className="font-mono">{agreement.id}</span>
           </span>
-          {/* Deliberately no "Status: {agreement.status}" line here — that
-              was a one-time PersistedAgreementDTO snapshot, captured the
-              moment the negotiation reached AGREED, and never refreshed
-              afterward (see this component's own header comment: this
-              module never re-fetches the Agreement after that point).
-              PaymentPanel below is the sole, live-refreshed source of
-              truth for payment status — rendering a second, frozen copy
-              here previously showed a permanently stale "pending_payment"
-              even after a real payment succeeded. */}
         </div>
-        <PaymentPanel agreementId={agreement.id} productName={productName ?? agreement.sku} />
+
+        {showPayment ? (
+          <PaymentPanel
+            agreementId={agreement.id}
+            productName={productName ?? agreement.sku}
+            onStartOver={onStartOver}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowPayment(true)}
+            className="flex h-12 w-fit items-center justify-center rounded-full bg-accent px-7 text-base font-medium text-accent-foreground transition-colors hover:brightness-110"
+          >
+            Proceed to payment
+          </button>
+        )}
       </div>
     );
   }
@@ -1581,14 +1341,13 @@ function OutcomeCard({
       : null;
 
   return (
-    <div className="flex flex-col gap-2 rounded-xl border-2 border-red-300 bg-red-50 p-5 dark:border-red-900 dark:bg-red-950/30">
-      <h3 className="text-lg font-bold tracking-tight text-red-900 dark:text-red-200">
-        Negotiation failed — {negotiationStatusLabel(status)}
+    <div className="animate-fade-in flex flex-col gap-2 rounded-2xl border border-red-500/30 bg-surface p-6 sm:p-8">
+      <p className="text-xs font-semibold tracking-widest text-red-300 uppercase">No deal</p>
+      <h3 className="text-xl font-semibold tracking-tight text-foreground">
+        Negotiation {negotiationStatusLabel(status).toLowerCase()}
       </h3>
-      {explanation && <p className="text-sm text-red-800 dark:text-red-300">{explanation}</p>}
-      <p className="text-sm text-red-800/80 dark:text-red-300/80">
-        {lastTurn?.merchant?.message ?? "The negotiation ended without an agreement."}
-      </p>
+      {explanation && <p className="text-sm text-muted">{explanation}</p>}
+      <p className="text-sm text-muted">{lastTurn?.merchant?.message ?? "The negotiation ended without an agreement."}</p>
     </div>
   );
 }

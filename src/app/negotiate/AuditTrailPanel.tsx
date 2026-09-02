@@ -1,6 +1,6 @@
 "use client";
 
-// Read-only Audit Trail viewer — Roadmap milestone: demonstrates
+// Read-only Audit Trail viewer — demonstrates
 // Agent decision -> persisted AuditLog -> API -> UI, not "data that
 // happens to still exist in React state." This panel NEVER reads the
 // live transcript/decisionAudit state NegotiationDemo.tsx already holds
@@ -17,7 +17,7 @@ import { formatInr } from "./negotiationUi";
 interface AuditTrailPanelProps {
   /** The negotiation session to inspect — null before a negotiation has actually been created (nothing to fetch yet). */
   sessionId: string | null;
-  /** Display-only, for the AGREEMENT_CREATED card — the same product name OutcomeCard already resolves from the client's own product list; falls back to the persisted sku when unavailable. */
+  /** Display-only, for the AGREEMENT_CREATED row — the same product name OutcomeCard already resolves from the client's own product list; falls back to the persisted sku when unavailable. */
   productName: string | null;
 }
 
@@ -55,41 +55,39 @@ export function AuditTrailPanel({ sessionId, productName }: AuditTrailPanelProps
   }
 
   return (
-    <div className="flex flex-col gap-3 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
+    <div id="audit-trail" className="flex scroll-mt-24 flex-col gap-4 rounded-2xl border border-border p-6 sm:p-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-medium text-black dark:text-zinc-50">Audit Trail</h2>
-          <p className="text-sm text-zinc-600 dark:text-zinc-400">Persisted events from this negotiation</p>
+          <h2 className="text-lg font-medium text-foreground">Audit Trail</h2>
+          <p className="text-sm text-muted">
+            Persisted events from this negotiation
+            {opened && entries && entries.length > 0 && (
+              <span className="text-muted"> · {entries.length} recorded</span>
+            )}
+          </p>
         </div>
         <button
           type="button"
           onClick={handleViewAuditTrail}
           disabled={loading}
-          className="rounded-full border border-black/[.12] px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
+          className="rounded-full border border-border px-4 py-2 text-sm font-medium text-foreground transition-colors hover:border-border-strong disabled:opacity-50"
         >
           {loading ? "Loading…" : opened ? "Refresh" : "View Audit Trail"}
         </button>
       </div>
 
       {opened && (
-        <div className="flex flex-col gap-1">
-          {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+        <div className="animate-fade-in flex flex-col">
+          {error && <p className="text-sm text-red-300">{error}</p>}
 
           {!error && entries && entries.length === 0 && (
-            <p className="text-sm text-zinc-500 dark:text-zinc-500">No audit events recorded yet.</p>
+            <p className="text-sm text-muted">No audit events recorded yet.</p>
           )}
 
           {!error && entries && entries.length > 0 && (
             <ol className="flex flex-col">
-              {entries.map((entry, i) => (
-                <li key={entry.id} className="flex flex-col">
-                  <AuditTrailEntryCard entry={entry} productName={productName} />
-                  {i < entries.length - 1 && (
-                    <div aria-hidden className="flex justify-center py-1 text-zinc-300 dark:text-zinc-700">
-                      ↓
-                    </div>
-                  )}
-                </li>
+              {entries.map((entry) => (
+                <AuditTrailEntryRow key={entry.id} entry={entry} productName={productName} />
               ))}
             </ol>
           )}
@@ -104,107 +102,6 @@ function formatTimestamp(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString();
 }
 
-function AuditTrailEntryCard({
-  entry,
-  productName,
-}: {
-  entry: AuditTrailEntryDTO;
-  productName: string | null;
-}) {
-  if (entry.eventType === "NEGOTIATION_DECISION" && entry.decision) {
-    return <NegotiationDecisionEntry entry={entry} decision={entry.decision} />;
-  }
-  if (entry.eventType === "AGREEMENT_CREATED") {
-    return <AgreementCreatedEntry entry={entry} productName={productName} />;
-  }
-  return <GenericAuditEntry entry={entry} />;
-}
-
-/**
- * A persisted NEGOTIATION_DECISION row — reuses AgentDecisionSide (the
- * exact component the live Agent Activity panel already uses) so the
- * rendering logic exists in exactly one place, whether it's fed from a
- * live turn response or a persisted audit row.
- */
-function NegotiationDecisionEntry({
-  entry,
-  decision,
-}: {
-  entry: AuditTrailEntryDTO;
-  decision: TurnDecisionAudit;
-}) {
-  return (
-    <div className="rounded-lg border border-dashed border-black/[.12] p-3 text-xs dark:border-white/[.18]">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-500">
-          Round {entry.turn} decision
-        </span>
-        <span className="text-[11px] text-zinc-400 dark:text-zinc-600">{formatTimestamp(entry.createdAt)}</span>
-      </div>
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <AgentDecisionSide label="Buyer" tone="blue" record={decision.buyer} />
-        <AgentDecisionSide label="Merchant" tone="amber" record={decision.merchant ?? null} />
-      </div>
-    </div>
-  );
-}
-
-function AgreementCreatedEntry({
-  entry,
-  productName,
-}: {
-  entry: AuditTrailEntryDTO;
-  productName: string | null;
-}) {
-  const payload = entry.payload ?? {};
-  const sku = typeof payload.sku === "string" ? payload.sku : null;
-  const quantity = typeof payload.quantity === "number" ? payload.quantity : null;
-  const unitPrice = typeof payload.unitPrice === "number" ? payload.unitPrice : null;
-  const deliveryDays = typeof payload.deliveryDays === "number" ? payload.deliveryDays : null;
-  const totalAmount = typeof payload.totalAmount === "number" ? payload.totalAmount : null;
-
-  return (
-    <div className="rounded-lg border-2 border-green-300 bg-green-50 p-3 text-xs dark:border-green-800 dark:bg-green-950/30">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <span className="text-xs font-semibold uppercase tracking-wider text-green-700 dark:text-green-400">
-          Agreement Created
-        </span>
-        <span className="text-[11px] text-green-700/70 dark:text-green-400/70">
-          {formatTimestamp(entry.createdAt)}
-        </span>
-      </div>
-      <dl className="grid grid-cols-2 gap-3 sm:grid-cols-5">
-        <div>
-          <dt className="text-green-700/70 dark:text-green-400/70">Product</dt>
-          <dd className="font-medium text-green-900 dark:text-green-200">{productName ?? sku ?? "—"}</dd>
-        </div>
-        <div>
-          <dt className="text-green-700/70 dark:text-green-400/70">Quantity</dt>
-          <dd className="font-medium text-green-900 dark:text-green-200">{quantity ?? "—"}</dd>
-        </div>
-        <div>
-          <dt className="text-green-700/70 dark:text-green-400/70">Unit price</dt>
-          <dd className="font-medium text-green-900 dark:text-green-200">
-            {unitPrice !== null ? formatInr(unitPrice) : "—"}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-green-700/70 dark:text-green-400/70">Delivery</dt>
-          <dd className="font-medium text-green-900 dark:text-green-200">
-            {deliveryDays !== null ? `${deliveryDays} day(s)` : "—"}
-          </dd>
-        </div>
-        <div>
-          <dt className="text-green-700/70 dark:text-green-400/70">Total amount</dt>
-          <dd className="font-medium text-green-900 dark:text-green-200">
-            {totalAmount !== null ? formatInr(totalAmount) : "—"}
-          </dd>
-        </div>
-      </dl>
-    </div>
-  );
-}
-
 const EVENT_TYPE_LABELS: Record<string, string> = {
   PAYMENT_ORDER_CREATED: "Payment order created",
   PAYMENT_VERIFICATION_STARTED: "Payment verification started",
@@ -217,13 +114,131 @@ const EVENT_TYPE_LABELS: Record<string, string> = {
   PAYMENT_FAILURE_REPORTED: "Payment failure reported",
 };
 
-const EVENT_TYPE_TONE_CLASS: Record<string, string> = {
-  PAYMENT_SUCCEEDED: "text-green-700 dark:text-green-400",
-  RECOVERY_SUCCEEDED: "text-green-700 dark:text-green-400",
-  PAYMENT_FAILED: "text-red-700 dark:text-red-400",
-  RECOVERY_FAILED: "text-red-700 dark:text-red-400",
-  PAYMENT_FAILURE_REPORTED: "text-red-700 dark:text-red-400",
-};
+const FAILURE_EVENT_TYPES = new Set(["PAYMENT_FAILED", "RECOVERY_FAILED", "PAYMENT_FAILURE_REPORTED"]);
+
+/** A short, human label for the checklist row — never fabricated, always derived from the row's own real eventType/turn. */
+function entryLabel(entry: AuditTrailEntryDTO): string {
+  if (entry.eventType === "NEGOTIATION_DECISION") {
+    return `Round ${entry.turn ?? "?"} decision`;
+  }
+  if (entry.eventType === "AGREEMENT_CREATED") {
+    return "Agreement created";
+  }
+  return EVENT_TYPE_LABELS[entry.eventType] ?? entry.eventType;
+}
+
+function hasExpandableDetail(entry: AuditTrailEntryDTO): boolean {
+  if (entry.eventType === "NEGOTIATION_DECISION" || entry.eventType === "AGREEMENT_CREATED") return true;
+  return Object.keys(entry.payload ?? {}).length > 0;
+}
+
+/**
+ * One row of the checklist-style transaction timeline. A negotiation
+ * that hasn't reached AGREED/paid yet simply has fewer rows — nothing
+ * is ever added to fill the gap (see listAuditTrail — the underlying
+ * query only ever returns rows that genuinely exist).
+ */
+function AuditTrailEntryRow({ entry, productName }: { entry: AuditTrailEntryDTO; productName: string | null }) {
+  const [expanded, setExpanded] = useState(false);
+  const expandable = hasExpandableDetail(entry);
+  const isFailure = FAILURE_EVENT_TYPES.has(entry.eventType);
+
+  return (
+    <li className="border-b border-border last:border-0">
+      <button
+        type="button"
+        onClick={() => expandable && setExpanded((v) => !v)}
+        aria-expanded={expanded}
+        className={`flex w-full items-center gap-3 py-3 text-left ${expandable ? "cursor-pointer" : "cursor-default"}`}
+      >
+        <span
+          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] ${
+            isFailure ? "bg-red-500/15 text-red-300" : "bg-emerald-400/15 text-emerald-300"
+          }`}
+          aria-hidden
+        >
+          {isFailure ? "!" : "✓"}
+        </span>
+        <span className="flex-1 text-sm font-medium text-foreground">{entryLabel(entry)}</span>
+        <span className="text-xs text-muted">{formatTimestamp(entry.createdAt)}</span>
+        {expandable && (
+          <span className={`text-[10px] text-muted transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden>
+            ⌄
+          </span>
+        )}
+      </button>
+
+      {expanded && (
+        <div className="animate-fade-in pb-4 pl-8">
+          {entry.eventType === "NEGOTIATION_DECISION" && entry.decision && (
+            <NegotiationDecisionDetail decision={entry.decision} />
+          )}
+          {entry.eventType === "AGREEMENT_CREATED" && (
+            <AgreementCreatedDetail payload={entry.payload ?? {}} productName={productName} />
+          )}
+          {entry.eventType !== "NEGOTIATION_DECISION" && entry.eventType !== "AGREEMENT_CREATED" && (
+            <GenericEntryDetail payload={entry.payload ?? {}} />
+          )}
+        </div>
+      )}
+    </li>
+  );
+}
+
+/**
+ * A persisted NEGOTIATION_DECISION row's expanded detail — reuses
+ * AgentDecisionSide (the exact component the live negotiation timeline
+ * already uses for "Why this move?") so the rendering logic exists in
+ * exactly one place, whether it's fed from a live turn response or a
+ * persisted audit row.
+ */
+function NegotiationDecisionDetail({ decision }: { decision: TurnDecisionAudit }) {
+  return (
+    <div className="grid grid-cols-1 gap-4 rounded-xl border border-border bg-surface p-4 text-xs sm:grid-cols-2">
+      <AgentDecisionSide label="Buyer" tone="blue" record={decision.buyer} />
+      <AgentDecisionSide label="Merchant" tone="amber" record={decision.merchant ?? null} />
+    </div>
+  );
+}
+
+function AgreementCreatedDetail({
+  payload,
+  productName,
+}: {
+  payload: Record<string, unknown>;
+  productName: string | null;
+}) {
+  const sku = typeof payload.sku === "string" ? payload.sku : null;
+  const quantity = typeof payload.quantity === "number" ? payload.quantity : null;
+  const unitPrice = typeof payload.unitPrice === "number" ? payload.unitPrice : null;
+  const deliveryDays = typeof payload.deliveryDays === "number" ? payload.deliveryDays : null;
+  const totalAmount = typeof payload.totalAmount === "number" ? payload.totalAmount : null;
+
+  return (
+    <dl className="grid grid-cols-2 gap-4 rounded-xl border border-border bg-surface p-4 text-xs sm:grid-cols-5">
+      <div>
+        <dt className="text-muted">Product</dt>
+        <dd className="font-medium text-foreground">{productName ?? sku ?? "—"}</dd>
+      </div>
+      <div>
+        <dt className="text-muted">Quantity</dt>
+        <dd className="font-medium text-foreground">{quantity ?? "—"}</dd>
+      </div>
+      <div>
+        <dt className="text-muted">Unit price</dt>
+        <dd className="font-medium text-foreground">{unitPrice !== null ? formatInr(unitPrice) : "—"}</dd>
+      </div>
+      <div>
+        <dt className="text-muted">Delivery</dt>
+        <dd className="font-medium text-foreground">{deliveryDays !== null ? `${deliveryDays} day(s)` : "—"}</dd>
+      </div>
+      <div>
+        <dt className="text-muted">Total</dt>
+        <dd className="font-medium text-foreground">{totalAmount !== null ? formatInr(totalAmount) : "—"}</dd>
+      </div>
+    </dl>
+  );
+}
 
 function humanizeFactKey(key: string): string {
   return key.replace(/([A-Z])/g, " $1").replace(/^./, (c) => c.toUpperCase());
@@ -237,42 +252,36 @@ function formatFactValue(value: unknown): string {
 }
 
 /**
- * Every other persisted event type (AGREEMENT_CREATED is handled above;
- * everything payment/recovery/webhook-related, plus any future event
- * type this panel doesn't know about yet, lands here) — a compact
- * timeline row of real business facts, never a raw JSON dump.
- * WEBHOOK_RECEIVED's own `rawPayload` is deliberately excluded from the
- * summary facts and only reachable via a collapsed <details>, per this
- * milestone's own "keep the default view compact" requirement.
+ * Every payment/recovery/webhook event's expanded detail — compact
+ * business facts, never a raw JSON dump. WEBHOOK_RECEIVED's own
+ * `rawPayload` is deliberately excluded from the summary facts and only
+ * reachable via a collapsed nested <details>, per the "keep the default
+ * view compact" requirement.
  */
-function GenericAuditEntry({ entry }: { entry: AuditTrailEntryDTO }) {
-  const label = EVENT_TYPE_LABELS[entry.eventType] ?? entry.eventType;
-  const toneClass = EVENT_TYPE_TONE_CLASS[entry.eventType] ?? "text-zinc-600 dark:text-zinc-400";
-  const { rawPayload, ...facts } = entry.payload ?? {};
+function GenericEntryDetail({ payload }: { payload: Record<string, unknown> }) {
+  const { rawPayload, ...facts } = payload;
   const factEntries = Object.entries(facts).filter(
     ([, value]) => value !== undefined && value !== null && value !== "",
   );
 
   return (
-    <div className="rounded-lg border border-black/[.08] bg-black/[.02] p-3 text-xs dark:border-white/[.1] dark:bg-white/[.03]">
-      <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
-        <span className={`text-xs font-semibold uppercase tracking-wider ${toneClass}`}>{label}</span>
-        <span className="text-[11px] text-zinc-400 dark:text-zinc-600">{formatTimestamp(entry.createdAt)}</span>
-      </div>
-      {factEntries.length > 0 && (
-        <dl className="flex flex-wrap gap-x-5 gap-y-1 text-zinc-600 dark:text-zinc-400">
+    <div className="rounded-xl border border-border bg-surface p-4 text-xs">
+      {factEntries.length > 0 ? (
+        <dl className="flex flex-wrap gap-x-6 gap-y-1.5 text-muted">
           {factEntries.map(([key, value]) => (
-            <div key={key} className="flex gap-1">
-              <dt className="text-zinc-400 dark:text-zinc-600">{humanizeFactKey(key)}:</dt>
-              <dd>{formatFactValue(value)}</dd>
+            <div key={key} className="flex gap-1.5">
+              <dt className="text-muted/70">{humanizeFactKey(key)}:</dt>
+              <dd className="text-foreground">{formatFactValue(value)}</dd>
             </div>
           ))}
         </dl>
+      ) : (
+        <p className="text-muted">No additional details.</p>
       )}
       {rawPayload !== undefined && (
-        <details className="mt-1.5">
-          <summary className="cursor-pointer text-zinc-400 dark:text-zinc-600">Raw webhook payload</summary>
-          <pre className="mt-1 max-h-40 overflow-auto rounded bg-black/[.04] p-2 text-[10px] text-zinc-600 dark:bg-white/[.05] dark:text-zinc-400">
+        <details className="mt-2">
+          <summary className="cursor-pointer text-muted">Raw webhook payload</summary>
+          <pre className="mt-1 max-h-40 overflow-auto rounded-lg bg-black/30 p-2 text-[10px] text-muted">
             {JSON.stringify(rawPayload, null, 2)}
           </pre>
         </details>

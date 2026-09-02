@@ -85,9 +85,11 @@ type PanelPhase = "idle" | "starting" | "awaiting_checkout" | "verifying" | "err
 interface PaymentPanelProps {
   agreementId: string;
   productName: string;
+  /** Presentation-only: resets NegotiationDemo's local UI state so a settled deal doesn't strand the user — see NegotiationDemo.tsx's own handleStartOver. Optional so this panel stays usable anywhere a "start over" concept doesn't apply. */
+  onStartOver?: () => void;
 }
 
-export function PaymentPanel({ agreementId, productName }: PaymentPanelProps) {
+export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentPanelProps) {
   const [status, setStatus] = useState<PaymentStatusResponseDTO | null>(null);
   const [phase, setPhase] = useState<PanelPhase>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -117,6 +119,40 @@ export function PaymentPanel({ agreementId, productName }: PaymentPanelProps) {
       cancelled = true;
     };
   }, [agreementId]);
+
+  // Preloads checkout.js as soon as this panel exists (an Agreement
+  // already does), rather than only on the first "Pay Now" click — pure
+  // lifecycle timing, not a change to what gets loaded or how Checkout
+  // itself is configured. Removes the only realistic window in which a
+  // slow/first-time script fetch could delay `.open()` actually
+  // presenting the overlay. Best-effort: a failure here is silently
+  // retried by runCheckout's own loadRazorpayCheckoutScript call when a
+  // real click happens, which still surfaces its own error state.
+  useEffect(() => {
+    loadRazorpayCheckoutScript().catch(() => {
+      // Ignored here — see comment above.
+    });
+  }, []);
+
+  // Razorpay's Standard Checkout already renders its own iframe overlay
+  // (appended to document.body with a very high z-index) the instant
+  // `.open()` is called below — this never navigates the page. What it
+  // does NOT do on its own is guarantee the page behind it visibly reads
+  // as "the same PACT negotiation screen, dimmed underneath a modal"
+  // rather than "something else happened" — so this panel now renders
+  // its own explicit dimmed backdrop (see the JSX below) and locks page
+  // scroll for exactly the lifetime of that overlay, keyed off the same
+  // `phase` state machine `runCheckout` already drives. No payment
+  // logic, order data, or Checkout option changes anywhere in this
+  // effect — purely a same-page presentation guarantee.
+  useEffect(() => {
+    if (phase !== "awaiting_checkout") return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previousOverflow;
+    };
+  }, [phase]);
 
   const submitVerification = useCallback(
     async (body: VerifyRequestBody) => {
@@ -350,39 +386,90 @@ export function PaymentPanel({ agreementId, productName }: PaymentPanelProps) {
   // inferring purely from the attempt list shape.
   const isResumable = latestAttempt?.status === "created" && status.currentRazorpayOrderId !== null;
 
+  const isSettled = status.agreementStatus === "paid" || status.agreementStatus === "recovered";
+
+  // Our own explicit dimmed overlay, present for exactly the lifetime of
+  // Razorpay's real Checkout — see the "awaiting_checkout" scroll-lock
+  // effect above for why this exists alongside (never instead of) the
+  // real Checkout.js overlay. z-40 sits below Razorpay's own
+  // (~10000+) iframe so its modal always renders on top of this dim
+  // layer, which sits above the rest of the negotiation page.
+  const checkoutBackdrop = phase === "awaiting_checkout" && (
+    <div
+      aria-hidden
+      className="animate-fade-in fixed inset-0 z-40 bg-black/70 backdrop-blur-[2px]"
+    />
+  );
+
+  if (isSettled) {
+    return (
+      <div className="animate-fade-in flex flex-col gap-4 rounded-xl border border-emerald-500/25 bg-emerald-400/[.05] p-5">
+        <div>
+          <p className="text-xs font-semibold tracking-widest text-emerald-300 uppercase">Transaction complete</p>
+          <p className="mt-1 text-lg font-medium text-foreground">Deal completed.</p>
+        </div>
+
+        <ul className="flex flex-col gap-1.5 text-sm text-foreground">
+          <li className="flex items-center gap-2">
+            <span className="text-emerald-400">✓</span> Agreement
+          </li>
+          <li className="flex items-center gap-2">
+            <span className="text-emerald-400">✓</span> Payment
+          </li>
+          <li className="flex items-center gap-2">
+            <span className="text-emerald-400">✓</span> Audit trail
+          </li>
+        </ul>
+
+        <div className="flex flex-wrap items-center gap-4 border-t border-emerald-500/20 pt-3">
+          <a
+            href="#audit-trail"
+            className="text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
+          >
+            View audit trail ↓
+          </a>
+          {onStartOver && (
+            <button
+              type="button"
+              onClick={onStartOver}
+              className="text-sm font-medium text-muted underline-offset-4 transition-colors hover:text-foreground hover:underline"
+            >
+              Start new negotiation
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="flex flex-col gap-3 border-t border-green-200 pt-4 dark:border-green-900/50">
+    <div className="flex flex-col gap-3 border-t border-border pt-5">
+      {checkoutBackdrop}
       <div className="flex items-center justify-between">
-        <span className="text-sm font-medium text-green-900 dark:text-green-200">
-          {paymentStatusLabel(status.agreementStatus)}
-        </span>
+        <span className="text-sm font-medium text-foreground">{paymentStatusLabel(status.agreementStatus)}</span>
         {latestAttempt && (
-          <span className="text-xs text-green-700/70 dark:text-green-400/70">
+          <span className="text-xs text-muted">
             {attemptProgressLabel(latestAttempt.attemptNumber, latestAttempt.isRecovery, status.maxAttempts)}
           </span>
         )}
       </div>
 
       {latestAttempt?.status === "failed" && (
-        <p className="text-xs text-red-700 dark:text-red-400">{paymentFailureLabel(latestAttempt.failureReason)}</p>
+        <p className="text-xs text-red-300">{paymentFailureLabel(latestAttempt.failureReason)}</p>
       )}
       {isResumable && (
-        <p className="text-xs text-amber-700 dark:text-amber-400">
+        <p className="text-xs text-amber-300">
           A previous payment attempt is still open — resuming it rather than starting a new one.
         </p>
       )}
-      {errorMessage && <p className="text-xs text-red-700 dark:text-red-400">{errorMessage}</p>}
-
-      {(status.agreementStatus === "paid" || status.agreementStatus === "recovered") && (
-        <p className="text-sm font-medium text-green-800 dark:text-green-300">✓ Payment successful</p>
-      )}
+      {errorMessage && <p className="text-xs text-red-300">{errorMessage}</p>}
 
       {status.agreementStatus === "pending_payment" && (
         <button
           type="button"
           onClick={() => void handlePayNow()}
           disabled={busy}
-          className="flex h-11 w-fit items-center justify-center rounded-full bg-green-700 px-6 text-sm font-medium text-white transition hover:bg-green-800 disabled:opacity-60 dark:bg-green-600 dark:hover:bg-green-500"
+          className="flex h-11 w-fit items-center justify-center rounded-full bg-accent px-6 text-sm font-medium text-accent-foreground transition-colors hover:brightness-110 disabled:opacity-60"
         >
           {busy ? busyLabel : isResumable ? "Resume payment" : "Pay Now"}
         </button>
@@ -393,16 +480,14 @@ export function PaymentPanel({ agreementId, productName }: PaymentPanelProps) {
           type="button"
           onClick={() => void handleRetry()}
           disabled={busy}
-          className="flex h-11 w-fit items-center justify-center rounded-full bg-amber-600 px-6 text-sm font-medium text-white transition hover:bg-amber-700 disabled:opacity-60"
+          className="flex h-11 w-fit items-center justify-center rounded-full bg-amber-500 px-6 text-sm font-medium text-black transition hover:bg-amber-400 disabled:opacity-60"
         >
           {busy ? busyLabel : isResumable ? "Resume payment" : "Retry payment"}
         </button>
       )}
 
       {status.agreementStatus === "failed" && !status.recoveryAvailable && (
-        <p className="text-xs text-red-700 dark:text-red-400">
-          Payment could not be completed after {status.maxAttempts} attempts.
-        </p>
+        <p className="text-xs text-red-300">Payment could not be completed after {status.maxAttempts} attempts.</p>
       )}
     </div>
   );
