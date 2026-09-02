@@ -13,11 +13,13 @@ import { computeMerchantConcessionPrice, type MerchantConcessionContext } from "
 import { computeBuyerConcessionPrice, resolveBuyerTarget, type BuyerConstraints, type BuyerConcessionContext } from "@/lib/rules/buyerRules";
 import {
   hasQuantityLeverage,
+  resolveDeliveryRushPremiumFraction,
   resolveDeliveryTrade,
   resolveMerchantDemandPressure,
   resolveMerchantStockPressure,
   resolveUrgencyConcessionFactor,
   LARGE_ORDER_QUANTITY_THRESHOLD,
+  MAX_RUSH_DELIVERY_PREMIUM_FRACTION,
 } from "./negotiationStrategy";
 
 const laptop: CatalogItemSnapshot = {
@@ -209,6 +211,55 @@ describe("delivery-for-price trade", () => {
     });
     expect(withTrade).toBeLessThan(withoutTrade);
     expect(withTrade).toBeGreaterThanOrEqual(laptop.minPrice);
+  });
+
+  // Scenario-behavior fix: a deadline FASTER than standard is a rush
+  // request, not a slower-for-discount trade — the merchant meets it
+  // exactly, independent of buyerFlexible (flexibility only ever governs
+  // willingness to accept a LATER date).
+  describe("rush delivery (faster than standard)", () => {
+    it("meets a faster-than-standard deadline exactly, regardless of buyerFlexible", () => {
+      const flexible = resolveDeliveryTrade(laptop, 2, true);
+      const inflexible = resolveDeliveryTrade(laptop, 2, false);
+      expect(flexible.deliveryDays).toBe(2);
+      expect(inflexible.deliveryDays).toBe(2);
+      // Not a "trade" in the slower-for-discount sense — no discount is
+      // computed here; the price premium is applied by the caller
+      // (merchantAgent.ts) via resolveDeliveryRushPremiumFraction.
+      expect(flexible.traded).toBe(false);
+      expect(inflexible.traded).toBe(false);
+      expect(flexible.discount).toBe(0);
+    });
+
+    it("a deadline exactly at standard is unaffected — the pre-existing no-op boundary", () => {
+      const trade = resolveDeliveryTrade(laptop, laptop.standardDeliveryDays, false);
+      expect(trade.deliveryDays).toBe(laptop.standardDeliveryDays);
+      expect(trade.traded).toBe(false);
+    });
+  });
+});
+
+describe("resolveDeliveryRushPremiumFraction", () => {
+  it("is zero at or above the standard lead time — a genuine no-op for every existing caller", () => {
+    expect(resolveDeliveryRushPremiumFraction(5, 5)).toBe(0);
+    expect(resolveDeliveryRushPremiumFraction(5, 10)).toBe(0);
+  });
+
+  it("grows with how many days faster than standard is requested", () => {
+    const oneDayFaster = resolveDeliveryRushPremiumFraction(5, 4);
+    const threeDaysFaster = resolveDeliveryRushPremiumFraction(5, 2);
+    expect(oneDayFaster).toBeGreaterThan(0);
+    expect(threeDaysFaster).toBeGreaterThan(oneDayFaster);
+  });
+
+  it("is capped at MAX_RUSH_DELIVERY_PREMIUM_FRACTION even for an extreme request", () => {
+    const extreme = resolveDeliveryRushPremiumFraction(5, 1);
+    expect(extreme).toBeLessThanOrEqual(MAX_RUSH_DELIVERY_PREMIUM_FRACTION);
+    expect(resolveDeliveryRushPremiumFraction(30, 1)).toBe(MAX_RUSH_DELIVERY_PREMIUM_FRACTION);
+  });
+
+  it("never goes negative for a deadline further beyond standard", () => {
+    expect(resolveDeliveryRushPremiumFraction(5, 100)).toBe(0);
   });
 });
 

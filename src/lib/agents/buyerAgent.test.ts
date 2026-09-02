@@ -964,6 +964,34 @@ describe("runBuyerAgent — quantity sufficiency (partial fulfillment is not aut
       expect(response.action.type).not.toBe("accept");
     });
 
+    // Regression test — a real bug found during scenario-behavior
+    // calibration: this gate was originally detected via
+    // `strategyContext?.previousBuyerUnitPrice` being null/undefined,
+    // but the real orchestrator populates that field from the buyer's
+    // OWN opening request price too (transcript[transcript.length -
+    // 1].buyer.unitPrice, which already exists after round 1) — so by
+    // round 2, the buyer's actual first reactive round, that field was
+    // ALREADY non-null, silently defeating the whole gate on every real
+    // negotiation (a strong-leverage buyer never got its one genuine
+    // chance to hold out). Fixed by keying off concessionContext.round
+    // instead (round 2 is unambiguously the first reactive round — see
+    // buyerAgent.ts's own doc comment). This test reproduces the exact
+    // shape the real orchestrator produces (a real previousBuyerUnitPrice
+    // already present at round 2, from the opening ask) to prove the
+    // gate still correctly applies.
+    it("still holds out at round 2 even when previousBuyerUnitPrice is already set (the buyer's own opening ask) — the real orchestrator shape", async () => {
+      mockedGenerateAgentMessage.mockResolvedValue("...");
+      const response = await runBuyerAgent(
+        shortfallConstraints,
+        manifestProduct,
+        fullySufficientResult,
+        { round: 2, maxRounds: 10 },
+        { leverageScore: 80, previousBuyerUnitPrice: 44650 }, // the buyer's own round-1 opening price
+      );
+
+      expect(response.action.type).not.toBe("accept");
+    });
+
     it("a weak-leverage buyer still auto-accepts the same sufficient offer — the narrowing only fires for strong leverage", async () => {
       mockedGenerateAgentMessage.mockResolvedValue("...");
       const response = await runBuyerAgent(

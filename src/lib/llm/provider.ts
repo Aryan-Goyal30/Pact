@@ -12,9 +12,9 @@
 
 import { claudeProvider } from "@/lib/llm/claude";
 import { geminiProvider } from "@/lib/llm/gemini";
-import { LlmUnavailableError } from "@/lib/llm/errors";
+import { LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/errors";
 
-export { LlmUnavailableError };
+export { LlmUnavailableError, ProviderRateLimitedError };
 
 export interface AgentMessageInput {
   /** Persona rules the model must follow (what it can/can't say, whose voice to speak in). */

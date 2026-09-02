@@ -13,7 +13,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { AgentMessageInput, LlmProvider } from "@/lib/llm/provider";
-import { LlmUnavailableError } from "@/lib/llm/errors";
+import { LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/errors";
 
 /**
  * Thrown when ANTHROPIC_API_KEY is not set. A dedicated error type so
@@ -48,18 +48,35 @@ export class ClaudeProvider implements LlmProvider {
   async generateAgentMessage(input: AgentMessageInput): Promise<string> {
     const client = getClient();
 
-    const response = await client.messages.create({
-      model: "claude-opus-5",
-      max_tokens: 300,
-      output_config: { effort: "low" },
-      system: input.systemPrompt,
-      messages: [
-        {
-          role: "user",
-          content: `${input.instruction}\n\nContext (authoritative — do not alter any value):\n${JSON.stringify(input.context, null, 2)}`,
-        },
-      ],
-    });
+    let response;
+    try {
+      response = await client.messages.create({
+        model: "claude-opus-5",
+        max_tokens: 300,
+        output_config: { effort: "low" },
+        system: input.systemPrompt,
+        messages: [
+          {
+            role: "user",
+            content: `${input.instruction}\n\nContext (authoritative — do not alter any value):\n${JSON.stringify(input.context, null, 2)}`,
+          },
+        ],
+      });
+    } catch (error) {
+      // Provider-failure handling: a 429 (RateLimitError, a subclass of
+      // Anthropic.APIError<429>) is a transient, expected condition, not
+      // a code bug — recognized here and re-thrown as the
+      // provider-agnostic ProviderRateLimitedError so agent code falls
+      // back to its deterministic message via the SAME
+      // `instanceof LlmUnavailableError` check it already uses for
+      // "no API key configured," instead of failing the whole
+      // negotiation turn. Every other error (auth, malformed request,
+      // network failure, etc.) is rethrown completely unchanged.
+      if (error instanceof Anthropic.APIError && error.status === 429) {
+        throw new ProviderRateLimitedError("Claude");
+      }
+      throw error;
+    }
 
     const textBlock = response.content.find(
       (block): block is Anthropic.TextBlock => block.type === "text",

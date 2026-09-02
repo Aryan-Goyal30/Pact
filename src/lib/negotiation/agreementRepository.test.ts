@@ -221,12 +221,18 @@ describe("full negotiation -> agreement persistence gate", () => {
   }
 
   // F. REJECTED negotiation creates no Agreement.
+  //
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite for a price
+  // premium. A non-positive deadline remains genuinely nonsensical
+  // regardless of price, so it's what this test uses to reliably reach
+  // REJECTED with no negotiation at all.
   it("F: creates no Agreement when the negotiation is REJECTED (impossible delivery)", async () => {
     const { sessionId, finalState, agreementResult } = await runAndConditionallyPersistAgreement({
       sku: LAPTOP_SKU,
       quantity: 10,
       maxUnitPrice: 45000,
-      deliveryDeadlineDays: 1, // faster than the merchant's standard 5 days
+      deliveryDeadlineDays: 0, // not a valid delivery window
     });
 
     expect(finalState.status).toBe("REJECTED");
@@ -272,12 +278,13 @@ describe("full negotiation -> agreement persistence gate", () => {
     expect(finalState.status).toBe("AGREED");
     expect(agreementResult).not.toBeNull();
     // The real, deterministic outcome for these inputs (buyer opens near
-    // its target, merchant counters at the anchored midpoint, buyer
-    // accepts since it's within its true ceiling) — not the fabricated
-    // "999999 units at ₹1" the mocked LLM text claimed.
+    // its target, holds for one round — a genuine, leverage-driven D4
+    // hold-out, buyer leverage 63 >= HOLD_LEVERAGE_THRESHOLD — then
+    // accepts the merchant's further-conceded price) — not the
+    // fabricated "999999 units at ₹1" the mocked LLM text claimed.
     expect(agreementResult!.agreement.quantity).toBe(10);
-    expect(agreementResult!.agreement.unitPrice).toBe(46800);
+    expect(agreementResult!.agreement.unitPrice).toBe(46292);
     expect(agreementResult!.agreement.deliveryDays).toBe(5);
-    expect(agreementResult!.agreement.totalAmount).toBe(468000);
+    expect(agreementResult!.agreement.totalAmount).toBe(462920);
   });
 });

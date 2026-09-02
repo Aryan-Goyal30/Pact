@@ -126,7 +126,27 @@ export function generateMerchantCandidates(
    * CONCEDE/blind-baseline candidates compute.
    */
   leverageScores?: { buyer: number; merchant: number },
+  /**
+   * Message-grounding fix: the REAL, catalog/manifest listed price —
+   * the exact number GET /api/manifest returns and the exact number a
+   * buyer would recognize as "the listed price." `item.listedPrice`
+   * itself may not be that number: when a rush-delivery premium is in
+   * effect (merchantAgent.ts's own effectiveItem substitution, see
+   * runMerchantAgent), `item` here IS that price-adjusted item, and its
+   * `.listedPrice` reflects the premium, not the catalog figure — using
+   * it in this function's own "instead of the listed X" reason text
+   * would state a number the LLM's authoritative context can't actually
+   * ground (a real, observed bug: a rush-adjusted 52320 appearing in
+   * generated prose as "the listed price" when the true catalog value
+   * is 48000). Optional and additive: omitted, falls back to
+   * `item.listedPrice` exactly as before this parameter existed — every
+   * existing caller/test that never had a rush premium to begin with is
+   * completely unaffected, since the two values are identical whenever
+   * no premium applies.
+   */
+  catalogListedPrice?: number,
 ): MerchantCandidateResult {
+  const realListedPrice = catalogListedPrice ?? item.listedPrice;
   const trade =
     request.deliveryDeadlineDays !== undefined
       ? resolveDeliveryTrade(item, request.deliveryDeadlineDays, request.deliveryFlexible ?? false)
@@ -148,7 +168,7 @@ export function generateMerchantCandidates(
     {
       move: "CONCEDE",
       unitPrice: baselineConcessionPrice,
-      reason: `Countering with an adjusted unit price of ${baselineConcessionPrice} instead of the listed ${item.listedPrice}.`,
+      reason: `Countering with an adjusted unit price of ${baselineConcessionPrice} instead of the listed ${realListedPrice}.`,
     },
   ];
 

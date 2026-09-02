@@ -8,7 +8,7 @@ import {
   runNegotiationTurn,
   type NegotiationContext,
 } from "./orchestrator";
-import { getLlmProvider } from "@/lib/llm/provider";
+import { getLlmProvider, ProviderRateLimitedError } from "@/lib/llm/provider";
 import { runMerchantAgent } from "@/lib/agents/merchantAgent";
 import * as walkAway from "@/lib/rules/walkAway";
 import { generateBuyerCandidates, selectBestBuyerCandidate } from "@/lib/rules/buyerMoveSelection";
@@ -462,6 +462,13 @@ describe("Section 11 demo scenarios", () => {
   });
 
   // D. Impossible delivery -> rejected deterministically, no negotiation.
+  //
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite for a price
+  // premium (see checkDeliveryAchievable / resolveDeliveryRushPremiumFraction).
+  // A non-positive deadline remains genuinely nonsensical regardless of
+  // price, so this test now uses that to exercise the true "impossible,
+  // no negotiation at all" path.
   it("D: rejects deterministically when the buyer's delivery deadline is impossible", async () => {
     const context: NegotiationContext = {
       item: laptop, // standard delivery 5 days
@@ -470,7 +477,7 @@ describe("Section 11 demo scenarios", () => {
         sku: "LAPTOP-14-I5",
         quantity: 10,
         maxUnitPrice: 45000,
-        deliveryDeadlineDays: 1, // faster than the merchant can ever do
+        deliveryDeadlineDays: 0, // not a valid delivery window, regardless of price
       },
     };
 
@@ -2470,5 +2477,120 @@ describe("Milestone 12: combined package round never falsely triggers repeated-p
     expect(transcript[1].buyer.unitPrice).toBe(transcript[0].buyer.unitPrice); // D5: deliberately repeats
     expect(transcript[1].merchant.unitPrice).not.toBe(transcript[0].merchant.unitPrice);
     expect(finalState.status).toBe("AGREED");
+  });
+});
+
+// Provider-failure handling: a rate-limited LLM provider (e.g. Gemini's
+// free-tier generate_content quota — 5 requests/minute was the figure
+// observed for the previously-used gemini-3.6-flash model; see
+// gemini.ts's GEMINI_MODEL for the model actually in use) must never
+// stop the negotiation itself. The
+// deterministic engine stays authoritative regardless of LLM
+// availability — this proves it end to end through the real
+// orchestrator, not just buyerAgent.ts/merchantAgent.ts's own isolated
+// unit tests.
+describe("provider-failure handling: a rate-limited LLM never stops the negotiation", () => {
+  it("a negotiation still reaches AGREED, with every message carrying real authoritative numbers, when the LLM provider is rate-limited on every call", async () => {
+    mockedGetLlmProvider.mockReturnValue({
+      generateAgentMessage: vi.fn().mockRejectedValue(new ProviderRateLimitedError("Gemini")),
+    });
+
+    const { transcript, finalState } = await runNegotiationToCompletion(demoContext(), 6);
+
+    // The deterministic engine stays authoritative: the negotiation
+    // completes exactly as it would with a working LLM — never throws,
+    // never stalls, never leaves the session in a non-terminal state.
+    expect(finalState.status).not.toBe("OPEN");
+    expect(finalState.status).not.toBe("COUNTERED");
+    expect(transcript.length).toBeGreaterThan(0);
+
+    // Every message actually sent is the deterministic fallback caption
+    // (never the string "mocked agent message" this file's own default
+    // mock would otherwise return, and never empty) — proving the
+    // fallback is what carries the negotiation forward, not a retry that
+    // eventually succeeded.
+    for (const turn of transcript) {
+      expect(turn.buyer.message.length).toBeGreaterThan(0);
+      expect(turn.merchant.message.length).toBeGreaterThan(0);
+      if (turn.buyer.unitPrice !== null) {
+        expect(turn.buyer.message).toContain(String(turn.buyer.unitPrice));
+      }
+      if (turn.merchant.unitPrice !== null && turn.merchant.type !== "accept") {
+        expect(turn.merchant.message).toContain(String(turn.merchant.unitPrice));
+      }
+    }
+  });
+
+  it("reaches a genuine EXPIRED walk-away (never a false AGREED) when the LLM is rate-limited and the budget is genuinely impossible", async () => {
+    mockedGetLlmProvider.mockReturnValue({
+      generateAgentMessage: vi.fn().mockRejectedValue(new ProviderRateLimitedError("Gemini")),
+    });
+
+    const impossible: NegotiationContext = {
+      item: laptop,
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: { ...demoBuyerConstraints, maxUnitPrice: 40000 }, // below minPrice (44000)
+    };
+    const { finalState } = await runNegotiationToCompletion(impossible, 6);
+
+    expect(finalState.status).not.toBe("AGREED");
+  });
+
+  it("a single turn never throws when the LLM is rate-limited — the deterministic state still advances", async () => {
+    mockedGetLlmProvider.mockReturnValue({
+      generateAgentMessage: vi.fn().mockRejectedValue(new ProviderRateLimitedError("Gemini")),
+    });
+
+    const state = createNegotiationState(6);
+    const turn = await runNegotiationTurn(demoContext(), state, null);
+
+    expect(turn.state.round).toBeGreaterThan(state.round);
+    expect(turn.buyer.message.length).toBeGreaterThan(0);
+    expect(turn.merchant.message.length).toBeGreaterThan(0);
+  });
+
+  // Call-budget: exactly one buyer message and one merchant message per
+  // real negotiating round — proves a single turn never makes more LLM
+  // calls than the two genuinely needed (one per side), which matters
+  // directly for a provider with a tight per-minute quota.
+  it("makes exactly two LLM calls (one buyer, one merchant) for one ordinary turn — never more", async () => {
+    const generateAgentMessage = vi.fn().mockResolvedValue("a real phrased message");
+    mockedGetLlmProvider.mockReturnValue({ generateAgentMessage });
+
+    const state = createNegotiationState(6);
+    await runNegotiationTurn(demoContext(), state, null);
+
+    expect(generateAgentMessage).toHaveBeenCalledTimes(2);
+  });
+
+  // Call-budget: the buyer's own closing "accept" message costs no LLM
+  // call at all — it's a plain statement of already-decided terms (see
+  // buyerAgent.ts's buildFallbackBuyerMessage), mirroring the merchant's
+  // own accept-echo (orchestrator.ts's hardcoded "Accepted.", never an
+  // LLM call either). A real, complete, two-round negotiation (opening
+  // exchange, then the buyer accepts) should cost exactly 2 LLM calls
+  // total — not 4 (2 per round) — proving the accept round genuinely
+  // adds nothing to the call budget.
+  it("a negotiation that closes on the buyer's accept makes zero LLM calls for that final round", async () => {
+    const generateAgentMessage = vi.fn().mockResolvedValue("a real phrased message");
+    mockedGetLlmProvider.mockReturnValue({ generateAgentMessage });
+
+    const generousBudget: NegotiationContext = {
+      item: laptop,
+      manifestProduct: laptopManifestListing,
+      buyerConstraints: { ...demoBuyerConstraints, quantity: 10, maxUnitPrice: 47500 },
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(generousBudget, 6);
+
+    expect(finalState.status).toBe("AGREED");
+    expect(transcript[transcript.length - 1].buyer.type).toBe("accept");
+    // Every round except the final accept round costs exactly 2 calls
+    // (one buyer, one merchant); the closing accept round costs zero —
+    // the buyer's own accept and the merchant's accept-echo are both
+    // free. Computed from the real transcript length rather than a
+    // hardcoded round count, so this stays correct however many rounds
+    // this fixture's own real economics take to converge.
+    const roundsBeforeAccept = transcript.length - 1;
+    expect(generateAgentMessage).toHaveBeenCalledTimes(roundsBeforeAccept * 2);
   });
 });

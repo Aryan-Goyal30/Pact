@@ -45,7 +45,7 @@ import {
 } from "@/lib/rules/buyerQuantitySufficiency";
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
-import { getLlmProvider, LlmUnavailableError } from "@/lib/llm/provider";
+import { getLlmProvider, LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/provider";
 
 export type BuyerAction =
   | ({ type: "request" } & ProposedAgreement)
@@ -313,22 +313,40 @@ function buildResponseToMerchantOffer(
     const buyerLeverageScore = strategyContext?.leverageScore;
     // The leverage-driven narrowing is deliberately single-shot: it can
     // only decline an otherwise-acceptable offer on the buyer's FIRST
-    // reactive round (no previousBuyerUnitPrice yet — nothing has been
-    // held out for yet). Without this, an extremely high-leverage buyer
-    // (>= HOLD_LEVERAGE_THRESHOLD) has no mechanism to ever relent: the
-    // merchant can genuinely hit its own floor and be forced to repeat
-    // that same, already-best-possible price every round, while this gate
-    // keeps refusing it round after round purely on leverage — producing
-    // a false EXPIRED (arePositionsRepeated trips) even though a real,
-    // mutually-acceptable deal was on the table the whole time. Limiting
-    // the gate to "have I already had at least one chance to hold out"
-    // preserves D4's intent (a strong-leverage buyer gets a genuine shot
-    // at a better offer instead of reflexively taking the first
-    // technically-acceptable one) while guaranteeing it can never itself
-    // be the cause of a repeated-position deadlock — after one round of
-    // holding out, sufficiency's original unconditional accept resumes.
-    const isFirstReactiveRound =
-      strategyContext?.previousBuyerUnitPrice === null || strategyContext?.previousBuyerUnitPrice === undefined;
+    // reactive round — nothing has been held out for yet. Without this,
+    // an extremely high-leverage buyer (>= HOLD_LEVERAGE_THRESHOLD) has
+    // no mechanism to ever relent: the merchant can genuinely hit its own
+    // floor and be forced to repeat that same, already-best-possible
+    // price every round, while this gate keeps refusing it round after
+    // round purely on leverage — producing a false EXPIRED
+    // (arePositionsRepeated trips) even though a real, mutually-
+    // acceptable deal was on the table the whole time. Limiting the gate
+    // to "have I already had at least one chance to hold out" preserves
+    // D4's intent (a strong-leverage buyer gets a genuine shot at a
+    // better offer instead of reflexively taking the first technically-
+    // acceptable one) while guaranteeing it can never itself be the
+    // cause of a repeated-position deadlock — after one round of holding
+    // out, sufficiency's original unconditional accept resumes.
+    //
+    // Bug found during scenario-behavior calibration: this was originally
+    // gated on `strategyContext?.previousBuyerUnitPrice` being null/
+    // undefined — but the orchestrator populates that field from the
+    // buyer's own OPENING request price too (transcript[transcript.length
+    // - 1].buyer.unitPrice, which already exists after round 1), so by
+    // round 2 — the buyer's actual FIRST reactive round, and the only
+    // round this gate is meant to cover — previousBuyerUnitPrice was
+    // already non-null. That silently defeated the whole gate on every
+    // real negotiation: a strongly-leveraged buyer never got its one
+    // genuine chance to hold out, sufficiency's unconditional accept
+    // fired immediately, and multi-round leverage/scarcity/urgency
+    // scenarios all collapsed into a single open-then-accept exchange.
+    // concessionContext.round is the correct, unambiguous signal instead
+    // — round 1 is always the opening request (buildOpeningRequest,
+    // never this function); round 2 is always the buyer's first reactive
+    // call (see orchestrator.ts's `round: state.round + 1`, and every
+    // existing reactive-round test fixture in this codebase, which all
+    // use round 2 for exactly this purpose).
+    const isFirstReactiveRound = concessionContext.round <= 2;
     const stronglyFavorsHolding =
       isFirstReactiveRound &&
       buyerLeverageScore !== undefined &&
@@ -427,15 +445,43 @@ function buildResponseToMerchantOffer(
 
 /**
  * Deterministic, non-LLM caption used only when no LLM provider is
- * configured (LlmUnavailableError). Built entirely from the
- * already-decided `action`, so it never fabricates a number or a
- * decision — it's a plain-English rendering of real data.
+ * configured (LlmUnavailableError) or the LLM's own message failed the
+ * integrity check. Built entirely from the already-decided `action` (plus
+ * `tradeMove`/`move`, both already-decided — never re-derived here), so it
+ * never fabricates a number or a decision — it's a plain-English rendering
+ * of real data.
+ *
+ * Scenario-behavior fix: a plain "I can go up to X" caption doesn't
+ * communicate WHY a counter changed shape on a trade round — a buyer
+ * giving up delivery speed (or offering more quantity) for a better
+ * price needs to read as a genuine, explicit exchange, not just a
+ * number that happens to be lower. This mirrors the phrasing the LLM
+ * prompt (see BUYER_SYSTEM_PROMPT's own instruction, runBuyerAgent)
+ * already asks for when an LLM is available — this is the SAME framing
+ * for the deterministic fallback path, so the tradeoff reads clearly
+ * regardless of whether an LLM is configured.
  */
-function buildFallbackBuyerMessage(action: BuyerAction): string {
+function buildFallbackBuyerMessage(
+  action: BuyerAction,
+  tradeMove?: BuyerTradeMove | BuyerDeliveryTradeMove | BuyerPackageTradeMove | null,
+  move?: BuyerMove | null,
+): string {
   switch (action.type) {
     case "request":
       return `I would like ${action.quantity} unit(s) of ${action.sku}, at up to ${action.unitPrice} each, delivered within ${action.deliveryDays} day(s).`;
     case "counter_offer":
+      if (tradeMove === "QUANTITY_FOR_PRICE") {
+        return `I'll take ${action.quantity} units if you can bring the price down to ${action.unitPrice} each.`;
+      }
+      if (tradeMove === "DELIVERY_FOR_PRICE") {
+        return `I can accept delivery in ${action.deliveryDays} day(s) if you can bring the price down to ${action.unitPrice} each.`;
+      }
+      if (tradeMove === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+        return `I'll take ${action.quantity} units and accept delivery in ${action.deliveryDays} day(s) if you can bring the price down to ${action.unitPrice} each.`;
+      }
+      if (move === "HOLD") {
+        return `I'll hold at ${action.unitPrice} for now, for ${action.quantity} unit(s) delivered within ${action.deliveryDays} day(s).`;
+      }
       return `I can go up to ${action.unitPrice} per unit for ${action.quantity} unit(s), delivered within ${action.deliveryDays} day(s).`;
     case "accept":
       return `I accept: ${action.quantity} unit(s) at ${action.unitPrice} each, delivered in ${action.deliveryDays} day(s).`;
@@ -479,10 +525,28 @@ export async function runBuyerAgent(
   const roundsLeft = concessionContext
     ? Math.max(1, concessionContext.maxRounds - concessionContext.round + 1)
     : Number.POSITIVE_INFINITY;
+  // Message-quality fix: explainBuyerFactors's urgency/quantity-leverage
+  // reasons are round-INVARIANT (urgency and order size never change
+  // mid-negotiation) — including them in strategicReasons on every
+  // single round was what drove the LLM to restate the same rationale
+  // verbatim round after round (observed: "Buyer urgency is high..."
+  // repeating identically across many counters). They're still genuinely
+  // useful context on the buyer's FIRST reactive round (round <= 2 — see
+  // buyerAgent.ts's own established "first reactive round" convention),
+  // establishing the negotiating posture once; from there on, only the
+  // final-rounds reason is kept (it's genuinely round-specific — only
+  // ever true once roundsLeft <= 2, so it's inherently self-limiting,
+  // never static). Nothing here changes what explainBuyerFactors itself
+  // computes (negotiationStrategy.ts, untouched) — only which of its
+  // already-computed strings this round's LLM context includes.
+  const isFirstReactiveRound = !concessionContext || concessionContext.round <= 2;
+  const buyerFactors = explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft);
   const strategicReasons =
     action.type === "request" || action.type === "counter_offer"
       ? [
-          ...explainBuyerFactors(constraints.urgency, hasQuantityLeverage(constraints.quantity), roundsLeft),
+          ...buyerFactors.filter(
+            (reason) => isFirstReactiveRound || reason.startsWith("Few negotiation rounds remain"),
+          ),
           ...(moveReason ? [moveReason] : []),
         ]
       : // Milestone 6: an "accept" is explainable too when it followed a
@@ -530,28 +594,45 @@ export async function runBuyerAgent(
     action.type === "reject" ? [] : [action.quantity, action.unitPrice, action.deliveryDays];
 
   let message: string;
-  try {
-    const generated = await getLlmProvider().generateAgentMessage({
-      systemPrompt: BUYER_SYSTEM_PROMPT,
-      context,
-      instruction:
-        "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"). If strategicReasons describes the buyer accepting a later delivery date in exchange for a better price, phrase that condition instead (e.g. \"I can accept 10-day delivery if you can do 43000 each.\"). If strategicReasons describes the buyer offering BOTH more quantity AND a later delivery date together in exchange for a better price, phrase it as one combined condition (e.g. \"I'll take 200 units and accept 12-day delivery if you can do 43000 each.\"), never as two separate sentences or unrelated changes — still using only the exact numbers given. If strategicReasons describes the buyer holding its position rather than conceding further, the message must communicate firmness, not openness to moving higher — e.g. \"I'll hold at 42750 for now.\" or \"I'm not able to move above 42750 unless the terms change.\" — and must NOT use language like \"I can go up to\" or \"I can increase to\", which implies the buyer is still willing to move.",
-    });
-    const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
-    if (check.valid) {
-      message = generated;
-    } else {
-      console.warn(`Buyer Agent LLM message failed integrity check, falling back: ${check.reason}`);
-      message = buildFallbackBuyerMessage(action);
+  // Provider-failure handling / call-budget: an "accept" is a plain
+  // statement of already-decided terms (see buildFallbackBuyerMessage's
+  // own "accept" case) — there is no negotiating stance left to phrase
+  // creatively, so the deterministic caption is used directly, exactly
+  // like the merchant's own accept-echo (orchestrator.ts's hardcoded
+  // "Accepted.", never an LLM call). This halves the LLM calls a closing
+  // round would otherwise cost and conserves a rate-limited provider's
+  // quota (e.g. Gemini's free tier: 5 requests/minute) for the rounds
+  // where phrasing genuinely matters.
+  if (action.type === "accept") {
+    message = buildFallbackBuyerMessage(action, tradeMove, move);
+  } else {
+    try {
+      const generated = await getLlmProvider().generateAgentMessage({
+        systemPrompt: BUYER_SYSTEM_PROMPT,
+        context,
+        instruction:
+          "Generate only the natural-language message for this already-decided negotiation action, from the buyer's perspective. Do not calculate, change, abbreviate, round, infer, or invent any numeric value — every number in authoritativeFacts must appear in your message rendered exactly as given (e.g. 100 must remain 100, never 10; 45375 must remain 45375, never 4537). The structured decision is authoritative. If strategicReasons describes the buyer offering more quantity in exchange for a better price, phrase the message so that condition is clear (e.g. \"I'll take 200 units if you can bring the price down to 43000 each.\"). If strategicReasons describes the buyer accepting a later delivery date in exchange for a better price, phrase that condition instead (e.g. \"I can accept 10-day delivery if you can do 43000 each.\"). If strategicReasons describes the buyer offering BOTH more quantity AND a later delivery date together in exchange for a better price, phrase it as one combined condition (e.g. \"I'll take 200 units and accept 12-day delivery if you can do 43000 each.\"), never as two separate sentences or unrelated changes — still using only the exact numbers given. If strategicReasons describes the buyer holding its position rather than conceding further, the message must communicate firmness, not openness to moving higher — e.g. \"I'll hold at 42750 for now.\" or \"I'm not able to move above 42750 unless the terms change.\" — and must NOT use language like \"I can go up to\" or \"I can increase to\", which implies the buyer is still willing to move. Keep it short: one or two sentences, never a paragraph. State the current quantity, price, and delivery terms plainly; mention a reason from strategicReasons only if one is present and directly explains this round's action — never restate a full justification every round, and never repeat the exact same sentence you might have used in a previous round. Vary your phrasing naturally each time so consecutive messages don't read as copies of each other, while never inventing a reason, number, or claim of changed position that isn't in the given data.",
+      });
+      const check = checkAgentMessageIntegrity(generated, requiredNumbers, context);
+      if (check.valid) {
+        message = generated;
+      } else {
+        console.warn(`Buyer Agent LLM message failed integrity check, falling back: ${check.reason}`);
+        message = buildFallbackBuyerMessage(action, tradeMove, move);
+      }
+    } catch (error) {
+      if (!(error instanceof LlmUnavailableError)) {
+        throw error;
+      }
+      if (error instanceof ProviderRateLimitedError) {
+        console.warn(`Buyer Agent: ${error.message}`);
+      }
+      // No LLM provider is configured, or it's rate-limited — fall back
+      // to a deterministic caption instead of failing the whole
+      // negotiation turn. `action` itself is completely unaffected;
+      // only the phrasing differs.
+      message = buildFallbackBuyerMessage(action, tradeMove, move);
     }
-  } catch (error) {
-    if (!(error instanceof LlmUnavailableError)) {
-      throw error;
-    }
-    // No LLM provider is configured — fall back to a deterministic
-    // caption instead of failing the whole negotiation turn. `action`
-    // itself is completely unaffected; only the phrasing differs.
-    message = buildFallbackBuyerMessage(action);
   }
 
   return { action, validation, message, strategicReasons, move, tradeMove, sufficiency };
@@ -613,6 +694,9 @@ export async function runBuyerWalkAway(
   } catch (error) {
     if (!(error instanceof LlmUnavailableError)) {
       throw error;
+    }
+    if (error instanceof ProviderRateLimitedError) {
+      console.warn(`Buyer Agent (walk-away): ${error.message}`);
     }
     message = buildFallbackBuyerWalkAwayMessage(reason, constraints.maxUnitPrice, merchantOfferUnitPrice);
   }

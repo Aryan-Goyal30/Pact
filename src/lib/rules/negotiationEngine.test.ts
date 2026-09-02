@@ -113,11 +113,28 @@ describe("evaluateNegotiationRequest", () => {
   });
 
   // 9. Delivery deadline is impossible.
-  it("rejects a delivery deadline faster than the standard lead time", () => {
+  //
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite (the price
+  // premium for it is applied by the caller, merchantAgent.ts, not by
+  // this function — see resolveDeliveryRushPremiumFraction). A
+  // non-positive deadline remains genuinely impossible regardless of
+  // price.
+  it("does not reject a delivery deadline merely for being faster than the standard lead time", () => {
     const result = evaluateNegotiationRequest(item, {
       sku: item.sku,
       quantity: 10,
       deliveryDeadlineDays: 1,
+    });
+    expect(result.outcome).not.toBe("REJECTED");
+    expect(result.deliveryDays).toBe(1);
+  });
+
+  it("rejects a non-positive delivery deadline", () => {
+    const result = evaluateNegotiationRequest(item, {
+      sku: item.sku,
+      quantity: 10,
+      deliveryDeadlineDays: 0,
     });
     expect(result.outcome).toBe("REJECTED");
   });

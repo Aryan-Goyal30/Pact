@@ -314,7 +314,7 @@ export function evaluateNegotiationRequest(
   );
   if (!deliveryCheck.isAchievable) {
     return rejected(item.sku, request.quantity, [
-      `Requested delivery in ${request.deliveryDeadlineDays} day(s) is faster than the merchant's standard ${item.standardDeliveryDays} day(s).`,
+      `Requested delivery deadline of ${request.deliveryDeadlineDays} day(s) is not a valid delivery window.`,
     ]);
   }
 
@@ -418,9 +418,7 @@ export function validateProposedAgreement(
   }
 
   if (!checkDeliveryAchievable(item, proposal.deliveryDays).isAchievable) {
-    reasons.push(
-      `Delivery in ${proposal.deliveryDays} day(s) is faster than the merchant's standard ${item.standardDeliveryDays} day(s).`,
-    );
+    reasons.push(`Delivery window of ${proposal.deliveryDays} day(s) is not a valid delivery window.`);
   }
 
   if (proposal.unitPrice < item.listedPrice && !item.negotiationEnabled) {

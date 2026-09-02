@@ -1,6 +1,7 @@
 import { findCatalogItemBySku } from "@/lib/rules/catalogRepository";
 import { getPublicManifest } from "@/lib/manifest";
 import { runNegotiationTurn } from "@/lib/negotiation/orchestrator";
+import { ProviderRateLimitedError } from "@/lib/llm/provider";
 import {
   hasBuyerProposedDeliveryDaysAbove,
   hasBuyerProposedQuantityAbove,
@@ -211,6 +212,23 @@ export async function POST(_request: Request, context: RouteContext<"/api/negoti
     return jsonResponse(response, 200);
   } catch (error) {
     console.error("Negotiation turn failed:", error);
+    // Provider-failure handling: buyerAgent.ts/merchantAgent.ts already
+    // catch a rate-limited LLM provider (ProviderRateLimitedError, a
+    // subclass of LlmUnavailableError) and fall back to a deterministic
+    // message, so a turn should never actually reach this branch for
+    // that reason — the deterministic engine keeps advancing regardless
+    // of LLM availability. This is a defense-in-depth backstop only
+    // (e.g. a future LLM call site that doesn't yet catch it), giving a
+    // distinct, actionable response instead of the generic failure
+    // message whenever it IS the cause.
+    if (error instanceof ProviderRateLimitedError) {
+      return jsonResponse(
+        {
+          error: `The ${error.provider} LLM provider is temporarily rate-limited. Please retry in a moment — the negotiation itself is unaffected and will continue with deterministic messages.`,
+        },
+        503,
+      );
+    }
     return jsonResponse({ error: "Could not advance the negotiation." }, 500);
   }
 }

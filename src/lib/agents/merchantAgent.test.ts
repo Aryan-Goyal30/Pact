@@ -91,15 +91,21 @@ describe("runMerchantAgent", () => {
   });
 
   // 3. A rejected/impossible request produces a rejection message.
+  //
+  // Scenario-behavior fix: a deadline faster than standard delivery is
+  // no longer impossible on its own — the merchant can expedite for a
+  // price premium (see checkDeliveryAchievable / resolveDeliveryRushPremiumFraction).
+  // A non-positive deadline remains genuinely nonsensical regardless of
+  // price, so it's what this test now uses to exercise the REJECTED path.
   it("produces a null offer and a rejection message for an impossible request", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
-      "We're unable to fulfill this request: delivery in 1 day is faster than our standard 5 days.",
+      "We're unable to fulfill this request: that is not a valid delivery window.",
     );
 
     const response = await runMerchantAgent(item, {
       sku: item.sku,
       quantity: 10,
-      deliveryDeadlineDays: 1,
+      deliveryDeadlineDays: 0,
     });
 
     expect(response.decision.outcome).toBe("REJECTED");
@@ -848,11 +854,11 @@ describe("runMerchantAgent", () => {
       const response = await runMerchantAgent(item, {
         sku: item.sku,
         quantity: 10,
-        deliveryDeadlineDays: 1,
+        deliveryDeadlineDays: 0,
       });
 
       expect(response.decision.outcome).toBe("REJECTED");
-      expect(response.message).toMatch(/faster than the merchant's standard/i);
+      expect(response.message).toMatch(/not a valid delivery window/i);
     });
 
     it("still propagates a non-key-related error instead of masking it", async () => {
@@ -862,6 +868,89 @@ describe("runMerchantAgent", () => {
         "network exploded",
       );
     });
+  });
+});
+
+// Scenario-behavior fix: rush delivery. A deadline faster than
+// item.standardDeliveryDays is no longer an unconditional impossibility
+// — the merchant can meet it, at a real price premium (see
+// checkDeliveryAchievable, catalogRules.ts, and
+// resolveDeliveryRushPremiumFraction, negotiationStrategy.ts). End-to-end
+// through the real runMerchantAgent, not just the underlying pure
+// functions' own isolated unit tests.
+describe("runMerchantAgent — rush delivery (faster than standard)", () => {
+  beforeEach(() => {
+    mockedGenerateAgentMessage.mockReset();
+    mockedGetLlmProvider.mockReturnValue({ generateAgentMessage: mockedGenerateAgentMessage });
+  });
+
+  it("meets a deadline faster than standard exactly, at a real price premium above the raw listed price", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const response = await runMerchantAgent(item, {
+      sku: item.sku,
+      quantity: 10,
+      deliveryDeadlineDays: 2, // standardDeliveryDays is 5 — 3 days faster
+    });
+
+    expect(response.decision.outcome).not.toBe("REJECTED");
+    expect(response.decision.deliveryDays).toBe(2);
+    expect(response.decision.unitPrice!).toBeGreaterThan(item.listedPrice);
+  });
+
+  it("a deadline at or after standard is unaffected — no premium, exactly the raw listed price", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const response = await runMerchantAgent(item, {
+      sku: item.sku,
+      quantity: 10,
+      deliveryDeadlineDays: 5,
+    });
+
+    expect(response.decision.unitPrice).toBe(item.listedPrice);
+    expect(response.decision.deliveryDays).toBe(5);
+  });
+
+  it("the rush premium grows with how many days faster than standard is requested", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const modest = await runMerchantAgent(item, { sku: item.sku, quantity: 10, deliveryDeadlineDays: 4 });
+    const aggressive = await runMerchantAgent(item, { sku: item.sku, quantity: 10, deliveryDeadlineDays: 1 });
+
+    expect(aggressive.decision.unitPrice!).toBeGreaterThan(modest.decision.unitPrice!);
+  });
+
+  it("even the most extreme rush request this fixture can validly ask for stays within the rush-adjusted [minPrice, listedPrice] band — never an unbounded price", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const response = await runMerchantAgent(item, {
+      sku: item.sku,
+      quantity: 10,
+      maxUnitPrice: 10, // forces the "counter" branch, clamped to the merchant's own floor
+      deliveryDeadlineDays: 1, // the fastest valid (>= 1) deadline this fixture can ask for
+    });
+
+    // 4 days faster than standard (5 - 1) * 0.03/day = a 12% premium
+    // (below the 15% cap) — item.listedPrice=48000, item.minPrice=44000,
+    // so the true rush-adjusted band this negotiation is bounded to is
+    // [49280, 53760]. An absurdly low buyer ask (10) clamps the counter
+    // to the adjusted floor exactly.
+    expect(response.decision.unitPrice).toBe(49280);
+    expect(response.decision.unitPrice!).toBeGreaterThanOrEqual(49280);
+    expect(response.decision.unitPrice!).toBeLessThanOrEqual(53760);
+  });
+
+  it("still rejects a genuinely nonsensical (non-positive) delivery deadline, regardless of price", async () => {
+    mockedGenerateAgentMessage.mockRejectedValue(new LlmUnavailableError("no key"));
+
+    const response = await runMerchantAgent(item, {
+      sku: item.sku,
+      quantity: 10,
+      deliveryDeadlineDays: 0,
+    });
+
+    expect(response.decision.outcome).toBe("REJECTED");
+    expect(response.offer).toBeNull();
   });
 });
 

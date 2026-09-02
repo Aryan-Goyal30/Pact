@@ -504,6 +504,42 @@ export function resolveDeliveryUrgencyFactor(urgency: UrgencyLevel = "medium"): 
 /** Extra fractional discount, on top of the buyer's ordinary round-aware concession ask, requested in exchange for that additional delivery slack. */
 export const DELIVERY_TRADE_PRICE_ASK_DISCOUNT = 0.02;
 
+// ---------------------------------------------------------------------------
+// Rush delivery: the inverse of the trade above. A buyer whose stated
+// deadline is FASTER than the merchant's standardDeliveryDays is no
+// longer an unconditional impossibility (see catalogRules.ts's
+// checkDeliveryAchievable) — the merchant can expedite to meet it, at a
+// price premium proportional to how many days faster than standard is
+// being asked for. Scenario-behavior fix: without this, "urgent
+// delivery" presets had no mechanism to demonstrate an actual cost for
+// speed, since any deadline faster than standard was simply rejected
+// outright before any negotiation could occur.
+// ---------------------------------------------------------------------------
+
+/** Rupee-fraction premium added per day faster than standard delivery — deliberately steeper than DELIVERY_TRADE_DISCOUNT_PER_DAY_FRACTION's own per-day discount (0.01): a real business commonly charges more per day for demonstrably harder-to-guarantee rush handling than it discounts for a buyer's mere convenience in waiting longer. */
+export const RUSH_DELIVERY_PREMIUM_PER_DAY_FRACTION = 0.03;
+/** Cap on the total rush premium, regardless of how aggressive the ask — mirrors MAX_DELIVERY_TRADE_DISCOUNT_FRACTION's own cap in the opposite direction, keeping both a symmetric, bounded band. */
+export const MAX_RUSH_DELIVERY_PREMIUM_FRACTION = 0.15;
+
+/**
+ * Fractional premium (0 when the requested deadline is at or after
+ * standardDeliveryDays — a genuine no-op for every existing caller/test,
+ * matching every other resolve* factor in this file) applied to the
+ * merchant's price band (listedPrice and minPrice both) for THIS
+ * negotiation only — never mutates the catalog item itself. The caller
+ * (merchantAgent.ts) derives an adjusted CatalogItemSnapshot from this
+ * fraction and threads it through the existing, otherwise-unmodified
+ * pricing formulas (computeCounterOfferPrice / computeMerchantConcessionPrice),
+ * so no pricing formula needs to know about delivery urgency directly.
+ */
+export function resolveDeliveryRushPremiumFraction(
+  standardDeliveryDays: number,
+  requestedDeliveryDays: number,
+): number {
+  const daysFaster = Math.max(0, standardDeliveryDays - requestedDeliveryDays);
+  return clamp(daysFaster * RUSH_DELIVERY_PREMIUM_PER_DAY_FRACTION, 0, MAX_RUSH_DELIVERY_PREMIUM_FRACTION);
+}
+
 /**
  * Merchant-side multiplier on the per-day delivery discount when stock is
  * genuinely CONSTRAINED (low) — deliberately the INVERSE of quantity's
@@ -536,6 +572,22 @@ export function resolveDeliveryTrade(
   buyerDeadlineDays: number,
   buyerFlexible: boolean,
 ): DeliveryTradeResult {
+  // Scenario-behavior fix: a buyer deadline FASTER than standard is a
+  // rush request, not a candidate for the (slower-for-discount) trade
+  // below — the merchant meets it exactly, independent of buyerFlexible
+  // (flexibility is only ever about willingness to accept a LATER date;
+  // it has no bearing on whether a faster one can be met). The price
+  // premium for this is not this function's concern: the caller
+  // (merchantAgent.ts) already derives it into `item.listedPrice` /
+  // `item.minPrice` before this function ever runs (see
+  // resolveDeliveryRushPremiumFraction) — traded stays false here
+  // (this isn't the buyer trading slack for a discount; it costs MORE,
+  // not less), which also means leverage.ts's own deliveryFlexComponent
+  // (traded ? 0.3 : 0) is completely unaffected by this branch.
+  if (buyerDeadlineDays < item.standardDeliveryDays) {
+    return { deliveryDays: buyerDeadlineDays, discount: 0, traded: false };
+  }
+
   if (!buyerFlexible || buyerDeadlineDays <= item.standardDeliveryDays) {
     return { deliveryDays: item.standardDeliveryDays, discount: 0, traded: false };
   }

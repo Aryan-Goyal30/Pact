@@ -203,9 +203,14 @@ describe("POST /api/negotiations/:id/turn — replay after AGREED", () => {
     expect(second.body.merchant.unitPrice).toBe(46163);
   });
 
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite for a price
+  // premium. A non-positive deadline remains genuinely nonsensical
+  // regardless of price, so it's what this test uses to reliably reach
+  // REJECTED with no negotiation at all.
   it("a REJECTED session still returns 409 on a repeated POST (unchanged behavior)", async () => {
     const sessionId = await createTestSession(
-      { sku: LAPTOP_SKU, quantity: 10, maxUnitPrice: 45000, deliveryDeadlineDays: 1 },
+      { sku: LAPTOP_SKU, quantity: 10, maxUnitPrice: 45000, deliveryDeadlineDays: 0 },
       4,
     );
 

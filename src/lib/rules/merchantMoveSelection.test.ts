@@ -206,7 +206,7 @@ describe("merchant HOLD candidate — real, gated on stock scarcity (not leverag
   // not revisit: leverage may now shape HOW MUCH the merchant concedes,
   // never WHETHER it is allowed to consider holding firm at all.
   it("HOLD's own eligibility gate remains leverage-blind — leverage only ever changes the resulting PRICE, never whether HOLD is generated", () => {
-    expect(generateMerchantCandidates.length).toBe(8); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays, authorizedQuantity, leverageScores (optional)
+    expect(generateMerchantCandidates.length).toBe(9); // item, request, concessionContext, priorBuyerUnitPrice, previousBuyerQuantity, previousBuyerDeliveryDays, authorizedQuantity, leverageScores (optional), catalogListedPrice (optional)
 
     const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
     const withoutLeverage = generateMerchantCandidates(scarce, req(), concessionContext, null, null, null, 10);
