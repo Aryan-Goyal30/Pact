@@ -34,7 +34,7 @@ import {
   type BuyerValidationResult,
 } from "@/lib/rules/buyerRules";
 import { explainBuyerFactors, hasQuantityLeverage } from "@/lib/rules/negotiationStrategy";
-import type { AgentDecisionRecord } from "@/lib/negotiation/agentDecision";
+import type { AgentDecisionRecord, AgentObservation } from "@/lib/negotiation/agentDecision";
 import type { CandidateMove } from "@/lib/rules/candidateMove";
 import { HOLD_LEVERAGE_THRESHOLD, type BuyerMove } from "@/lib/rules/buyerMoveSelector";
 import type { BuyerTradeMove } from "@/lib/rules/buyerQuantityTrade";
@@ -572,6 +572,34 @@ export async function runBuyerAgent(
         ? [sufficiency.reason]
         : [];
 
+  // State-driven agent loop (OBSERVE step): a snapshot of exactly what
+  // this decision was made FROM, using only values already in scope at
+  // this point — never a new computation, never influencing `action`/
+  // `move`/`candidates` above (those were all already fully decided
+  // before this object is built). previousMerchantOffer is undefined on
+  // the opening round (merchantResult is null — there is nothing yet to
+  // react to); leverage.merchant is deliberately never populated here —
+  // buyerAgent.ts itself only ever receives its OWN leverage number (see
+  // BuyerStrategyContext.leverageScore), never the merchant's.
+  const observation: AgentObservation = {
+    round: concessionContext?.round,
+    maxRounds: concessionContext?.maxRounds,
+    roundsLeft: concessionContext ? roundsLeft : undefined,
+    buyerRequirement: {
+      quantity: constraints.quantity,
+      maxUnitPrice: constraints.maxUnitPrice,
+      deliveryDeadlineDays: constraints.deliveryDeadlineDays,
+    },
+    previousMerchantOffer: merchantResult
+      ? {
+          quantity: merchantResult.offeredQuantity,
+          unitPrice: merchantResult.unitPrice,
+          deliveryDays: merchantResult.deliveryDays,
+        }
+      : undefined,
+    leverage: strategyContext?.leverageScore !== undefined ? { buyer: strategyContext.leverageScore } : undefined,
+  };
+
   // Agentic Decision + Audit Trail (first layer): a captured snapshot of
   // this same decision, kept SEPARATE from strategicReasons above (which
   // exists purely to feed the LLM prompt and stays completely unchanged)
@@ -585,6 +613,7 @@ export async function runBuyerAgent(
   // context, exactly like `move`/`tradeMove` already are.
   const agentDecision: AgentDecisionRecord = {
     side: "buyer",
+    observation,
     move: tradeMove && tradeMove !== "NO_TRADE" ? tradeMove : (move ?? undefined),
     deterministicReasons: moveReason ? [moveReason] : [],
     strategicReasons: relevantBuyerFactors,

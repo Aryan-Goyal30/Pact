@@ -78,6 +78,16 @@ export interface NegotiationSessionCreateRequest {
   deliveryFlexible?: boolean;
   /** How much shortfall from `quantity` (as a fraction, e.g. 0.2 = up to 20% less) the buyer tolerates without needing price to compensate — see BuyerConstraints.quantityShortfallTolerance. Defaults to a value derived from `urgency` when omitted. */
   quantityShortfallTolerance?: number;
+  /**
+   * Natural-Language Buyer Intent (Roadmap Step 1): the buyer's
+   * aspirational opening price, distinct from the hard `maxUnitPrice`
+   * ceiling — see BuyerConstraints.targetUnitPrice (buyerRules.ts),
+   * which already supported this field; only the API boundary didn't
+   * expose it until now. Optional and additive: every existing caller
+   * that omits it gets the exact same default (resolveBuyerTarget's own
+   * 5%-below-ceiling heuristic) as before this field existed.
+   */
+  targetUnitPrice?: number;
 }
 
 /**
@@ -149,4 +159,36 @@ export interface NegotiationTurnResponse {
    * though the live turn originally carried one.
    */
   decisionAudit?: TurnDecisionAudit;
+}
+
+// ---------------------------------------------------------------------------
+// Audit Trail viewer (read-only) — GET /api/negotiations/:id/audit-trail.
+// See auditTrailRepository.ts: this is a browser-facing view of AuditLog
+// rows that were ALREADY persisted by existing, unmodified write paths
+// (negotiationSessionRepository.ts / agreementRepository.ts /
+// paymentRepository.ts) — not a new decision/audit shape.
+// ---------------------------------------------------------------------------
+
+/**
+ * One persisted AuditLog row. For `eventType === "NEGOTIATION_DECISION"`,
+ * `turn`/`decision` are populated with the exact TurnDecisionAudit
+ * already shown in the live Agent Activity panel (agentDecision.ts) —
+ * reused verbatim, never re-derived. For every other event type
+ * (AGREEMENT_CREATED, PAYMENT_*, RECOVERY_*, WEBHOOK_RECEIVED), `payload`
+ * carries that row's own already-persisted business facts.
+ */
+export interface AuditTrailEntryDTO {
+  id: string;
+  eventType: string;
+  /** ISO 8601 — the row's real, database-assigned AuditLog.createdAt. */
+  createdAt: string;
+  turn?: number;
+  decision?: TurnDecisionAudit;
+  payload?: Record<string, unknown>;
+}
+
+/** Response for GET /api/negotiations/:id/audit-trail. */
+export interface AuditTrailResponse {
+  sessionId: string;
+  entries: AuditTrailEntryDTO[];
 }

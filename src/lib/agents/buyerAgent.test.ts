@@ -1167,6 +1167,130 @@ describe("runBuyerAgent — agentDecision (Agentic Decision + Audit Trail)", () 
   });
 });
 
+// State-driven agent loop: agentDecision.observation is a snapshot of
+// what this decision was made FROM (round/roundsLeft, the buyer's own
+// requirement, the merchant offer being reacted to, leverage) — these
+// tests prove it faithfully reflects the real inputs, and — critically
+// — that adding it changes NOTHING about the action itself (move/terms
+// stay byte-identical to the pre-existing agentDecision tests above).
+describe("runBuyerAgent — observation (state-driven agent loop)", () => {
+  const stuckMerchantResult: NegotiationResult = {
+    outcome: "COUNTER_OFFER",
+    sku: "LAPTOP-14-I5",
+    requestedQuantity: 200,
+    offeredQuantity: 200,
+    unitPrice: 46500,
+    deliveryDays: 10,
+    reasons: [],
+  };
+
+  it("on the opening round, observes the buyer's own requirement and no prior merchant offer yet", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(constraints, manifestProduct, null, { round: 1, maxRounds: 8 });
+
+    expect(response.agentDecision.observation.round).toBe(1);
+    expect(response.agentDecision.observation.maxRounds).toBe(8);
+    expect(response.agentDecision.observation.roundsLeft).toBe(8);
+    expect(response.agentDecision.observation.buyerRequirement).toEqual({
+      quantity: constraints.quantity,
+      maxUnitPrice: constraints.maxUnitPrice,
+      deliveryDeadlineDays: constraints.deliveryDeadlineDays,
+    });
+    // Nothing to react to yet — never fabricated.
+    expect(response.agentDecision.observation.previousMerchantOffer).toBeUndefined();
+  });
+
+  it("without any round context, observation still reports the buyer's requirement but no round/roundsLeft", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(constraints, manifestProduct, null);
+
+    expect(response.agentDecision.observation.round).toBeUndefined();
+    expect(response.agentDecision.observation.maxRounds).toBeUndefined();
+    expect(response.agentDecision.observation.roundsLeft).toBeUndefined();
+    expect(response.agentDecision.observation.buyerRequirement.quantity).toBe(constraints.quantity);
+  });
+
+  it("on a reactive round, observes the exact merchant offer being reacted to and the real roundsLeft — while the SELECTED ACTION remains identical to the pre-existing HOLD fixture", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 },
+    );
+
+    // The action/decision itself: byte-identical to the pre-observation
+    // HOLD fixture proven above — this feature changes nothing about
+    // what gets decided, only what gets recorded about how it was made.
+    expect(response.move).toBe("HOLD");
+    expect(response.agentDecision.move).toBe("HOLD");
+    expect(response.action.unitPrice).toBe(43700);
+
+    // What it observed, faithfully echoing the real inputs:
+    expect(response.agentDecision.observation.round).toBe(3);
+    expect(response.agentDecision.observation.maxRounds).toBe(8);
+    expect(response.agentDecision.observation.roundsLeft).toBe(6);
+    expect(response.agentDecision.observation.previousMerchantOffer).toEqual({
+      quantity: stuckMerchantResult.offeredQuantity,
+      unitPrice: stuckMerchantResult.unitPrice,
+      deliveryDays: stuckMerchantResult.deliveryDays,
+    });
+  });
+
+  it("observes its own leverage score exactly as supplied, never the merchant's", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    const response = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700, leverageScore: 62 },
+    );
+
+    expect(response.agentDecision.observation.leverage).toEqual({ buyer: 62 });
+    // The buyer never observes the merchant's own leverage number — only
+    // its own aggregate score crosses this boundary (see buyerAgent.ts's
+    // own header comment on this invariant).
+    expect(response.agentDecision.observation.leverage?.merchant).toBeUndefined();
+  });
+
+  it("different negotiation situations produce different observations and different decisions — not a fixed, pre-written sequence", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+
+    // Situation A: merchant hasn't moved from its prior price -> HOLD.
+    const holdResponse = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      stuckMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 },
+    );
+
+    // Situation B: merchant genuinely conceded from its prior price (but
+    // not all the way to an outright-acceptable price) -> CONCEDE.
+    const movedMerchantResult: NegotiationResult = { ...stuckMerchantResult, unitPrice: 45900 };
+    const concedeResponse = await runBuyerAgent(
+      constraints,
+      manifestProduct,
+      movedMerchantResult,
+      { round: 3, maxRounds: 8 },
+      { priorMerchantUnitPrice: 46500, previousBuyerUnitPrice: 43700 },
+    );
+
+    expect(holdResponse.agentDecision.move).toBe("HOLD");
+    expect(concedeResponse.agentDecision.move).toBe("CONCEDE");
+    // The observation genuinely differs too — it's a real snapshot of
+    // different input state, not a static template.
+    expect(holdResponse.agentDecision.observation.previousMerchantOffer?.unitPrice).toBe(46500);
+    expect(concedeResponse.agentDecision.observation.previousMerchantOffer?.unitPrice).toBe(45900);
+  });
+});
+
 // PACT V2 Milestone 2: the buyer's deterministic walk-away decision.
 describe("runBuyerWalkAway", () => {
   it("the message states the buyer's own maximum budget and the merchant's offer that exceeded it", async () => {

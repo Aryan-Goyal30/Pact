@@ -25,7 +25,7 @@ import type { CandidateMove, CandidateMoveType } from "@/lib/rules/candidateMove
 import type { WalkAwayReason } from "@/lib/rules/walkAway";
 import { checkAgentMessageIntegrity } from "@/lib/agents/messageIntegrity";
 import { getLlmProvider, LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/provider";
-import type { AgentDecisionRecord } from "@/lib/negotiation/agentDecision";
+import type { AgentDecisionRecord, AgentObservation } from "@/lib/negotiation/agentDecision";
 
 export interface MerchantAgentOffer {
   sku: string;
@@ -468,6 +468,29 @@ export async function runMerchantAgent(
     candidates = concession.candidates;
   }
 
+  // State-driven agent loop (OBSERVE step): a snapshot of exactly what
+  // this decision was made FROM, using only values already in scope at
+  // this point — never a new computation, never influencing `decision`/
+  // `move`/`candidates` above (all already fully decided before this
+  // object is built). The merchant's own "requirement it's reacting to"
+  // IS the buyer's current ask (`request`) — there is no separate
+  // "previous offer" to observe beyond that (see AgentObservation's own
+  // doc comment); roundsLeft mirrors buyerAgent.ts's identical trivial
+  // arithmetic, not a second implementation of any strategic formula.
+  const observation: AgentObservation = {
+    round: concessionContext?.round,
+    maxRounds: concessionContext?.maxRounds,
+    roundsLeft: concessionContext
+      ? Math.max(1, concessionContext.maxRounds - concessionContext.round + 1)
+      : undefined,
+    buyerRequirement: {
+      quantity: request.quantity,
+      maxUnitPrice: request.maxUnitPrice,
+      deliveryDeadlineDays: request.deliveryDeadlineDays,
+    },
+    leverage: leverageScores,
+  };
+
   // Agentic Decision + Audit Trail (first layer): a captured snapshot of
   // this same decision (decision.reasons is the merchant's own
   // deterministic "why" — never LLM-authored; merchant has no separate
@@ -478,6 +501,7 @@ export async function runMerchantAgent(
   // like `move` already is.
   const agentDecision: AgentDecisionRecord = {
     side: "merchant",
+    observation,
     move,
     deterministicReasons: decision.reasons,
     strategicReasons: [],

@@ -29,12 +29,68 @@ export interface AgentDecisionSufficiency {
 }
 
 /**
+ * What a side read BEFORE deciding this round's move — the OBSERVE step
+ * of the observe -> evaluate -> decide -> act loop the orchestrator
+ * already runs every round, made an explicit, auditable value instead of
+ * staying implicit across several function parameters. Every field here
+ * is a direct, unmodified copy of a value buyerAgent.ts / merchantAgent.ts
+ * already received as an input to build this same decision — nothing is
+ * recomputed, and nothing here ever influences `move` / `candidates` /
+ * `terms` below. Optional throughout: a field is present only when the
+ * corresponding input was actually supplied/known this round (e.g. no
+ * concessionContext means no round/roundsLeft to report, and the buyer's
+ * opening round has no prior merchant offer to react to yet) — never
+ * fabricated to fill a gap.
+ */
+export interface AgentObservation {
+  /** 1-indexed round this decision was made in. Absent for a caller with no round context (e.g. the single-shot POST /api/negotiate). */
+  round?: number;
+  maxRounds?: number;
+  /** Rounds remaining before the round budget is exhausted, floored at 1 — the same trivial "how many rounds are left" arithmetic every round-aware concession formula in this codebase already derives inline (buyerRules.ts / negotiationEngine.ts); echoed here for display only, never a second implementation of any strategic decision. */
+  roundsLeft?: number;
+  /**
+   * The requirement this side is negotiating against this round: the
+   * buyer's own original constraints for the buyer's own observation; the
+   * buyer's CURRENT stated ask (quantity/price/delivery) for the
+   * merchant's observation, since that request is the entirety of what
+   * the merchant ever observes of "the buyer's requirement" — it never
+   * sees the buyer's true underlying ceiling, exactly like every other
+   * merchant-facing value in this codebase.
+   */
+  buyerRequirement: {
+    quantity: number;
+    /** Undefined only when the buyer genuinely stated no price ceiling (see NegotiationRequest.maxUnitPrice) — never fabricated. */
+    maxUnitPrice?: number;
+    /** Undefined only when the buyer genuinely stated no delivery deadline (see NegotiationRequest.deliveryDeadlineDays) — never fabricated. */
+    deliveryDeadlineDays?: number;
+  };
+  /**
+   * The merchant's most recent public offer this round is reacting to —
+   * buyer-side only (see buyerAgent.ts). Undefined on the buyer's opening
+   * round, before any merchant offer exists yet to observe. There is no
+   * merchant-side equivalent field: the merchant's own "what it's
+   * reacting to" is already fully captured by `buyerRequirement` above.
+   */
+  previousMerchantOffer?: { quantity: number | null; unitPrice: number | null; deliveryDays: number | null };
+  /**
+   * This side's own live leverage reading at decision time (leverage.ts).
+   * The buyer only ever receives its own aggregate score (merchant
+   * omitted here too) — merchantAgent.ts receives both — mirroring the
+   * exact visibility boundary each agent already has today; never widened
+   * by this field.
+   */
+  leverage?: { buyer?: number; merchant?: number };
+}
+
+/**
  * One side's (buyer or merchant) deterministic decision for a single
  * round. Every field is a direct capture of something already computed
  * elsewhere — nothing here is derived or inferred by this module itself.
  */
 export interface AgentDecisionRecord {
   side: "buyer" | "merchant";
+  /** What this side observed before deciding — see AgentObservation. */
+  observation: AgentObservation;
   /**
    * The winning strategic move (HOLD / CONCEDE / a trade), when a
    * genuine candidate-selection decision was made this round — see

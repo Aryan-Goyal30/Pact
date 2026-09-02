@@ -1157,3 +1157,82 @@ describe("runMerchantAgent — agentDecision (Agentic Decision + Audit Trail)", 
     });
   });
 });
+
+// State-driven agent loop: agentDecision.observation is a snapshot of
+// what this decision was made FROM (round/roundsLeft, the buyer's
+// current ask, leverage) — these tests prove it faithfully reflects the
+// real inputs, and that adding it changes nothing about the decision
+// itself (move/terms stay byte-identical to the fixtures proven above).
+describe("runMerchantAgent — observation (state-driven agent loop)", () => {
+  beforeEach(() => {
+    mockedGenerateAgentMessage.mockResolvedValue("...");
+  });
+
+  it("observes the buyer's current ask, round/roundsLeft, and leverage on a round-aware call — while the SELECTED ACTION remains identical to the pre-existing HOLD fixture", async () => {
+    const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+    const response = await runMerchantAgent(
+      scarce,
+      { sku: item.sku, quantity: 300, maxUnitPrice: 44100, deliveryDeadlineDays: 10 },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+      undefined,
+      undefined,
+      undefined,
+      { buyer: 70, merchant: 30 },
+    );
+
+    // Byte-identical to the pre-observation HOLD fixture above.
+    expect(response.agentDecision.move).toBe("HOLD");
+    expect(response.decision.unitPrice).toBe(45600);
+
+    expect(response.agentDecision.observation.round).toBe(2);
+    expect(response.agentDecision.observation.maxRounds).toBe(6);
+    expect(response.agentDecision.observation.roundsLeft).toBe(5);
+    expect(response.agentDecision.observation.buyerRequirement).toEqual({
+      quantity: 300,
+      maxUnitPrice: 44100,
+      deliveryDeadlineDays: 10,
+    });
+    // The merchant sees BOTH sides' leverage — mirroring exactly what it
+    // already received as its own leverageScores parameter.
+    expect(response.agentDecision.observation.leverage).toEqual({ buyer: 70, merchant: 30 });
+  });
+
+  it("without a round context, observation still reports the buyer's current ask but no round/roundsLeft", async () => {
+    const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10, maxUnitPrice: 45000 });
+
+    expect(response.agentDecision.observation.round).toBeUndefined();
+    expect(response.agentDecision.observation.maxRounds).toBeUndefined();
+    expect(response.agentDecision.observation.roundsLeft).toBeUndefined();
+    expect(response.agentDecision.observation.buyerRequirement.quantity).toBe(10);
+    expect(response.agentDecision.observation.buyerRequirement.maxUnitPrice).toBe(45000);
+  });
+
+  it("never fabricates a delivery deadline the buyer didn't state", async () => {
+    const response = await runMerchantAgent(item, { sku: item.sku, quantity: 10, maxUnitPrice: 45000 });
+
+    expect(response.agentDecision.observation.buyerRequirement.deliveryDeadlineDays).toBeUndefined();
+  });
+
+  it("different negotiation situations produce different observations and different decisions — not a fixed, pre-written sequence", async () => {
+    // Situation A: scarce stock -> HOLD.
+    const scarce: CatalogItemSnapshot = { ...item, availableQty: 15 };
+    const holdResponse = await runMerchantAgent(
+      scarce,
+      { sku: item.sku, quantity: 300, maxUnitPrice: 44100 },
+      { round: 2, maxRounds: 6, previousOfferUnitPrice: 45600 },
+    );
+
+    // Situation B: ordinary stock, genuine room to concede -> CONCEDE.
+    const concedeResponse = await runMerchantAgent(
+      item,
+      { sku: item.sku, quantity: 10, maxUnitPrice: 45000 },
+      { round: 2, maxRounds: 4, previousOfferUnitPrice: 46500 },
+      44000,
+    );
+
+    expect(holdResponse.agentDecision.move).toBe("HOLD");
+    expect(concedeResponse.agentDecision.move).toBe("CONCEDE");
+    expect(holdResponse.agentDecision.observation.buyerRequirement.quantity).toBe(300);
+    expect(concedeResponse.agentDecision.observation.buyerRequirement.quantity).toBe(10);
+  });
+});

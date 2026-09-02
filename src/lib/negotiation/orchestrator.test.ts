@@ -2640,6 +2640,116 @@ describe("decisionAudit (Agentic Decision + Audit Trail)", () => {
   });
 });
 
+// State-driven agent loop: proves the orchestrator's existing per-turn
+// cycle genuinely IS observe -> evaluate -> decide -> act -> new state ->
+// observe again, using the newly-explicit AgentObservation snapshot
+// (agentDecision.ts) each side's decisionAudit now carries. Critically,
+// this never asserts anything different about the NEGOTIATED terms
+// themselves — those are already covered end-to-end by every other test
+// in this file, all of which still pass unmodified.
+describe("decisionAudit.observation — state-driven agent loop", () => {
+  it("round 1 observes the buyer's own requirement with no prior merchant offer to react to yet", async () => {
+    const state = createNegotiationState(4);
+    const turn = await runNegotiationTurn(demoContext(), state, null);
+
+    expect(turn.decisionAudit!.buyer.observation.round).toBe(1);
+    expect(turn.decisionAudit!.buyer.observation.previousMerchantOffer).toBeUndefined();
+    expect(turn.decisionAudit!.buyer.observation.buyerRequirement).toEqual({
+      quantity: demoBuyerConstraints.quantity,
+      maxUnitPrice: demoBuyerConstraints.maxUnitPrice,
+      deliveryDeadlineDays: demoBuyerConstraints.deliveryDeadlineDays,
+    });
+    // The merchant's own observation for this same round: what it's
+    // reacting to IS the buyer's opening ask, real numbers, not fabricated.
+    expect(turn.decisionAudit!.merchant!.observation.buyerRequirement.quantity).toBe(
+      turn.buyer.quantity,
+    );
+  });
+
+  // This is the core proof that the loop is genuinely STATE-DRIVEN, not
+  // a sequence of independently pre-computed responses: round 2's
+  // observation.previousMerchantOffer must equal round 1's ACTUAL,
+  // just-produced merchant terms — a value that could only be known
+  // after round 1 finished, fed back in as round 2's own input.
+  it("round 2's observation of the prior merchant offer is exactly round 1's own real, just-produced terms — the new state genuinely feeds the next round", async () => {
+    const { transcript, finalState } = await runNegotiationToCompletion(demoContext(), 6);
+    expect(transcript.length).toBeGreaterThanOrEqual(2);
+
+    const round1 = transcript[0];
+    const round2 = transcript[1];
+
+    expect(round2.decisionAudit!.buyer.observation.previousMerchantOffer).toEqual({
+      quantity: round1.merchant.quantity,
+      unitPrice: round1.merchant.unitPrice,
+      deliveryDays: round1.merchant.deliveryDays,
+    });
+    // Round 2's own round/roundsLeft bookkeeping likewise advanced from
+    // round 1's, rather than staying static.
+    expect(round2.decisionAudit!.buyer.observation.round).toBe(2);
+    expect(round1.decisionAudit!.buyer.observation.round).toBe(1);
+    expect(finalState.status).not.toBe("OPEN");
+  });
+
+  it("different negotiation situations produce genuinely different observations and different decisions through the real orchestrator — not a fixed, pre-written sequence", async () => {
+    // Situation A: the demo scenario (partial fulfillment pressure).
+    const roundA = (await runNegotiationTurn(demoContext(), createNegotiationState(4), null)).decisionAudit!;
+
+    // Situation B: a scarce-stock item that opens the merchant's HOLD gate.
+    const scarceContext: NegotiationContext = {
+      item: { ...laptop, availableQty: 15 },
+      manifestProduct: { ...laptopManifestListing, availableQuantity: 15 },
+      buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 300, maxUnitPrice: 44100, deliveryDeadlineDays: 10 },
+    };
+    const roundB = (await runNegotiationTurn(scarceContext, createNegotiationState(4), null)).decisionAudit!;
+
+    expect(roundA.buyer.observation.buyerRequirement.quantity).not.toBe(
+      roundB.buyer.observation.buyerRequirement.quantity,
+    );
+    expect(roundA.merchant!.terms.unitPrice).not.toBe(roundB.merchant!.terms.unitPrice);
+  });
+
+  it("never fabricates an observation for a structural walk-away — decisionAudit is absent entirely, exactly as before", async () => {
+    const laptop2: CatalogItemSnapshot = {
+      sku: "LAPTOP-14-I5",
+      listedPrice: 48000,
+      minPrice: 44000,
+      availableQty: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiationEnabled: true,
+    };
+    const laptop2Listing: PublicManifestProduct = {
+      sku: "LAPTOP-14-I5",
+      name: "14-inch Business Laptop (i5, 16GB RAM)",
+      description: "Mid-range business laptop suitable for office use.",
+      listedPrice: 48000,
+      availableQuantity: 100,
+      standardDeliveryDays: 5,
+      maxDeliveryDays: 12,
+      negotiable: true,
+    };
+    const { transcript, finalState } = await runNegotiationToCompletion(
+      {
+        item: laptop2,
+        manifestProduct: laptop2Listing,
+        buyerConstraints: { sku: "LAPTOP-14-I5", quantity: 10, maxUnitPrice: 30000, deliveryDeadlineDays: 10 },
+      },
+      4,
+    );
+
+    expect(finalState.status).toBe("EXPIRED");
+    const closingTurn = transcript[transcript.length - 1];
+    expect(closingTurn.buyer.type).toBe("reject");
+    // No decisionAudit at all on this turn -> no observation to check
+    // either, by construction (there is no AgentDecisionRecord to hold
+    // one). This is the same invariant the existing decisionAudit
+    // describe block above already proves; repeated here explicitly
+    // because it's the exact case this feature could most easily get
+    // wrong by fabricating a hollow observation with nothing real to report.
+    expect(closingTurn.decisionAudit).toBeUndefined();
+  });
+});
+
 describe("provider-failure handling: a rate-limited LLM never stops the negotiation", () => {
   it("a negotiation still reaches AGREED, with every message carrying real authoritative numbers, when the LLM provider is rate-limited on every call", async () => {
     mockedGetLlmProvider.mockReturnValue({

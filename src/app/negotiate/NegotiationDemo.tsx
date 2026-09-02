@@ -5,12 +5,21 @@ import type { PublicManifestProduct } from "@/types/manifest";
 import type {
   LeverageScoreDTO,
   NegotiationMessageDTO,
+  NegotiationSessionCreateRequest,
   NegotiationSessionResponse,
   NegotiationTurnResponse,
   PersistedAgreementDTO,
 } from "@/types/negotiation";
 import type { AgentDecisionRecord, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 import type { NegotiationStatus } from "@/lib/rules/negotiationState";
+// Only the pure, dependency-free mapping helper and its types are used
+// client-side — parseBuyerIntent itself (which calls the LLM provider)
+// stays server-only, reached via POST /api/negotiations/intent (see
+// handleUnderstandRequest below), never imported directly into this
+// client bundle.
+import { buyerIntentToSessionRequest } from "@/lib/negotiation/buyerIntentParser";
+import type { BuyerIntent, BuyerIntentParseResult } from "@/lib/negotiation/buyerIntentParser";
+import { AuditTrailPanel } from "./AuditTrailPanel";
 import {
   buyerThinkingLabel,
   computeMaxOrderValue,
@@ -85,6 +94,11 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   const [started, setStarted] = useState(false);
 
   const [maxRounds, setMaxRounds] = useState<number | null>(null);
+  // Audit Trail viewer: the one piece of identity AuditTrailPanel needs
+  // to fetch GET /api/negotiations/:id/audit-trail on demand. Not used
+  // for anything else — every other piece of UI state in this component
+  // already comes from the turn-by-turn responses, unaffected by this.
+  const [sessionId, setSessionId] = useState<string | null>(null);
   const [round, setRound] = useState(0);
   // UI display fix: the engine's own `round` (state.round, above) is a
   // round-BUDGET counter for the deterministic concession formulas
@@ -110,6 +124,18 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
   );
   const [agreement, setAgreement] = useState<PersistedAgreementDTO | null>(null);
 
+  // Natural-Language Buyer Intent (Roadmap Step 1): the primary entry
+  // point is free text, understood into the SAME structured request the
+  // form below has always produced — see buyerIntentParser.ts. The
+  // structured form itself, and everything from `formError` down to the
+  // turn-polling loop above, is completely unchanged: it remains the
+  // fallback/editing layer, reachable at any time via entryMode "form".
+  const [entryMode, setEntryMode] = useState<"intent" | "form">("intent");
+  const [intentText, setIntentText] = useState("");
+  const [intentLoading, setIntentLoading] = useState(false);
+  const [intentNotice, setIntentNotice] = useState<string | null>(null);
+  const [parsedIntent, setParsedIntent] = useState<BuyerIntent | null>(null);
+
   const selectedProduct = products.find((p) => p.sku === form.sku) ?? null;
   const parsedQuantity = Number(form.quantity);
   const parsedMaxPrice = Number(form.maxUnitPrice);
@@ -118,21 +144,20 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
       ? computeMaxOrderValue(parsedQuantity, parsedMaxPrice)
       : null;
 
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setFormError(null);
+  // The actual negotiation run — unchanged from before this milestone,
+  // just extracted out of handleSubmit's body so both the structured
+  // form AND the new natural-language confirmation card can start the
+  // exact same flow. `parsed` is anything shaped like
+  // NegotiationSessionCreateRequest — both the form's own ParsedBuyerRequest
+  // and buyerIntentToSessionRequest's output satisfy this structurally,
+  // targetUnitPrice included where present.
+  async function runNegotiation(parsed: NegotiationSessionCreateRequest) {
     setApiError(null);
-
-    const parsed = parseBuyerRequestForm(form);
-    if (typeof parsed === "string") {
-      setFormError(parsed);
-      return;
-    }
-
     setRunning(true);
     setStarted(true);
     setTranscript([]);
     setAgreement(null);
+    setSessionId(null);
     setRound(0);
     setDisplayRound(0);
     setStatus(null);
@@ -150,6 +175,9 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
         // POST /api/negotiations are completely unaffected — the API
         // already accepted an optional maxRounds field before this
         // change; only this one client now supplies it.
+        // targetUnitPrice is absent from every existing (form) caller's
+        // `parsed` object — JSON.stringify drops undefined keys, so this
+        // is a no-op for them; only the natural-language path supplies it.
         body: JSON.stringify({ ...parsed, maxRounds: 6 }),
       });
       const session = (await createResponse.json()) as NegotiationSessionResponse & {
@@ -163,6 +191,7 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
       }
 
       setMaxRounds(session.maxRounds);
+      setSessionId(session.sessionId);
       setStatus(session.status);
 
       let currentStatus: NegotiationStatus = session.status;
@@ -222,6 +251,105 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
     }
   }
 
+  // The structured form's own submit — unchanged behavior, now just a
+  // thin wrapper around the shared runNegotiation.
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setFormError(null);
+
+    const parsed = parseBuyerRequestForm(form);
+    if (typeof parsed === "string") {
+      setFormError(parsed);
+      return;
+    }
+
+    await runNegotiation(parsed);
+  }
+
+  // Copies whatever a BuyerIntentParseResult DID confidently understand
+  // onto the existing form state — never invents a value for a field
+  // that wasn't understood; those fields simply keep the form's current
+  // value, exactly like a person editing the form by hand.
+  function applyUnderstoodToForm(partial: Partial<BuyerIntent>) {
+    setForm((prev) => ({
+      sku: partial.sku ?? prev.sku,
+      quantity: partial.quantity !== undefined ? String(partial.quantity) : prev.quantity,
+      maxUnitPrice: partial.maxPrice !== undefined ? String(partial.maxPrice) : prev.maxUnitPrice,
+      deliveryDeadlineDays:
+        partial.deliveryDeadlineDays !== undefined ? String(partial.deliveryDeadlineDays) : prev.deliveryDeadlineDays,
+      urgency: partial.urgency ?? prev.urgency,
+      deliveryFlexible: partial.deliveryFlexible ?? prev.deliveryFlexible,
+    }));
+  }
+
+  // Natural-language entry point: sends free text to the new, isolated
+  // /api/negotiations/intent endpoint (buyerIntentParser.ts) — never
+  // decides anything itself, only understands. A successful parse shows
+  // the confirmation card; anything else (missing fields, an unmatched
+  // product, or unusable output) surfaces the parser's own message and
+  // falls back to the structured form, pre-filled with whatever WAS
+  // understood, exactly per the "never invent, surface what's missing"
+  // requirement.
+  async function handleUnderstandRequest() {
+    setIntentNotice(null);
+    setParsedIntent(null);
+
+    if (intentText.trim().length === 0) {
+      setIntentNotice("Describe what you'd like to buy first.");
+      return;
+    }
+
+    setIntentLoading(true);
+    try {
+      const response = await fetch("/api/negotiations/intent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: intentText }),
+      });
+      const result = (await response.json()) as BuyerIntentParseResult & { error?: string };
+
+      if (!response.ok) {
+        setIntentNotice(result.error ?? "Could not process that request.");
+        return;
+      }
+
+      if (result.status === "ok") {
+        setParsedIntent(result.intent);
+        applyUnderstoodToForm(result.intent);
+      } else if (result.status === "missing_fields" || result.status === "unknown_product") {
+        setIntentNotice(result.message);
+        applyUnderstoodToForm(result.understood);
+        setEntryMode("form");
+      } else {
+        setIntentNotice(result.message);
+        setEntryMode("form");
+      }
+    } catch {
+      setIntentNotice("Could not reach the request parser — please fill in the details below.");
+      setEntryMode("form");
+    } finally {
+      setIntentLoading(false);
+    }
+  }
+
+  // "Start Autonomous Negotiation" on the confirmation card — runs the
+  // exact same negotiation flow as the structured form's submit, just
+  // sourced from the already-understood, already-validated intent
+  // instead of re-reading the form. buyerIntentToSessionRequest (the
+  // same pure mapping function this milestone's tests exercise directly)
+  // is also what supplies targetUnitPrice — the one field the manual
+  // form path never sends.
+  async function handleStartFromIntent() {
+    if (!parsedIntent) return;
+    await runNegotiation(buyerIntentToSessionRequest(parsedIntent));
+  }
+
+  function handleDescribeSomethingElse() {
+    setParsedIntent(null);
+    setIntentText("");
+    setIntentNotice(null);
+  }
+
   const lastTurn = transcript[transcript.length - 1];
   const previousTurn = transcript[transcript.length - 2];
   const latestBuyerOffer = lastTurn?.buyer ?? null;
@@ -232,32 +360,69 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
       <AgentObjectivesHeader />
 
       <section className="flex flex-col gap-3">
-        <div>
-          <h2 className="text-lg font-medium text-black dark:text-zinc-50">
-            Start a negotiation
-          </h2>
-          <p className="text-sm text-zinc-600 dark:text-zinc-400">
-            Tell the Buyer Agent what it&apos;s shopping for. It will negotiate with
-            the Merchant Agent on your behalf, one real exchange at a time.
-          </p>
-        </div>
+        {entryMode === "intent" ? (
+          parsedIntent ? (
+            <IntentConfirmation
+              intent={parsedIntent}
+              running={running}
+              onStart={handleStartFromIntent}
+              onEdit={() => setEntryMode("form")}
+              onReset={handleDescribeSomethingElse}
+            />
+          ) : (
+            <IntentEntry
+              value={intentText}
+              onChange={setIntentText}
+              onSubmit={handleUnderstandRequest}
+              loading={intentLoading}
+              notice={intentNotice}
+              disabled={running}
+              onSkipToForm={() => setEntryMode("form")}
+            />
+          )
+        ) : (
+          <>
+            <button
+              type="button"
+              disabled={running}
+              onClick={() => setEntryMode("intent")}
+              className="self-start text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
+            >
+              ← Back to natural language
+            </button>
 
-        {presets.length > 0 && (
-          <div className="flex flex-wrap gap-2">
-            {presets.map((preset) => (
-              <button
-                key={preset.id}
-                type="button"
-                disabled={running}
-                title={preset.description}
-                onClick={() => setForm(preset.values)}
-                className="rounded-full border border-black/[.12] px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
-              >
-                {preset.label}
-              </button>
-            ))}
-          </div>
-        )}
+            {intentNotice && (
+              <p className="rounded-lg bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
+                {intentNotice}
+              </p>
+            )}
+
+            <div>
+              <h2 className="text-lg font-medium text-black dark:text-zinc-50">
+                Start a negotiation
+              </h2>
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                Tell the Buyer Agent what it&apos;s shopping for. It will negotiate with
+                the Merchant Agent on your behalf, one real exchange at a time.
+              </p>
+            </div>
+
+            {presets.length > 0 && (
+              <div className="flex flex-wrap gap-2">
+                {presets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    disabled={running}
+                    title={preset.description}
+                    onClick={() => setForm(preset.values)}
+                    className="rounded-full border border-black/[.12] px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            )}
 
         <form
           onSubmit={handleSubmit}
@@ -399,12 +564,14 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
             </button>
           </div>
         </form>
+          </>
+        )}
       </section>
 
       {!started && (
         <p className="rounded-lg border border-dashed border-black/[.15] p-6 text-center text-sm text-zinc-500 dark:border-white/[.2] dark:text-zinc-500">
-          Fill in the form above and start a negotiation to watch the Buyer and
-          Merchant Agents negotiate live, one real exchange at a time.
+          Describe what you&apos;re looking to buy above (or fill in the form manually) to
+          watch the Buyer and Merchant Agents negotiate live, one real exchange at a time.
         </p>
       )}
 
@@ -469,6 +636,8 @@ export function NegotiationDemo({ products }: NegotiationDemoProps) {
               maxRounds={maxRounds}
             />
           )}
+
+          <AuditTrailPanel sessionId={sessionId} productName={selectedProduct?.name ?? null} />
         </section>
       )}
     </div>
@@ -500,6 +669,175 @@ function AgentObjectivesHeader() {
         <p className="text-xs text-zinc-500 dark:text-zinc-500">
           Constraint: a private reservation price it can never go below
         </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Natural-Language Buyer Intent (Roadmap Step 1) — the primary entry
+ * point: free text in, "Understand my request" turns it into the same
+ * structured request the form below has always produced (see
+ * buyerIntentParser.ts). Purely a text box + two buttons — the
+ * structured form itself is untouched and always one click away via
+ * "Or fill in the form manually".
+ */
+function IntentEntry({
+  value,
+  onChange,
+  onSubmit,
+  loading,
+  notice,
+  disabled,
+  onSkipToForm,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  loading: boolean;
+  notice: string | null;
+  disabled: boolean;
+  onSkipToForm: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-3 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
+      <div>
+        <h2 className="text-lg font-medium text-black dark:text-zinc-50">
+          What are you looking to buy?
+        </h2>
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Describe it in your own words — the Buyer Agent turns this into a structured
+          request before it starts negotiating.
+        </p>
+      </div>
+
+      <textarea
+        value={value}
+        disabled={disabled || loading}
+        onChange={(e) => onChange(e.target.value)}
+        rows={3}
+        placeholder="e.g. I need 300 wireless keyboard and mouse combos for our office. I need them within 5 days. I'd like to stay around ₹1,200 each, but I can pay a little more if I can get faster delivery."
+        className="resize-none rounded-md border border-black/[.15] bg-white px-3 py-2 text-sm text-zinc-900 disabled:opacity-50 dark:border-white/[.2] dark:bg-black dark:text-zinc-100"
+      />
+
+      {notice && <p className="text-sm text-red-600 dark:text-red-400">{notice}</p>}
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          disabled={disabled || loading}
+          onClick={onSubmit}
+          className="flex h-11 items-center justify-center rounded-full bg-foreground px-6 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
+        >
+          {loading ? "Understanding…" : "Understand my request"}
+        </button>
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={onSkipToForm}
+          className="text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
+        >
+          Or fill in the form manually
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "BUYER AGENT UNDERSTOOD" confirmation/editing layer — shown after a
+ * successful parse. Every value here is a direct, unmodified field of
+ * the BuyerIntent the server returned (see buyerIntentParser.ts);
+ * nothing is recomputed here. "Start Autonomous Negotiation" hands this
+ * straight to the existing, unmodified negotiation flow; "Edit details"
+ * reveals the existing structured form, pre-filled with these same
+ * values, for anyone who wants to adjust something first.
+ */
+function IntentConfirmation({
+  intent,
+  running,
+  onStart,
+  onEdit,
+  onReset,
+}: {
+  intent: BuyerIntent;
+  running: boolean;
+  onStart: () => void;
+  onEdit: () => void;
+  onReset: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-4 rounded-xl border border-black/[.08] p-5 dark:border-white/[.145]">
+      <p className="text-xs font-semibold uppercase tracking-wider text-zinc-400 dark:text-zinc-600">
+        Buyer Agent understood
+      </p>
+
+      <dl className="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Product</dt>
+          <dd className="font-medium text-zinc-900 dark:text-zinc-100">{intent.productName}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Quantity</dt>
+          <dd className="font-medium text-zinc-900 dark:text-zinc-100">{intent.quantity} units</dd>
+        </div>
+        {intent.targetPrice !== undefined && (
+          <div>
+            <dt className="text-xs text-zinc-500 dark:text-zinc-500">Target price</dt>
+            <dd className="font-medium text-zinc-900 dark:text-zinc-100">
+              {formatInr(intent.targetPrice)} / unit
+            </dd>
+          </div>
+        )}
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Maximum budget</dt>
+          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
+            {formatInr(intent.maxPrice)} / unit
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Delivery</dt>
+          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
+            Within {intent.deliveryDeadlineDays} day(s)
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Priority</dt>
+          <dd className="font-medium capitalize text-zinc-900 dark:text-zinc-100">{intent.urgency}</dd>
+        </div>
+        <div>
+          <dt className="text-xs text-zinc-500 dark:text-zinc-500">Delivery flexibility</dt>
+          <dd className="font-medium text-zinc-900 dark:text-zinc-100">
+            {intent.deliveryFlexible ? "Yes" : "No"}
+          </dd>
+        </div>
+      </dl>
+
+      <div className="flex flex-wrap items-center gap-3">
+        <button
+          type="button"
+          disabled={running}
+          onClick={onStart}
+          className="flex h-11 items-center justify-center rounded-full bg-foreground px-6 text-sm font-medium text-background transition-colors hover:bg-[#383838] disabled:opacity-50 dark:hover:bg-[#ccc]"
+        >
+          {running ? "Negotiating…" : "Start Autonomous Negotiation"}
+        </button>
+        <button
+          type="button"
+          disabled={running}
+          onClick={onEdit}
+          className="rounded-full border border-black/[.12] px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-black/[.04] disabled:opacity-50 dark:border-white/[.18] dark:text-zinc-300 dark:hover:bg-white/[.06]"
+        >
+          Edit details
+        </button>
+        <button
+          type="button"
+          disabled={running}
+          onClick={onReset}
+          className="text-sm font-medium text-zinc-600 underline-offset-2 hover:underline disabled:opacity-50 dark:text-zinc-400"
+        >
+          Describe something else
+        </button>
       </div>
     </div>
   );
@@ -796,7 +1134,13 @@ function AgentDecisionPanel({ decisionAudit }: { decisionAudit: TurnDecisionAudi
   );
 }
 
-function AgentDecisionSide({
+/**
+ * Exported so AuditTrailPanel.tsx can reuse this exact rendering for a
+ * NEGOTIATION_DECISION AuditLog entry, instead of duplicating it — same
+ * component, same props, whether the record came from a live turn
+ * response or a persisted audit row.
+ */
+export function AgentDecisionSide({
   label,
   tone,
   record,
@@ -834,6 +1178,33 @@ function AgentDecisionSide({
           <span className="text-[10px] text-zinc-400 dark:text-zinc-600">no move this round</span>
         )}
       </div>
+
+      {/* State-driven agent loop (OBSERVE step): what this decision was
+          made FROM — see AgentObservation (agentDecision.ts). Every
+          value here is an unmodified echo of a real input the agent
+          already received; never recomputed, never new data. */}
+      <p className="text-zinc-500 dark:text-zinc-500">
+        Observed:{" "}
+        {(
+          [
+            record.observation.previousMerchantOffer?.unitPrice != null
+              ? `reacting to the merchant's offer of ${formatInr(record.observation.previousMerchantOffer.unitPrice)}`
+              : null,
+            record.observation.round !== undefined
+              ? `round ${record.observation.round}/${record.observation.maxRounds}`
+              : null,
+            record.observation.leverage?.buyer !== undefined
+              ? `leverage ${record.observation.leverage.buyer}%${
+                  record.observation.leverage.merchant !== undefined
+                    ? ` buyer / ${record.observation.leverage.merchant}% merchant`
+                    : ""
+                }`
+              : null,
+          ] as (string | null)[]
+        )
+          .filter((part): part is string => part !== null)
+          .join(" · ") || "its own opening requirement — no prior offer to react to yet"}
+      </p>
 
       {record.sufficiency && (
         <p className="text-zinc-500 dark:text-zinc-500">
