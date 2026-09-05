@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { TopNav } from "@/components/TopNav";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -14,16 +15,22 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "PACT",
-  description: "Merchant-side agentic commerce system",
+  description: "Let AI negotiate the deal.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      // Dark-first is a deliberate product decision (see globals.css's
+      // own header comment), not a system-preference toggle — this
+      // class is always present.
+      className={`dark ${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      <body className="flex min-h-full flex-col bg-background text-foreground">
+        <TopNav />
+        <main className="flex flex-1 flex-col">{children}</main>
+      </body>
     </html>
   );
 }

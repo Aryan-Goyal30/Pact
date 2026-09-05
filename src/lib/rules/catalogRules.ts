@@ -81,22 +81,38 @@ export function checkQuantityAvailable(
 }
 
 /**
- * Checks whether a requested delivery deadline is achievable. The
- * merchant's fastest committed lead time is standardDeliveryDays — a
- * deadline cannot be met by going faster than that, only extended via
- * maxDeliveryDays.
+ * Checks whether a requested delivery deadline is achievable.
+ * standardDeliveryDays is the merchant's normal, no-extra-cost lead
+ * time — a looser deadline than that still gets the standard pace
+ * (going slower than asked has never been meaningful; only extending
+ * further via maxDeliveryDays, elsewhere, is).
+ *
+ * Scenario-behavior fix: a deadline FASTER than standard used to be an
+ * unconditional hard-reject of the entire request — there was no way to
+ * ever negotiate rush delivery at all, which is why "urgent delivery"
+ * demo scenarios could only ever set a deadline equal to standard (zero
+ * real urgency to negotiate). A real merchant can typically expedite a
+ * shipment for a premium; that premium is priced by the caller (see
+ * resolveDeliveryRushPremiumFraction, negotiationStrategy.ts) — this
+ * function's job is only to report that it CAN be met (isAchievable),
+ * and that the merchant's offer, when it can, genuinely meets the
+ * buyer's own faster date rather than silently reverting to the
+ * standard one. The only remaining non-achievable case is a nonsensical
+ * (non-positive) deadline, unrelated to price.
  */
 export function checkDeliveryAchievable(
   item: CatalogItemSnapshot,
   requestedDeliveryDays?: number,
 ): DeliveryCheckResult {
-  const isAchievable =
-    requestedDeliveryDays === undefined ||
-    requestedDeliveryDays >= item.standardDeliveryDays;
+  const isAchievable = requestedDeliveryDays === undefined || requestedDeliveryDays >= 1;
+  const offeredDeliveryDays =
+    requestedDeliveryDays !== undefined && requestedDeliveryDays < item.standardDeliveryDays
+      ? requestedDeliveryDays
+      : item.standardDeliveryDays;
 
   return {
     requestedDeliveryDays,
-    offeredDeliveryDays: item.standardDeliveryDays,
+    offeredDeliveryDays,
     isAchievable,
   };
 }

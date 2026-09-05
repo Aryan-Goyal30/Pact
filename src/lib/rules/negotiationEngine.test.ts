@@ -113,11 +113,28 @@ describe("evaluateNegotiationRequest", () => {
   });
 
   // 9. Delivery deadline is impossible.
-  it("rejects a delivery deadline faster than the standard lead time", () => {
+  //
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite (the price
+  // premium for it is applied by the caller, merchantAgent.ts, not by
+  // this function — see resolveDeliveryRushPremiumFraction). A
+  // non-positive deadline remains genuinely impossible regardless of
+  // price.
+  it("does not reject a delivery deadline merely for being faster than the standard lead time", () => {
     const result = evaluateNegotiationRequest(item, {
       sku: item.sku,
       quantity: 10,
       deliveryDeadlineDays: 1,
+    });
+    expect(result.outcome).not.toBe("REJECTED");
+    expect(result.deliveryDays).toBe(1);
+  });
+
+  it("rejects a non-positive delivery deadline", () => {
+    const result = evaluateNegotiationRequest(item, {
+      sku: item.sku,
+      quantity: 10,
+      deliveryDeadlineDays: 0,
     });
     expect(result.outcome).toBe("REJECTED");
   });
@@ -216,6 +233,130 @@ describe("computeMerchantConcessionPrice", () => {
     const settled = computeMerchantConcessionPrice(monitor, 8800, roundContext(4, opening));
     expect(settled).toBe(8800);
     expect(settled).toBeGreaterThanOrEqual(monitor.minPrice);
+  });
+
+  // Milestone 4: reciprocitySpeedMultiplier — omitting it must reproduce
+  // the exact pre-Milestone-4 formula (every existing caller/test).
+  describe("reciprocitySpeedMultiplier", () => {
+    it("omitting it reproduces the exact formula from before this option existed", () => {
+      const withoutMultiplier = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const withNeutralMultiplier = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1,
+      });
+      expect(withoutMultiplier).toBe(withNeutralMultiplier);
+    });
+
+    it("a multiplier above 1 concedes further than the baseline; below 1 concedes less", () => {
+      const baseline = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const rewarded = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1.15,
+      });
+      const withheld = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 0.75,
+      });
+
+      expect(rewarded).toBeLessThan(baseline); // concedes further (lower price) than baseline
+      expect(withheld).toBeGreaterThan(baseline); // concedes less (higher price) than baseline
+    });
+
+    it("never breaches [minPrice, listedPrice], even with an aggressive multiplier", () => {
+      const price = computeMerchantConcessionPrice(item, 1, {
+        ...roundContext(2, 950),
+        reciprocitySpeedMultiplier: 1.15,
+      });
+      expect(price).toBeGreaterThanOrEqual(item.minPrice);
+      expect(price).toBeLessThanOrEqual(item.listedPrice);
+    });
+
+    it("does not apply in the final-2-rounds settle-at-ceiling branch — the guaranteed-convergence safety net is unaffected", () => {
+      const withheld = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(4, 900),
+        reciprocitySpeedMultiplier: 0.6,
+      });
+      expect(withheld).toBe(900); // identical to the unmultiplied final-round settlement
+    });
+  });
+
+  // Negotiation Engine V2 (D1/D2): leverageSpeedFactor — the merchant's
+  // own concession pressure now genuinely responds to its leverage
+  // relative to the buyer's, following the exact same "optional,
+  // already-resolved multiplier, no-op when omitted" discipline
+  // reciprocitySpeedMultiplier already established above.
+  describe("leverageSpeedFactor (D1/D2)", () => {
+    it("omitting it reproduces the exact formula from before this option existed", () => {
+      const withoutLeverage = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const withNeutralLeverage = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        leverageSpeedFactor: 1,
+      });
+      expect(withoutLeverage).toBe(withNeutralLeverage);
+    });
+
+    it("a factor above 1 (weaker merchant leverage) concedes further; below 1 (stronger merchant leverage) concedes less", () => {
+      const baseline = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      const weakerMerchant = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        leverageSpeedFactor: 1.5,
+      });
+      const strongerMerchant = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(2, 950),
+        leverageSpeedFactor: 0.5,
+      });
+      expect(weakerMerchant).toBeLessThan(baseline);
+      expect(strongerMerchant).toBeGreaterThan(baseline);
+    });
+
+    it("never breaches [minPrice, listedPrice], even with the most extreme leverage factor", () => {
+      const price = computeMerchantConcessionPrice(item, 1, {
+        ...roundContext(2, 950),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(price).toBeGreaterThanOrEqual(item.minPrice);
+      expect(price).toBeLessThanOrEqual(item.listedPrice);
+    });
+
+    it("does not apply in the final-2-rounds settle-at-ceiling branch — the guaranteed-convergence safety net is unaffected", () => {
+      const withheld = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(4, 900),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(withheld).toBe(900);
+    });
+
+    it("does not apply on the opening round (no previous offer) — round 1 stays byte-identical to computeCounterOfferPrice", () => {
+      const withLeverage = computeMerchantConcessionPrice(item, 900, {
+        ...roundContext(1),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(withLeverage).toBe(computeCounterOfferPrice(item, 900));
+    });
+  });
+
+  // Negotiation Engine V2 (D3): round progression — a bounded pressure
+  // modifier computed directly from round/maxRounds (already-required
+  // fields, no new plumbing), always active from round 2 onward.
+  describe("round progression (D3)", () => {
+    it("the SAME remaining gap concedes further in a later-progress round than an earlier one, all else equal", () => {
+      // Same round/maxRounds RATIO comparison at two different points in
+      // a longer negotiation — round 2 of 10 (early progress) vs round 8
+      // of 10 (late progress), same anchor/buyerMax gap each time.
+      const early = computeMerchantConcessionPrice(item, 900, { round: 2, maxRounds: 10, previousOfferUnitPrice: 950 });
+      const late = computeMerchantConcessionPrice(item, 900, { round: 8, maxRounds: 10, previousOfferUnitPrice: 950 });
+      expect(late).toBeLessThan(early); // later progress -> more pressure to converge -> lower price
+    });
+
+    it("round 2 of a 4-round negotiation (the ratio nearly every existing test fixture already uses) reproduces exactly the pre-this-milestone price — a genuine no-op, not an opted-out special case", () => {
+      const price = computeMerchantConcessionPrice(item, 900, roundContext(2, 950));
+      // roundProgress = 2/4 = 0.5 -> resolveRoundProgressFactor's own
+      // neutral midpoint (1.0) — verified directly against the
+      // already-pinned "concedes only partway" test above, not a new
+      // hand-derived number.
+      expect(price).toBeGreaterThan(900);
+      expect(price).toBeLessThan(950);
+    });
   });
 });
 

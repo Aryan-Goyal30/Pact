@@ -12,11 +12,11 @@
 // it only exercises the missing-API-key path, which throws before any
 // network call.
 
-import { GoogleGenAI } from "@google/genai";
+import { ApiError, GoogleGenAI } from "@google/genai";
 import type { AgentMessageInput, LlmProvider } from "@/lib/llm/provider";
-import { LlmUnavailableError } from "@/lib/llm/errors";
+import { LlmUnavailableError, ProviderRateLimitedError } from "@/lib/llm/errors";
 
-const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
 /**
  * Thrown when GEMINI_API_KEY is not set. Extends the provider-agnostic
@@ -57,15 +57,46 @@ export class GeminiProvider implements LlmProvider {
     // string"), with all structured negotiation values still decided
     // exclusively by the deterministic engine before this is ever
     // called.
-    const response = await client.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: `${input.instruction}\n\nContext (authoritative — do not alter any value):\n${JSON.stringify(input.context, null, 2)}`,
-      config: {
-        systemInstruction: input.systemPrompt,
-        maxOutputTokens: 300,
-        temperature: 0.7,
-      },
-    });
+    let response;
+    try {
+      response = await client.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: `${input.instruction}\n\nContext (authoritative — do not alter any value):\n${JSON.stringify(input.context, null, 2)}`,
+        config: {
+          systemInstruction: input.systemPrompt,
+          maxOutputTokens: 300,
+          temperature: 0.7,
+        },
+      });
+    } catch (error) {
+      // Provider-failure handling: two distinct but equally transient
+      // ApiError statuses are both treated as "no LLM is currently
+      // usable this turn" rather than a code bug:
+      //  - 429 — observed in practice as Gemini's free-tier
+      //    generate_content quota (5 requests/minute was the figure
+      //    observed for the previously-used gemini-3.6-flash model; the
+      //    exact limit for GEMINI_MODEL above may differ).
+      //  - 503 (status text "UNAVAILABLE") — observed in practice as
+      //    Gemini reporting the model itself is overloaded ("This model
+      //    is currently experiencing high demand"), independent of any
+      //    per-caller quota.
+      // Both are recognized here and re-thrown as the same provider-
+      // agnostic ProviderRateLimitedError so agent code falls back to
+      // its deterministic message via the SAME `instanceof
+      // LlmUnavailableError` check it already uses for "no API key
+      // configured" and for a 429, instead of failing the whole
+      // negotiation turn (or, for the buyer-intent parser specifically,
+      // instead of the intent route returning a generic 500 and losing
+      // its own intended friendly "Automatic understanding isn't
+      // available right now" fallback message — see
+      // buyerIntentParser.ts's own catch). Every other error (auth,
+      // malformed request, network failure, etc.) is rethrown completely
+      // unchanged.
+      if (error instanceof ApiError && (error.status === 429 || error.status === 503)) {
+        throw new ProviderRateLimitedError("Gemini");
+      }
+      throw error;
+    }
 
     const text = response.text?.trim();
     if (!text) {

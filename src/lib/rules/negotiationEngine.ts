@@ -12,6 +12,12 @@ import {
   checkQuantityAvailable,
   type CatalogItemSnapshot,
 } from "@/lib/rules/catalogRules";
+import {
+  hasQuantityLeverage,
+  resolveMerchantConcessionSpeedFactor,
+  resolveRoundProgressFactor,
+  LARGE_ORDER_MERCHANT_DISCOUNT,
+} from "@/lib/rules/negotiationStrategy";
 
 /** A buyer agent's normalized, structured request for one SKU. */
 export interface NegotiationRequest {
@@ -28,6 +34,16 @@ export interface NegotiationRequest {
    * field to make a decision.
    */
   buyerContext?: string;
+  /**
+   * Whether the buyer is willing to accept a later delivery date (up to
+   * the merchant's maxDeliveryDays, never past deliveryDeadlineDays) in
+   * exchange for a price concession — see
+   * negotiationStrategy.resolveDeliveryTrade. Only read by the
+   * round-aware concession layer (applyMerchantConcession in
+   * merchantAgent.ts); evaluateNegotiationRequest itself always offers
+   * standardDeliveryDays regardless of this flag, unaffected.
+   */
+  deliveryFlexible?: boolean;
 }
 
 export type NegotiationOutcome =
@@ -102,6 +118,33 @@ export interface MerchantConcessionContext {
   maxRounds: number;
   /** The merchant's own previously quoted unit price for this SKU, if any. Undefined for the opening counter. */
   previousOfferUnitPrice?: number;
+  /** The buyer's requested quantity this round — enables the large-order quantity discount (negotiationStrategy.hasQuantityLeverage). Omitted by callers that predate this option, which leaves the discount inactive, exactly as before. */
+  requestedQuantity?: number;
+  /** A rupee amount to additionally subtract for a delivery-for-price trade (negotiationStrategy.resolveDeliveryTrade), still subject to the final minPrice clamp below. Omitted by callers that predate this option. */
+  deliveryTradeDiscount?: number;
+  /**
+   * Milestone 4: a multiplier on the concession step, driven by whether
+   * the buyer's own last move was a genuine concession, a hold, or a
+   * withdrawal (merchantReciprocity.evaluateBuyerReciprocity). Defaults
+   * to 1.0 (a complete no-op) when omitted, so every caller that
+   * predates this option — including every existing test — behaves
+   * exactly as before. Still fully subject to the final
+   * [minPrice, listedPrice] clamp below regardless of magnitude.
+   */
+  reciprocitySpeedMultiplier?: number;
+  /**
+   * Negotiation Engine V2 — an already-resolved multiplier from
+   * negotiationStrategy.resolveLeverageSpeedFactor(merchantLeverage,
+   * buyerLeverage), reflecting the merchant's OWN leverage relative to
+   * the buyer's this round. Defaults to 1.0 (a complete no-op) when
+   * omitted, exactly like reciprocitySpeedMultiplier above — every
+   * caller that predates this option (including every existing test)
+   * behaves exactly as before. Computed by the caller (merchantMoveSelection.ts),
+   * never re-derived here, so this function stays a pure formula over
+   * already-resolved numbers, the same discipline reciprocitySpeedMultiplier
+   * already established.
+   */
+  leverageSpeedFactor?: number;
 }
 
 /**
@@ -132,6 +175,24 @@ export interface MerchantConcessionContext {
  * orchestrator's own accept/reject logic (an offer at the buyer's
  * ceiling still has to be explicitly accepted, same as any other
  * counter-offer).
+ *
+ * Beyond the base "split the remaining difference" step, four optional
+ * strategic overlays apply:
+ *  - a stock-pressure speed factor (negotiationStrategy.ts), always
+ *    derived from item.availableQty alone (ample stock concedes faster,
+ *    scarce stock holds firmer) — always active, but a documented no-op
+ *    for every catalog fixture this codebase currently uses (see
+ *    negotiationStrategy.ts's calibration note);
+ *  - a reciprocity speed multiplier (merchantReciprocity.ts), only when
+ *    context.reciprocitySpeedMultiplier is supplied — otherwise 1.0, a
+ *    complete no-op;
+ *  - a large-order quantity discount, only when context.requestedQuantity
+ *    is supplied and crosses the leverage threshold;
+ *  - a delivery-for-price trade discount, only when
+ *    context.deliveryTradeDiscount is supplied.
+ * All four are inert unless the caller opts in, and the final clamp to
+ * [minPrice, listedPrice] still applies no matter what they compute —
+ * they can shift the number, never the hard floor/ceiling.
  */
 export function computeMerchantConcessionPrice(
   item: CatalogItemSnapshot,
@@ -145,7 +206,42 @@ export function computeMerchantConcessionPrice(
   }
 
   const anchor = context.previousOfferUnitPrice ?? item.listedPrice;
-  const conceded = anchor - (anchor - buyerMaxUnitPrice) / 2;
+  const speedFactor = resolveMerchantConcessionSpeedFactor(item);
+  const reciprocityFactor = context.reciprocitySpeedMultiplier ?? 1;
+  // Negotiation Engine V2: leverage (an already-resolved, opt-in
+  // multiplier — see MerchantConcessionContext's own doc comment) and
+  // round progression (computed directly from the round/maxRounds this
+  // context already requires — no new plumbing) both fold into the SAME
+  // combinedSpeed term the existing two factors already compose
+  // multiplicatively. Deliberately INERT on the opening round
+  // (context.previousOfferUnitPrice undefined, i.e. no prior position to
+  // measure progression or reciprocation against — the same "anchor =
+  // item.listedPrice" case this function's own doc comment already
+  // documents as producing exactly computeCounterOfferPrice's output):
+  // round 1 opening behavior is explicitly out of scope for this
+  // redesign, and this is what keeps it byte-identical. The outer clamp
+  // bounds worst-case compounding across all four factors from round 2
+  // onward; it is a documented no-op for every combination of
+  // stockSpeedFactor/reciprocityFactor alone that predates this change
+  // (their own widest possible product, ~0.42 to ~1.495 per
+  // merchantReciprocity.ts's own calibration note, sits comfortably
+  // inside [0.3, 2.0]).
+  const hasPriorPosition = context.previousOfferUnitPrice !== undefined;
+  const leverageFactor = hasPriorPosition ? (context.leverageSpeedFactor ?? 1) : 1;
+  const roundProgressFactor = hasPriorPosition
+    ? resolveRoundProgressFactor(context.round, context.maxRounds)
+    : 1;
+  const combinedSpeed = clamp(speedFactor * reciprocityFactor * leverageFactor * roundProgressFactor, 0.3, 2.0);
+  let conceded = anchor - ((anchor - buyerMaxUnitPrice) / 2) * combinedSpeed;
+
+  if (context.requestedQuantity !== undefined && hasQuantityLeverage(context.requestedQuantity)) {
+    conceded -= (item.listedPrice - item.minPrice) * LARGE_ORDER_MERCHANT_DISCOUNT;
+  }
+
+  if (context.deliveryTradeDiscount) {
+    conceded -= context.deliveryTradeDiscount;
+  }
+
   return clamp(Math.round(conceded), item.minPrice, item.listedPrice);
 }
 
@@ -218,7 +314,7 @@ export function evaluateNegotiationRequest(
   );
   if (!deliveryCheck.isAchievable) {
     return rejected(item.sku, request.quantity, [
-      `Requested delivery in ${request.deliveryDeadlineDays} day(s) is faster than the merchant's standard ${item.standardDeliveryDays} day(s).`,
+      `Requested delivery deadline of ${request.deliveryDeadlineDays} day(s) is not a valid delivery window.`,
     ]);
   }
 
@@ -322,9 +418,7 @@ export function validateProposedAgreement(
   }
 
   if (!checkDeliveryAchievable(item, proposal.deliveryDays).isAchievable) {
-    reasons.push(
-      `Delivery in ${proposal.deliveryDays} day(s) is faster than the merchant's standard ${item.standardDeliveryDays} day(s).`,
-    );
+    reasons.push(`Delivery window of ${proposal.deliveryDays} day(s) is not a valid delivery window.`);
   }
 
   if (proposal.unitPrice < item.listedPrice && !item.negotiationEnabled) {

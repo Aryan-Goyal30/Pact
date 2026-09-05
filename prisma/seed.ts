@@ -30,7 +30,14 @@ async function main() {
         description: "Mid-range business laptop suitable for office use.",
         listedPrice: 48000,
         minPrice: 44000,
-        availableQty: 100,
+        // Catalog/preset recalibration: 100 -> 10. Price/delivery economics
+        // unchanged — only stock is lowered, deliberately repurposing this
+        // item as the scarce-inventory / partial-fulfillment / premium
+        // product (its own price band already made anything above ~10
+        // units unpayable under the real Razorpay ~₹5,00,000 transaction
+        // ceiling; this makes that ceiling and this item's stock agree,
+        // rather than papering over the mismatch in negotiation code).
+        availableQty: 10,
         standardDeliveryDays: 5,
         maxDeliveryDays: 12,
         negotiationEnabled: true,
@@ -55,7 +62,14 @@ async function main() {
         availableQty: 500,
         standardDeliveryDays: 3,
         maxDeliveryDays: 7,
-        negotiationEnabled: false,
+        // Catalog/preset recalibration: false -> true. A pure demo/business
+        // data decision (this SKU's cheap unit price + high stock are what
+        // make it the only current product that can demonstrate abundant
+        // inventory / the large-order quantity threshold while staying
+        // under the real Razorpay transaction ceiling) — no negotiation
+        // code was changed to special-case this item; it goes through
+        // exactly the same rule engine every other negotiable product does.
+        negotiationEnabled: true,
       },
     ],
   });

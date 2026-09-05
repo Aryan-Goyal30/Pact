@@ -7,6 +7,7 @@ import {
   isQuantityAcceptable,
   isSkuMatch,
   resolveBuyerTarget,
+  resolveEffectiveBudgetCeiling,
   toNegotiationRequest,
   validateMerchantProposal,
   type BuyerConcessionContext,
@@ -189,5 +190,141 @@ describe("computeBuyerConcessionPrice", () => {
     const price = computeBuyerConcessionPrice(monitorConstraints, 9150, roundContext(2));
     expect(price).toBeGreaterThan(target);
     expect(price).toBeLessThanOrEqual(monitorConstraints.maxUnitPrice);
+  });
+
+  // Negotiation Engine V2 (D1/D2): leverageSpeedFactor — symmetric
+  // treatment to the merchant side's own leverageSpeedFactor
+  // (negotiationEngine.test.ts). "Own" leverage here is the BUYER's.
+  describe("leverageSpeedFactor (D1/D2)", () => {
+    it("omitting it reproduces the exact formula from before this option existed", () => {
+      const withoutLeverage = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+      const withNeutralLeverage = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1,
+      });
+      expect(withoutLeverage).toBe(withNeutralLeverage);
+    });
+
+    it("a factor above 1 (weaker buyer leverage) concedes further (a higher price); below 1 (stronger buyer leverage) concedes less", () => {
+      const baseline = computeBuyerConcessionPrice(constraints, 45375, roundContext(2));
+      const weakerBuyer = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1.5,
+      });
+      const strongerBuyer = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(2),
+        leverageSpeedFactor: 0.5,
+      });
+      expect(weakerBuyer).toBeGreaterThan(baseline); // concedes further -> moves closer to the merchant, a higher price
+      expect(strongerBuyer).toBeLessThan(baseline); // concedes less -> stays closer to target, a lower price
+    });
+
+    it("never exceeds maxUnitPrice, even with the most extreme leverage factor", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, {
+        ...roundContext(2),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(price).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    });
+
+    it("does not apply in the final-2-rounds settle-at-ceiling branch — the guaranteed-convergence safety net is unaffected", () => {
+      const withheld = computeBuyerConcessionPrice(constraints, 45375, {
+        ...roundContext(4),
+        leverageSpeedFactor: 1.5,
+      });
+      expect(withheld).toBe(constraints.maxUnitPrice);
+    });
+  });
+
+  // Negotiation Engine V2 (D3): round progression, symmetric to the
+  // merchant side's own equivalent test.
+  describe("round progression (D3)", () => {
+    it("the SAME opposing offer concedes further (moves closer to it) in a later-progress round than an earlier one, all else equal", () => {
+      const early = computeBuyerConcessionPrice(constraints, 45375, { round: 2, maxRounds: 10 });
+      const late = computeBuyerConcessionPrice(constraints, 45375, { round: 8, maxRounds: 10 });
+      expect(late).toBeGreaterThan(early); // later progress -> more pressure to converge -> moves further toward the merchant
+    });
+  });
+
+  // Pass 4: budgetFlexible / effectiveCeiling — the 4th parameter is
+  // purely additive. Omitting it (every test above) reproduces exactly
+  // today's hard-ceiling behavior, proven again explicitly here.
+  describe("Pass 4 — effectiveCeiling (budgetFlexible)", () => {
+    it("omitting effectiveCeiling reproduces the exact maxUnitPrice-bounded result", () => {
+      const withoutCeiling = computeBuyerConcessionPrice(constraints, 100000, roundContext(4));
+      const withExplicitMax = computeBuyerConcessionPrice(constraints, 100000, roundContext(4), constraints.maxUnitPrice);
+      expect(withoutCeiling).toBe(constraints.maxUnitPrice);
+      expect(withExplicitMax).toBe(constraints.maxUnitPrice);
+    });
+
+    it("a higher effectiveCeiling lets the buyer move above its stated maxUnitPrice on the final-rounds safety net", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, roundContext(4), 48000);
+      expect(price).toBe(48000);
+      expect(price).toBeGreaterThan(constraints.maxUnitPrice);
+    });
+
+    it("a higher effectiveCeiling raises the clamp bound on a middle round too, never exceeding the given ceiling", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, roundContext(2), 48000);
+      expect(price).toBeLessThanOrEqual(48000);
+    });
+
+    it("target/aspiration (resolveBuyerTarget) is unaffected by effectiveCeiling — it still anchors on the stated maxUnitPrice", () => {
+      const target = resolveBuyerTarget(constraints);
+      const price = computeBuyerConcessionPrice(constraints, target - 5000, roundContext(2), 48000);
+      expect(price).toBeGreaterThanOrEqual(target);
+    });
+  });
+});
+
+describe("resolveEffectiveBudgetCeiling", () => {
+  const hard: BuyerConstraints = { ...constraints, budgetFlexible: false };
+  const flexible: BuyerConstraints = { ...constraints, budgetFlexible: true };
+
+  it("a hard budget is bounded by exactly maxUnitPrice, regardless of listedPrice", () => {
+    expect(resolveEffectiveBudgetCeiling(hard, 60000)).toBe(constraints.maxUnitPrice);
+    expect(resolveEffectiveBudgetCeiling(hard)).toBe(constraints.maxUnitPrice);
+  });
+
+  it("omitted budgetFlexible behaves exactly like a hard budget", () => {
+    expect(resolveEffectiveBudgetCeiling({ maxUnitPrice: constraints.maxUnitPrice }, 60000)).toBe(
+      constraints.maxUnitPrice,
+    );
+  });
+
+  it("a flexible budget is bounded by the merchant's listedPrice when it's higher than the stated maxUnitPrice", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible, 60000)).toBe(60000);
+  });
+
+  it("a flexible budget never drops BELOW the buyer's own stated maxUnitPrice, even if listedPrice is lower", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible, 30000)).toBe(constraints.maxUnitPrice);
+  });
+
+  it("a flexible budget with no listedPrice available falls back to the buyer's own stated maxUnitPrice, never unbounded", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible)).toBe(constraints.maxUnitPrice);
+  });
+});
+
+describe("isPriceAcceptable / validateMerchantProposal — Pass 4 effectiveCeiling", () => {
+  it("isPriceAcceptable accepts a price above maxUnitPrice when an explicit higher effectiveCeiling is given", () => {
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 46500 })).toBe(false);
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 46500 }, 48000)).toBe(true);
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 49000 }, 48000)).toBe(false);
+  });
+
+  it("validateMerchantProposal is ACCEPTABLE for a price above maxUnitPrice when an effectiveCeiling covers it", () => {
+    const result = validateMerchantProposal(
+      constraints,
+      { ...acceptableProposal, unitPrice: 46500 },
+      constraints.quantity,
+      constraints.deliveryDeadlineDays,
+      48000,
+    );
+    expect(result.outcome).toBe("ACCEPTABLE");
+  });
+
+  it("validateMerchantProposal omitting effectiveCeiling reproduces the exact hard-ceiling UNACCEPTABLE result", () => {
+    const result = validateMerchantProposal(constraints, { ...acceptableProposal, unitPrice: 46500 });
+    expect(result.outcome).toBe("UNACCEPTABLE");
+    expect(result.reasons.join(" ")).toMatch(/exceeds the buyer's maximum/i);
   });
 });

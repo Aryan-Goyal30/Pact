@@ -30,13 +30,18 @@ import {
   acceptNegotiation,
   advanceNegotiationState,
   createNegotiationState,
+  expireNegotiation,
   rejectNegotiation,
   type NegotiationState,
   type NegotiationStatus,
 } from "@/lib/rules/negotiationState";
-import { runBuyerAgent, type BuyerAction } from "@/lib/agents/buyerAgent";
-import { runMerchantAgent } from "@/lib/agents/merchantAgent";
+import { runBuyerAgent, runBuyerWalkAway, type BuyerAction, type BuyerAgentResponse } from "@/lib/agents/buyerAgent";
+import { runMerchantAgent, runMerchantWalkAway } from "@/lib/agents/merchantAgent";
 import type { StructuredNegotiationMessage } from "@/lib/negotiation/protocol";
+import { computeLeverage, type LeverageScore } from "@/lib/rules/leverage";
+import { arePositionsRepeated, isPriceGapUnbridgeable, type WalkAwayReason } from "@/lib/rules/walkAway";
+import type { CandidateMoveType } from "@/lib/rules/candidateMove";
+import type { AgentDecisionRecord, TurnDecisionAudit } from "@/lib/negotiation/agentDecision";
 
 export interface NegotiationContext {
   item: CatalogItemSnapshot;
@@ -50,11 +55,63 @@ export interface NegotiationTurnResult {
   merchant: StructuredNegotiationMessage;
   /** Feed this into the next call's `previousMerchantResult`; null once the negotiation has closed. */
   nextMerchantResult: NegotiationResult | null;
+  /** Live buyer-vs-merchant leverage score for this turn — see leverage.ts. Recomputed fresh every turn from the same deterministic factors driving the price/quantity/delivery math; never derived from or shown to the LLM. */
+  leverage: LeverageScore;
+  /**
+   * Agentic Decision + Audit Trail (first layer): both sides' captured
+   * decision snapshots for this turn (buyerAgent.ts's/merchantAgent.ts's
+   * own agentDecision, lifted here unchanged) plus this turn's leverage,
+   * bundled for persistence/display. Absent only when no agent decision
+   * was genuinely made this round at all — a structural walk-away closed
+   * before either agent ran (see the price-gap-unbridgeable check
+   * below); every other path (including a repeated-position walk-away,
+   * which still runs both agents first) carries at least the buyer's
+   * decision. Never influences `state`/`buyer`/`merchant`/`nextMerchantResult`
+   * above — purely observational.
+   */
+  decisionAudit?: TurnDecisionAudit;
 }
+
+/** The turn result shape before its leverage score (and the decisionAudit it feeds) are attached — see finish(). */
+type NegotiationTurnResultCore = Omit<NegotiationTurnResult, "leverage" | "decisionAudit"> & {
+  buyerDecision?: AgentDecisionRecord;
+  merchantDecision?: AgentDecisionRecord;
+};
 
 const TERMINAL_STATUSES: NegotiationStatus[] = ["AGREED", "REJECTED", "EXPIRED"];
 
-function buyerActionToMessage(action: BuyerAction, text: string): StructuredNegotiationMessage {
+/**
+ * Milestone 10: combines BuyerAgentResponse's two already-computed move
+ * fields (move / tradeMove — see buyerAgent.ts) into the single public
+ * CandidateMoveType this message carries. This is NOT a new decision —
+ * buildResponseToMerchantOffer (buyerAgent.ts) already guarantees at most
+ * one of the two carries a real value whenever a genuine candidate
+ * selection happened this round (a trade winning sets tradeMove and
+ * nulls move; the ordinary candidate winning sets move and leaves
+ * tradeMove as "NO_TRADE"), and both are null whenever no selection was
+ * made at all (opening request, ordinary accept, ordinary reject, or a
+ * caller without a round context) — this function only picks whichever
+ * of the two is actually populated.
+ */
+function resolveBuyerMove(response: Pick<BuyerAgentResponse, "move" | "tradeMove">): CandidateMoveType | undefined {
+  if (
+    response.tradeMove === "QUANTITY_FOR_PRICE" ||
+    response.tradeMove === "DELIVERY_FOR_PRICE" ||
+    response.tradeMove === "QUANTITY_AND_DELIVERY_FOR_PRICE"
+  ) {
+    return response.tradeMove;
+  }
+  if (response.move === "HOLD" || response.move === "CONCEDE") {
+    return response.move;
+  }
+  return undefined;
+}
+
+function buyerActionToMessage(
+  action: BuyerAction,
+  text: string,
+  move: CandidateMoveType | undefined,
+): StructuredNegotiationMessage {
   return {
     sender: "buyer",
     type: action.type,
@@ -63,6 +120,7 @@ function buyerActionToMessage(action: BuyerAction, text: string): StructuredNego
     unitPrice: action.unitPrice,
     deliveryDays: action.deliveryDays,
     message: text,
+    move,
   };
 }
 
@@ -87,7 +145,11 @@ function closeNegotiation(
   accepted: boolean,
   rejectionReasons: string[],
   acceptMessage = "Accepted.",
-): NegotiationTurnResult {
+  /** Agentic Decision + Audit Trail: the buyer's own captured decision that led to this accept — absent when there is none to report (defensive default, every real caller has one). */
+  buyerDecision?: AgentDecisionRecord,
+  /** Only present when a fresh merchant agent call actually happened this same round (the EXACT_MATCH path) — absent for a buyer accepting a PRIOR round's already-known merchant offer, since no merchant decision was made this round. */
+  merchantDecision?: AgentDecisionRecord,
+): NegotiationTurnResultCore {
   return {
     state: accepted ? acceptNegotiation(state) : rejectNegotiation(state),
     buyer: buyerMessage,
@@ -101,6 +163,8 @@ function closeNegotiation(
       message: accepted ? acceptMessage : rejectionReasons.join(" ") || "Rejected.",
     },
     nextMerchantResult: null,
+    buyerDecision,
+    merchantDecision,
   };
 }
 
@@ -114,6 +178,60 @@ export async function runNegotiationTurn(
   context: NegotiationContext,
   state: NegotiationState,
   previousMerchantResult: NegotiationResult | null,
+  /**
+   * The buyer's own previous-round unit price, if any — used for
+   * repeated-position deadlock detection (walkAway.ts) AND, as of
+   * Milestone 3, as the price buyerMoveSelector.ts's HOLD move repeats.
+   * Optional and additive: every existing caller that predates this
+   * parameter behaves exactly as before, since omitting it simply means
+   * the repeated-position check can never fire and the buyer's HOLD
+   * falls back to its own aspirational target instead.
+   */
+  previousBuyerUnitPrice?: number | null,
+  /**
+   * The merchant's unit price from ONE ROUND BEFORE previousMerchantResult
+   * — Milestone 3: lets the buyer's move selector detect whether the
+   * merchant's most recent offer was genuine forward progress or a
+   * repeat, without the buyer ever seeing item.minPrice. Optional and
+   * additive: omitting it makes the buyer treat every offer as "the
+   * merchant moved" (today's pre-Milestone-3 behavior — always concede).
+   */
+  priorMerchantUnitPrice?: number | null,
+  /**
+   * Milestone 5: the buyer's own quantity from ONE ROUND BEFORE this
+   * one — lets the merchant recognize a genuine round-over-round
+   * quantity increase (buyerAgent.ts's quantity-for-price trade) even
+   * below the flat bulk-order threshold. Optional and additive: omitting
+   * it reproduces exactly today's (pre-Milestone-5) trigger condition.
+   */
+  previousBuyerQuantity?: number | null,
+  /**
+   * Milestone 5: whether the buyer has already used its quantity-for-price
+   * bargaining chip earlier in this same negotiation — derived by the
+   * caller from actual negotiation history (see
+   * runNegotiationToCompletion below / negotiationSessionRepository.ts),
+   * never guessed here. Omitted (or false) leaves the chip available,
+   * exactly as if this option didn't exist.
+   */
+  quantityTradeAlreadyUsed?: boolean,
+  /**
+   * Milestone 7: the buyer's own delivery-day ask from ONE ROUND BEFORE
+   * this one — lets the merchant recognize a genuine round-over-round
+   * delivery extension (buyerAgent.ts's delivery-for-price trade), and
+   * lets the buyer's own acceptance ceiling widen when the merchant
+   * mirrors back a later date the buyer itself already offered. Optional
+   * and additive: omitting it reproduces exactly today's (pre-Milestone-7)
+   * behavior. Tracked entirely independently from previousBuyerQuantity /
+   * quantityTradeAlreadyUsed.
+   */
+  previousBuyerDeliveryDays?: number | null,
+  /**
+   * Milestone 7: whether the buyer has already used its delivery-for-price
+   * bargaining chip earlier in this same negotiation — derived by the
+   * caller from actual negotiation history, mirroring
+   * quantityTradeAlreadyUsed exactly, for the delivery dimension.
+   */
+  deliveryTradeAlreadyUsed?: boolean,
 ): Promise<NegotiationTurnResult> {
   if (TERMINAL_STATUSES.includes(state.status)) {
     throw new Error(
@@ -121,13 +239,133 @@ export async function runNegotiationTurn(
     );
   }
 
+  // Attaches this turn's live leverage score, computed fresh from the
+  // same deterministic factors (stock, quantity, urgency, delivery
+  // flexibility, and this turn's own price position) driving the real
+  // negotiation math — see leverage.ts. Wraps every return path below so
+  // no branch can forget it.
+  function finish(core: NegotiationTurnResultCore): NegotiationTurnResult {
+    const leverage = computeLeverage({
+      item: context.item,
+      buyerConstraints: context.buyerConstraints,
+      currentMerchantUnitPrice: core.merchant.unitPrice,
+    });
+    const { buyerDecision, merchantDecision, ...rest } = core;
+    return {
+      ...rest,
+      leverage,
+      decisionAudit: buyerDecision
+        ? {
+            buyer: buyerDecision,
+            merchant: merchantDecision,
+            leverage: { buyer: leverage.buyerLeverage, merchant: leverage.merchantLeverage, reasons: leverage.reasons },
+          }
+        : undefined,
+    };
+  }
+
+  // Milestone 2: closes the negotiation as a legitimate walk-away
+  // (EXPIRED — a real outcome, not a system failure) instead of another
+  // round of negotiation. Both buyer and merchant explain why through
+  // the same LLM -> integrity -> fallback pipeline every other message
+  // in this codebase already goes through; walkAway.ts never decides
+  // price/quantity/delivery, only whether to stop.
+  async function buildWalkAwayTurn(
+    reason: WalkAwayReason,
+    merchantOfferUnitPrice: number,
+    buyerAskUnitPrice: number,
+    /** Agentic Decision + Audit Trail: whichever counter-offer decision each side had already computed THIS round before the deadlock was detected — absent for a structural (price-gap-unbridgeable) walk-away, where neither agent ran this round at all. */
+    buyerDecision?: AgentDecisionRecord,
+    merchantDecision?: AgentDecisionRecord,
+  ): Promise<NegotiationTurnResultCore> {
+    const [buyerWalkAway, merchantWalkAway] = await Promise.all([
+      runBuyerWalkAway(context.buyerConstraints, merchantOfferUnitPrice, reason),
+      runMerchantWalkAway(buyerAskUnitPrice, reason),
+    ]);
+
+    const walkAwayMessage = (
+      sender: "buyer" | "merchant",
+      message: string,
+    ): StructuredNegotiationMessage => ({
+      sender,
+      type: "reject",
+      sku: context.buyerConstraints.sku,
+      quantity: null,
+      unitPrice: null,
+      deliveryDays: null,
+      message,
+    });
+
+    return {
+      state: expireNegotiation(state),
+      buyer: walkAwayMessage("buyer", buyerWalkAway.message),
+      merchant: walkAwayMessage("merchant", merchantWalkAway.message),
+      nextMerchantResult: null,
+      buyerDecision,
+      merchantDecision,
+    };
+  }
+
+  // Structural impossibility: the buyer's ceiling is below the
+  // merchant's floor, so no further round could ever succeed. Checked
+  // only from the second call onward (previousMerchantResult !== null)
+  // so the merchant's real, floor-clamped opening counter is still
+  // visible in the transcript first — this closes on the NEXT turn
+  // instead of repeating that same offer for the remaining rounds.
+  if (
+    previousMerchantResult !== null &&
+    previousMerchantResult.unitPrice !== null &&
+    isPriceGapUnbridgeable(context.item, context.buyerConstraints)
+  ) {
+    return finish(
+      await buildWalkAwayTurn(
+        "price_gap_unbridgeable",
+        previousMerchantResult.unitPrice,
+        context.buyerConstraints.maxUnitPrice,
+      ),
+    );
+  }
+
+  // Milestone 3: the buyer's own pre-round leverage score, computed from
+  // the LAST round's merchant price (this round's hasn't been decided
+  // yet) — only the aggregate 0-100 number crosses into buyerAgent.ts,
+  // never context.item itself, preserving buyerAgent.ts's existing
+  // invariant that it never sees item.minPrice or any other private
+  // catalog field.
+  //
+  // Negotiation Engine V2: this SAME computeLeverage call already
+  // produces the merchant's own complementary score (buyer + merchant
+  // === 100, leverage.ts unchanged) — captured here too so it can be
+  // threaded into runMerchantAgent below, making leverage causal for
+  // both sides from the exact same, single, per-round computation
+  // rather than a second call or a re-derivation.
+  const preRoundLeverage = computeLeverage({
+    item: context.item,
+    buyerConstraints: context.buyerConstraints,
+    currentMerchantUnitPrice: previousMerchantResult?.unitPrice ?? null,
+  });
+  const buyerLeverageScore = preRoundLeverage.buyerLeverage;
+
   const buyerResponse = await runBuyerAgent(
     context.buyerConstraints,
     context.manifestProduct,
     previousMerchantResult,
     { round: state.round + 1, maxRounds: state.maxRounds },
+    {
+      priorMerchantUnitPrice,
+      previousBuyerUnitPrice,
+      leverageScore: buyerLeverageScore,
+      quantityTradeAlreadyUsed,
+      previousBuyerQuantity,
+      deliveryTradeAlreadyUsed,
+      previousBuyerDeliveryDays,
+    },
   );
-  const buyerMessage = buyerActionToMessage(buyerResponse.action, buyerResponse.message);
+  const buyerMessage = buyerActionToMessage(
+    buyerResponse.action,
+    buyerResponse.message,
+    resolveBuyerMove(buyerResponse),
+  );
 
   // The buyer deterministically decided (buyerRules.ts) to accept the
   // merchant's previous offer — close on those terms. No new merchant
@@ -140,19 +378,23 @@ export async function runNegotiationTurn(
       unitPrice: buyerResponse.action.unitPrice,
       deliveryDays: buyerResponse.action.deliveryDays,
     });
-    return closeNegotiation(
-      state,
-      buyerMessage,
-      buyerResponse.action,
-      agreementCheck.outcome === "ACCEPTED",
-      agreementCheck.reasons,
+    return finish(
+      closeNegotiation(
+        state,
+        buyerMessage,
+        buyerResponse.action,
+        agreementCheck.outcome === "ACCEPTED",
+        agreementCheck.reasons,
+        undefined,
+        buyerResponse.agentDecision,
+      ),
     );
   }
 
   // The buyer deterministically decided the merchant already rejected —
   // nothing left to negotiate.
   if (buyerResponse.action.type === "reject") {
-    return {
+    return finish({
       state: rejectNegotiation(state),
       buyer: buyerMessage,
       merchant: {
@@ -165,7 +407,8 @@ export async function runNegotiationTurn(
         message: "Negotiation closed without an agreement.",
       },
       nextMerchantResult: null,
-    };
+      buyerDecision: buyerResponse.agentDecision,
+    });
   }
 
   // Buyer sent a genuine ask ("request" or "counter_offer"). The
@@ -186,12 +429,29 @@ export async function runNegotiationTurn(
       quantity: buyerResponse.action.quantity,
       maxUnitPrice: buyerResponse.action.unitPrice,
       deliveryDeadlineDays: buyerResponse.action.deliveryDays,
+      deliveryFlexible: context.buyerConstraints.deliveryFlexible,
     },
     {
       round: state.round + 1,
       maxRounds: state.maxRounds,
       previousOfferUnitPrice: previousMerchantResult?.unitPrice ?? undefined,
     },
+    // Milestone 4: previousBuyerUnitPrice is already threaded into this
+    // function for walk-away/HOLD purposes — reused here, unchanged, so
+    // the merchant can now react to whether the buyer's CURRENT ask
+    // (buyerResponse.action.unitPrice, above) is a genuine concession
+    // from its own prior ask, a hold, or a withdrawal.
+    previousBuyerUnitPrice,
+    // Milestone 5: lets the merchant recognize a genuine round-over-round
+    // quantity increase (buyerResponse.action.quantity, above) even
+    // below the flat bulk-order threshold.
+    previousBuyerQuantity,
+    // Milestone 7: lets the merchant recognize a genuine round-over-round
+    // delivery extension (buyerResponse.action.deliveryDays, above).
+    previousBuyerDeliveryDays,
+    // Negotiation Engine V2: the same pre-round leverage snapshot the
+    // buyer's own decision above already used, in {buyer, merchant} form.
+    { buyer: preRoundLeverage.buyerLeverage, merchant: preRoundLeverage.merchantLeverage },
   );
   const merchantResult = merchantAgentResponse.decision;
 
@@ -213,19 +473,46 @@ export async function runNegotiationTurn(
       deliveryDays: merchantResult.deliveryDays as number,
     };
     const agreementCheck = validateProposedAgreement(context.item, terms);
-    return closeNegotiation(
-      state,
-      buyerMessage,
-      terms,
-      agreementCheck.outcome === "ACCEPTED",
-      agreementCheck.reasons,
-      merchantAgentResponse.message,
+    return finish(
+      closeNegotiation(
+        state,
+        buyerMessage,
+        terms,
+        agreementCheck.outcome === "ACCEPTED",
+        agreementCheck.reasons,
+        merchantAgentResponse.message,
+        buyerResponse.agentDecision,
+        merchantAgentResponse.agentDecision,
+      ),
     );
   }
 
   const nextState = advanceNegotiationState(state, merchantResult.outcome);
 
-  return {
+  // Repeated-position deadlock: only relevant when the negotiation would
+  // otherwise continue as COUNTERED (never overrides an already-accepted
+  // or already-rejected round) — both sides' prices exactly matching
+  // their own previous round is treated as sufficient evidence that
+  // neither has anything left to concede.
+  if (
+    nextState.status === "COUNTERED" &&
+    arePositionsRepeated(
+      { buyerUnitPrice: buyerResponse.action.unitPrice, merchantUnitPrice: merchantResult.unitPrice },
+      { buyerUnitPrice: previousBuyerUnitPrice, merchantUnitPrice: previousMerchantResult?.unitPrice },
+    )
+  ) {
+    return finish(
+      await buildWalkAwayTurn(
+        "repeated_positions",
+        merchantResult.unitPrice as number,
+        buyerResponse.action.unitPrice as number,
+        buyerResponse.agentDecision,
+        merchantAgentResponse.agentDecision,
+      ),
+    );
+  }
+
+  return finish({
     state: nextState,
     buyer: buyerMessage,
     merchant: {
@@ -236,9 +523,12 @@ export async function runNegotiationTurn(
       unitPrice: merchantResult.unitPrice,
       deliveryDays: merchantResult.deliveryDays,
       message: merchantAgentResponse.message,
+      move: merchantAgentResponse.move,
     },
     nextMerchantResult: nextState.status === "COUNTERED" ? merchantResult : null,
-  };
+    buyerDecision: buyerResponse.agentDecision,
+    merchantDecision: merchantAgentResponse.agentDecision,
+  });
 }
 
 export interface NegotiationRunResult {
@@ -265,7 +555,43 @@ export async function runNegotiationToCompletion(
   const safetyLimit = state.maxRounds + 3;
 
   while (!TERMINAL_STATUSES.includes(state.status)) {
-    const turn = await runNegotiationTurn(context, state, previousMerchantResult);
+    const previousBuyerUnitPrice = transcript[transcript.length - 1]?.buyer.unitPrice ?? null;
+    // The merchant's price from ONE ROUND BEFORE previousMerchantResult
+    // — i.e. two turns back in the transcript — see runNegotiationTurn's
+    // priorMerchantUnitPrice parameter.
+    const priorMerchantUnitPrice = transcript[transcript.length - 2]?.merchant.unitPrice ?? null;
+    // Milestone 5: the buyer's own quantity one round back, and whether
+    // the quantity-for-price chip has EVER been used across the WHOLE
+    // transcript so far (not just the immediately previous round) —
+    // scanning the full history, rather than a single-round lookback,
+    // is what makes this reliable: a single-round comparison could
+    // "forget" a trade used two rounds ago if the buyer's mirrored
+    // quantity later drops back down (e.g. a subsequent partial-fulfillment
+    // offer), which would wrongly let the chip fire again.
+    const previousBuyerQuantity = transcript[transcript.length - 1]?.buyer.quantity ?? null;
+    const quantityTradeAlreadyUsed = transcript.some(
+      (t) => t.buyer.quantity !== null && t.buyer.quantity > context.buyerConstraints.quantity,
+    );
+    // Milestone 7: same full-history-scan discipline as the quantity
+    // chip, tracked entirely independently — see
+    // hasBuyerProposedDeliveryDaysAbove's own doc comment
+    // (negotiationSessionRepository.ts) for why a single-round lookback
+    // would be unreliable here too.
+    const previousBuyerDeliveryDays = transcript[transcript.length - 1]?.buyer.deliveryDays ?? null;
+    const deliveryTradeAlreadyUsed = transcript.some(
+      (t) => t.buyer.deliveryDays !== null && t.buyer.deliveryDays > context.buyerConstraints.deliveryDeadlineDays,
+    );
+    const turn = await runNegotiationTurn(
+      context,
+      state,
+      previousMerchantResult,
+      previousBuyerUnitPrice,
+      priorMerchantUnitPrice,
+      previousBuyerQuantity,
+      quantityTradeAlreadyUsed,
+      previousBuyerDeliveryDays,
+      deliveryTradeAlreadyUsed,
+    );
     transcript.push(turn);
     state = turn.state;
     previousMerchantResult = turn.nextMerchantResult;

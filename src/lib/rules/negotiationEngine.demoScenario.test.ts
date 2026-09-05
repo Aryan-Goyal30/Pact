@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CatalogItemSnapshot } from "./catalogRules";
 import { evaluateNegotiationRequest } from "./negotiationEngine";
 
-// Pact's headline demo scenario (see AGENTS.md / project brief):
+// PACT's headline demo scenario / project brief:
 //
 //   Buyer wants 200 laptops, max ₹45,000/unit, delivery within 10 days.
 //   Merchant has 100 laptops, listed ₹48,000, private floor ₹44,000,

@@ -11,12 +11,24 @@ function jsonResponse(body: unknown, status: number) {
   });
 }
 
+const VALID_URGENCY_LEVELS = ["low", "medium", "high"] as const;
+
 function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | null {
   if (typeof body !== "object" || body === null) {
     return null;
   }
-  const { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds } =
-    body as Record<string, unknown>;
+  const {
+    sku,
+    quantity,
+    maxUnitPrice,
+    deliveryDeadlineDays,
+    maxRounds,
+    urgency,
+    deliveryFlexible,
+    quantityShortfallTolerance,
+    targetUnitPrice,
+    budgetFlexible,
+  } = body as Record<string, unknown>;
 
   if (typeof sku !== "string" || sku.trim().length === 0) {
     return null;
@@ -37,8 +49,45 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
   if (maxRounds !== undefined && (typeof maxRounds !== "number" || maxRounds <= 0)) {
     return null;
   }
+  if (
+    urgency !== undefined &&
+    !VALID_URGENCY_LEVELS.includes(urgency as (typeof VALID_URGENCY_LEVELS)[number])
+  ) {
+    return null;
+  }
+  if (deliveryFlexible !== undefined && typeof deliveryFlexible !== "boolean") {
+    return null;
+  }
+  if (
+    quantityShortfallTolerance !== undefined &&
+    (typeof quantityShortfallTolerance !== "number" ||
+      quantityShortfallTolerance < 0 ||
+      quantityShortfallTolerance > 1)
+  ) {
+    return null;
+  }
+  if (
+    targetUnitPrice !== undefined &&
+    (typeof targetUnitPrice !== "number" || !Number.isFinite(targetUnitPrice) || targetUnitPrice <= 0)
+  ) {
+    return null;
+  }
+  if (budgetFlexible !== undefined && typeof budgetFlexible !== "boolean") {
+    return null;
+  }
 
-  return { sku, quantity, maxUnitPrice, deliveryDeadlineDays, maxRounds };
+  return {
+    sku,
+    quantity,
+    maxUnitPrice,
+    deliveryDeadlineDays,
+    maxRounds,
+    urgency: urgency as NegotiationSessionCreateRequest["urgency"],
+    deliveryFlexible,
+    quantityShortfallTolerance: quantityShortfallTolerance as number | undefined,
+    targetUnitPrice: targetUnitPrice as number | undefined,
+    budgetFlexible,
+  };
 }
 
 // POST /api/negotiations — creates a negotiation session and returns its
@@ -89,6 +138,11 @@ export async function POST(request: Request) {
         quantity: createRequest.quantity,
         maxUnitPrice: createRequest.maxUnitPrice,
         deliveryDeadlineDays: createRequest.deliveryDeadlineDays,
+        urgency: createRequest.urgency,
+        deliveryFlexible: createRequest.deliveryFlexible,
+        quantityShortfallTolerance: createRequest.quantityShortfallTolerance,
+        targetUnitPrice: createRequest.targetUnitPrice,
+        budgetFlexible: createRequest.budgetFlexible,
       },
       maxRounds,
     );

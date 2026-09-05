@@ -77,6 +77,11 @@ describe("buildNegotiationRunResponse", () => {
     );
   });
 
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — the merchant can expedite for a price
+  // premium. A non-positive deadline remains genuinely nonsensical
+  // regardless of price, so it's what this test uses to reliably reach
+  // REJECTED with no negotiation at all.
   it("returns a null agreement for a run that ends REJECTED or EXPIRED", async () => {
     const context: NegotiationContext = {
       item: laptop,
@@ -85,7 +90,7 @@ describe("buildNegotiationRunResponse", () => {
         sku: "LAPTOP-14-I5",
         quantity: 10,
         maxUnitPrice: 45000,
-        deliveryDeadlineDays: 1, // faster than standard — impossible
+        deliveryDeadlineDays: 0, // not a valid delivery window
       },
     };
     const { transcript, finalState } = await runNegotiationToCompletion(context, 4);

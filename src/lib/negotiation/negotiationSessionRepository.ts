@@ -13,6 +13,27 @@ import type { BuyerConstraints } from "@/lib/rules/buyerRules";
 import type { NegotiationResult } from "@/lib/rules/negotiationEngine";
 import type { NegotiationState, NegotiationStatus } from "@/lib/rules/negotiationState";
 import type { NegotiationTurnResult } from "@/lib/negotiation/orchestrator";
+import type {
+  NegotiationMessageType,
+  NegotiationParticipant,
+} from "@/lib/negotiation/protocol";
+import type { NegotiationMessageDTO } from "@/types/negotiation";
+
+/**
+ * Agentic Decision + Audit Trail (first layer): the event type recorded
+ * in the EXISTING AuditLog table (see agreementRepository.ts /
+ * paymentRepository.ts for the same convention — a named
+ * AUDIT_EVENT_* constant plus a JSON `payload`) whenever a turn carries
+ * a decisionAudit. Deliberately reuses AuditLog rather than adding new
+ * NegotiationMessage columns — no schema migration needed. The payload
+ * is `turn.decisionAudit` (NegotiationTurnResult) plus the turn number,
+ * a self-contained snapshot: both sides' deterministic move/reasons/
+ * sufficiency/candidates-considered and the leverage they were made
+ * against — see agentDecision.ts for the full shape. Never written when
+ * decisionAudit is absent (a structural walk-away, where neither agent
+ * made a decision this round at all) — nothing fabricated to fill the gap.
+ */
+export const AUDIT_EVENT_NEGOTIATION_DECISION = "NEGOTIATION_DECISION";
 
 /** Creates a new OPEN session and returns its id. Executes no turns. */
 export async function createNegotiationSession(
@@ -116,7 +137,135 @@ export async function persistNegotiationTurn(
           : null,
       },
     }),
+    // Agentic Decision + Audit Trail: same transaction as the messages
+    // it describes, so a session can never end up with a turn but a
+    // missing (or orphaned) decision record. Only written when this
+    // turn actually carries one — see AUDIT_EVENT_NEGOTIATION_DECISION's
+    // own doc comment.
+    ...(turn.decisionAudit
+      ? [
+          prisma.auditLog.create({
+            data: {
+              eventType: AUDIT_EVENT_NEGOTIATION_DECISION,
+              sessionId,
+              payload: JSON.stringify({ turn: turnNumber, ...turn.decisionAudit }),
+            },
+          }),
+        ]
+      : []),
   ]);
 
   return { turnNumber };
+}
+
+export interface LoadedTurnMessages {
+  turnNumber: number;
+  buyer: NegotiationMessageDTO;
+  merchant: NegotiationMessageDTO;
+}
+
+/**
+ * Re-reads the most recently persisted turn's buyer/merchant messages
+ * without running a new negotiation turn — used to replay the response
+ * of an already-terminal session (e.g. a repeated POST .../turn after
+ * AGREED) purely from what's already on disk. Returns null if the
+ * session has no messages yet.
+ */
+export async function loadLatestTurn(
+  sessionId: string,
+  sku: string,
+): Promise<LoadedTurnMessages | null> {
+  const latest = await prisma.negotiationMessage.findFirst({
+    where: { sessionId },
+    orderBy: { round: "desc" },
+  });
+  if (!latest) {
+    return null;
+  }
+
+  const rows = await prisma.negotiationMessage.findMany({
+    where: { sessionId, round: latest.round },
+  });
+  const buyerRow = rows.find((row) => row.sender === "buyer");
+  const merchantRow = rows.find((row) => row.sender === "merchant");
+  if (!buyerRow || !merchantRow) {
+    return null;
+  }
+
+  const toDTO = (row: typeof buyerRow): NegotiationMessageDTO => ({
+    sender: row.sender as NegotiationParticipant,
+    type: row.type as NegotiationMessageType,
+    sku,
+    quantity: row.quantity,
+    unitPrice: row.pricePerUnit,
+    deliveryDays: row.deliveryDays,
+    message: row.messageText,
+  });
+
+  return { turnNumber: latest.round, buyer: toDTO(buyerRow), merchant: toDTO(merchantRow) };
+}
+
+/**
+ * Milestone 3: the merchant's unit price from the round BEFORE the
+ * given one — lets the buyer's move selector (buyerMoveSelector.ts)
+ * detect whether the merchant's most recent offer was genuine forward
+ * progress. Reuses the existing NegotiationMessage history (no schema
+ * change); returns null if that earlier round doesn't exist (e.g. the
+ * buyer's first real counter, where there is only one merchant offer
+ * on record so far).
+ */
+export async function loadMerchantUnitPriceAtRound(
+  sessionId: string,
+  round: number,
+): Promise<number | null> {
+  if (round < 1) {
+    return null;
+  }
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "merchant", round },
+  });
+  return row?.pricePerUnit ?? null;
+}
+
+/**
+ * Milestone 5: whether the buyer has EVER proposed a quantity greater
+ * than its original requested quantity anywhere in this session's
+ * history — i.e. whether the quantity-for-price bargaining chip
+ * (buyerQuantityTrade.ts) has already been used. Deliberately scans the
+ * WHOLE history rather than only the most recent round: a single-round
+ * lookback could "forget" a trade used earlier if the buyer's mirrored
+ * quantity later drops back down (e.g. a subsequent partial-fulfillment
+ * offer), which would wrongly let the chip fire again. No schema
+ * change — reuses the existing NegotiationMessage.quantity column,
+ * same pattern as loadMerchantUnitPriceAtRound above.
+ */
+export async function hasBuyerProposedQuantityAbove(
+  sessionId: string,
+  originalQuantity: number,
+): Promise<boolean> {
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "buyer", quantity: { gt: originalQuantity } },
+  });
+  return row !== null;
+}
+
+/**
+ * Milestone 7: whether the buyer has EVER proposed a delivery window
+ * later than its original stated deadline anywhere in this session's
+ * history — i.e. whether the delivery-for-price bargaining chip
+ * (buyerDeliveryTrade.ts) has already been used. Tracked entirely
+ * independently from hasBuyerProposedQuantityAbove — using one chip must
+ * never consume the other. Same full-history-scan discipline as that
+ * function (a single-round lookback could "forget" a trade used
+ * earlier), and reuses the existing NegotiationMessage.deliveryDays
+ * column — no schema change.
+ */
+export async function hasBuyerProposedDeliveryDaysAbove(
+  sessionId: string,
+  originalDeliveryDeadlineDays: number,
+): Promise<boolean> {
+  const row = await prisma.negotiationMessage.findFirst({
+    where: { sessionId, sender: "buyer", deliveryDays: { gt: originalDeliveryDeadlineDays } },
+  });
+  return row !== null;
 }

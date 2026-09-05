@@ -3,6 +3,7 @@ import {
   acceptNegotiation,
   advanceNegotiationState,
   createNegotiationState,
+  expireNegotiation,
   rejectNegotiation,
 } from "./negotiationState";
 
@@ -59,5 +60,20 @@ describe("negotiation state machine", () => {
   it("allows rejectNegotiation to close an open/countered negotiation as REJECTED", () => {
     const state = rejectNegotiation(createNegotiationState(4));
     expect(state.status).toBe("REJECTED");
+  });
+
+  // Milestone 2: a recognized walk-away closes as EXPIRED — the same
+  // public status round-exhaustion already produces, since a walk-away
+  // is a legitimate outcome, not a system failure.
+  it("allows expireNegotiation to close an open/countered negotiation as EXPIRED, without requiring the round limit", () => {
+    const countered = advanceNegotiationState(createNegotiationState(4), "COUNTER_OFFER");
+    expect(countered.round).toBeLessThan(countered.maxRounds);
+    const expired = expireNegotiation(countered);
+    expect(expired.status).toBe("EXPIRED");
+  });
+
+  it("does not allow expireNegotiation to change a negotiation that already closed", () => {
+    const agreed = acceptNegotiation(createNegotiationState(4));
+    expect(expireNegotiation(agreed).status).toBe("AGREED");
   });
 });

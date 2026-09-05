@@ -7,6 +7,13 @@
 // only phrases whatever these functions already decided.
 
 import type { NegotiationRequest, ProposedAgreement } from "@/lib/rules/negotiationEngine";
+import {
+  hasQuantityLeverage,
+  resolveUrgencyConcessionFactor,
+  resolveRoundProgressFactor,
+  LARGE_ORDER_TARGET_DISCOUNT,
+  type UrgencyLevel,
+} from "@/lib/rules/negotiationStrategy";
 
 /**
  * The buyer's own hard constraints for one SKU. Mirrors
@@ -28,6 +35,46 @@ export interface BuyerConstraints {
    * caller only has to supply a ceiling, same as before.
    */
   targetUnitPrice?: number;
+  /**
+   * How eager the buyer is to close quickly. "medium" (the default when
+   * omitted) reproduces the exact concession behavior this field
+   * predates — see negotiationStrategy.resolveUrgencyConcessionFactor.
+   * High urgency makes the buyer less aggressive on price (moves toward
+   * its ceiling faster); low urgency allows stronger bargaining.
+   */
+  urgency?: UrgencyLevel;
+  /**
+   * Whether the buyer will accept a later delivery date in exchange for
+   * a price concession — see negotiationStrategy.resolveDeliveryTrade.
+   * Only meaningful to the merchant's round-aware concession logic;
+   * omitted (false) reproduces existing behavior exactly.
+   */
+  deliveryFlexible?: boolean;
+  /**
+   * Pass 4: whether `maxUnitPrice` is a soft preference rather than a
+   * hard ceiling — the buyer explicitly said their stated price is
+   * flexible/negotiable/approximate, or that they're willing to go
+   * above it. Omitted (false) reproduces today's exact hard-ceiling
+   * behavior everywhere — every function that reads this only ever
+   * loosens its bound when it's true, and it never changes
+   * resolveBuyerTarget's own aspiration math (the stated maxUnitPrice
+   * remains the buyer's anchor either way). See
+   * resolveEffectiveBudgetCeiling below for the single, centralized
+   * definition of how much a flexible buyer can actually move.
+   */
+  budgetFlexible?: boolean;
+  /**
+   * Milestone 6: how much shortfall from `quantity` (as a fraction,
+   * e.g. 0.2 = up to 20% less than requested) the buyer will tolerate
+   * without needing the price to compensate for it — see
+   * buyerQuantitySufficiency.ts. Optional: when omitted, a sensible
+   * default is derived purely from `urgency` (see
+   * negotiationStrategy.resolveQuantityShortfallTolerance) — no caller
+   * is required to state this explicitly, and every caller that predates
+   * Milestone 6 (which never even checked for a shortfall floor) still
+   * gets a real, principled default rather than no floor at all.
+   */
+  quantityShortfallTolerance?: number;
 }
 
 /** Converts buyer constraints into the structured request the merchant engine expects. */
@@ -38,6 +85,7 @@ export function toNegotiationRequest(constraints: BuyerConstraints): Negotiation
     maxUnitPrice: constraints.maxUnitPrice,
     deliveryDeadlineDays: constraints.deliveryDeadlineDays,
     buyerContext: constraints.buyerContext,
+    deliveryFlexible: constraints.deliveryFlexible,
   };
 }
 
@@ -46,28 +94,70 @@ export function isSkuMatch(constraints: BuyerConstraints, proposal: ProposedAgre
   return proposal.sku === constraints.sku;
 }
 
-/** Is the proposed quantity acceptable — positive, and not more than the buyer asked for? */
+/**
+ * Is the proposed quantity acceptable — positive, and not more than the
+ * buyer is actually willing to take?
+ *
+ * `maxAcceptableQuantity` defaults to `constraints.quantity` (the
+ * buyer's original requirement) when omitted — exactly the pre-Milestone-5
+ * behavior every existing caller relies on. Milestone 5's
+ * quantity-for-price trade lets the buyer deliberately ask for MORE than
+ * its original quantity in exchange for a better price (see
+ * buyerQuantityTrade.ts); once it has, the merchant's own offer mirroring
+ * that larger ask must not be rejected here as "too much" — the caller
+ * (buyerAgent.ts) passes the buyer's own most recent ask as the ceiling
+ * in that case. Never affects merchant-side stock limits — those are
+ * checked separately by negotiationEngine.ts's checkQuantityAvailable /
+ * validateProposedAgreement.
+ */
 export function isQuantityAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableQuantity: number = constraints.quantity,
 ): boolean {
-  return proposal.quantity > 0 && proposal.quantity <= constraints.quantity;
+  return proposal.quantity > 0 && proposal.quantity <= maxAcceptableQuantity;
 }
 
-/** Is the proposed unit price at or below the buyer's maximum? */
+/**
+ * Is the proposed unit price at or below the buyer's ceiling?
+ *
+ * `effectiveCeiling` defaults to `constraints.maxUnitPrice` — the exact
+ * pre-Pass-4 behavior every existing caller relies on. A caller that has
+ * already resolved a flexible buyer's real bound (see
+ * resolveEffectiveBudgetCeiling) passes it explicitly; omitting it means
+ * a `budgetFlexible` buyer is checked against its own stated number,
+ * same as a hard budget, which is the intentional safe fallback for any
+ * call site that doesn't have merchant listed-price context available.
+ */
 export function isPriceAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): boolean {
-  return proposal.unitPrice <= constraints.maxUnitPrice;
+  return proposal.unitPrice <= effectiveCeiling;
 }
 
-/** Is the proposed delivery time at or before the buyer's deadline? */
+/**
+ * Is the proposed delivery time at or before what the buyer is actually
+ * willing to accept?
+ *
+ * `maxAcceptableDeliveryDays` defaults to `constraints.deliveryDeadlineDays`
+ * (the buyer's original deadline) when omitted — exactly the
+ * pre-Milestone-7 behavior every existing caller relies on. Milestone 7's
+ * delivery-for-price trade lets the buyer deliberately offer a LATER date
+ * than its original deadline in exchange for a better price (see
+ * buyerDeliveryTrade.ts); once it has, the merchant's own offer mirroring
+ * that later date must not be rejected here as "too slow" — the caller
+ * (buyerAgent.ts) passes the buyer's own most recent ask as the ceiling
+ * in that case. Mirrors isQuantityAcceptable's own Milestone 5 fix
+ * exactly, for the delivery dimension.
+ */
 export function isDeliveryAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableDeliveryDays: number = constraints.deliveryDeadlineDays,
 ): boolean {
-  return proposal.deliveryDays <= constraints.deliveryDeadlineDays;
+  return proposal.deliveryDays <= maxAcceptableDeliveryDays;
 }
 
 export type BuyerValidationOutcome = "ACCEPTABLE" | "UNACCEPTABLE";
@@ -81,29 +171,39 @@ export interface BuyerValidationResult {
  * Runs all four buyer-side checks against a merchant's proposal. This is
  * the single gate the Buyer Agent's decision logic goes through — an
  * LLM-proposed "accept" is only ever acted on if this function agrees.
+ *
+ * `maxAcceptableQuantity` — see isQuantityAcceptable — defaults to
+ * `constraints.quantity`, exactly the pre-Milestone-5 behavior.
+ * `maxAcceptableDeliveryDays` — see isDeliveryAcceptable — defaults to
+ * `constraints.deliveryDeadlineDays`, exactly the pre-Milestone-7 behavior.
+ * `effectiveCeiling` — see isPriceAcceptable — defaults to
+ * `constraints.maxUnitPrice`, exactly the pre-Pass-4 behavior.
  */
 export function validateMerchantProposal(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  maxAcceptableQuantity: number = constraints.quantity,
+  maxAcceptableDeliveryDays: number = constraints.deliveryDeadlineDays,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerValidationResult {
   const reasons: string[] = [];
 
   if (!isSkuMatch(constraints, proposal)) {
     reasons.push(`Proposal is for ${proposal.sku}, but ${constraints.sku} was requested.`);
   }
-  if (!isQuantityAcceptable(constraints, proposal)) {
+  if (!isQuantityAcceptable(constraints, proposal, maxAcceptableQuantity)) {
     reasons.push(
-      `Offered quantity ${proposal.quantity} is not acceptable (requested up to ${constraints.quantity}).`,
+      `Offered quantity ${proposal.quantity} is not acceptable (requested up to ${maxAcceptableQuantity}).`,
     );
   }
-  if (!isPriceAcceptable(constraints, proposal)) {
+  if (!isPriceAcceptable(constraints, proposal, effectiveCeiling)) {
     reasons.push(
-      `Offered unit price ${proposal.unitPrice} exceeds the buyer's maximum of ${constraints.maxUnitPrice}.`,
+      `Offered unit price ${proposal.unitPrice} exceeds the buyer's maximum of ${effectiveCeiling}.`,
     );
   }
-  if (!isDeliveryAcceptable(constraints, proposal)) {
+  if (!isDeliveryAcceptable(constraints, proposal, maxAcceptableDeliveryDays)) {
     reasons.push(
-      `Offered delivery of ${proposal.deliveryDays} day(s) exceeds the buyer's deadline of ${constraints.deliveryDeadlineDays} day(s).`,
+      `Offered delivery of ${proposal.deliveryDays} day(s) exceeds the buyer's deadline of ${maxAcceptableDeliveryDays} day(s).`,
     );
   }
 
@@ -134,12 +234,23 @@ export const DEFAULT_BUYER_TARGET_DISCOUNT = 0.05;
  * fixed 5% below maxUnitPrice. This never depends on any merchant data
  * (listed price, floor, etc.) — it's purely a function of the buyer's
  * own stated ceiling, so it works the same way for any product.
+ *
+ * A large order (negotiationStrategy.hasQuantityLeverage) pulls the
+ * target further down — bulk buyers open asking for a deeper discount —
+ * still clamped to [0, maxUnitPrice]. Below the leverage threshold
+ * (every existing fixture in this codebase, including the 200-unit demo
+ * scenario) this is a no-op.
  */
 export function resolveBuyerTarget(constraints: BuyerConstraints): number {
-  if (constraints.targetUnitPrice !== undefined) {
-    return clamp(constraints.targetUnitPrice, 0, constraints.maxUnitPrice);
+  const base =
+    constraints.targetUnitPrice !== undefined
+      ? clamp(constraints.targetUnitPrice, 0, constraints.maxUnitPrice)
+      : Math.round(constraints.maxUnitPrice * (1 - DEFAULT_BUYER_TARGET_DISCOUNT));
+
+  if (!hasQuantityLeverage(constraints.quantity)) {
+    return base;
   }
-  return Math.round(constraints.maxUnitPrice * (1 - DEFAULT_BUYER_TARGET_DISCOUNT));
+  return clamp(Math.round(base * (1 - LARGE_ORDER_TARGET_DISCOUNT)), 0, constraints.maxUnitPrice);
 }
 
 /** Round context an orchestrator supplies to computeBuyerConcessionPrice. */
@@ -147,6 +258,19 @@ export interface BuyerConcessionContext {
   /** Which buyer response this is, 1-indexed — the opening request is round 1. */
   round: number;
   maxRounds: number;
+  /**
+   * Negotiation Engine V2 — an already-resolved multiplier from
+   * negotiationStrategy.resolveLeverageSpeedFactor(buyerLeverage,
+   * merchantLeverage), reflecting the buyer's OWN leverage relative to
+   * the merchant's this round. Defaults to 1.0 (a complete no-op) when
+   * omitted — every caller that predates this option (including every
+   * existing test) behaves exactly as before. Computed by the caller
+   * (buyerMoveSelector.ts), never re-derived here — this function stays
+   * a pure formula over already-resolved numbers, the same discipline
+   * negotiationEngine.ts's own reciprocitySpeedMultiplier already
+   * established for the symmetric merchant-side case.
+   */
+  leverageSpeedFactor?: number;
 }
 
 /**
@@ -175,19 +299,85 @@ export interface BuyerConcessionContext {
  * This function only computes a NUMBER; it never decides whether to
  * accept, reject, or counter — buyerAgent.ts's validateMerchantProposal
  * check does that, same as before this function existed.
+ *
+ * The step size is additionally scaled by constraints.urgency
+ * (negotiationStrategy.resolveUrgencyConcessionFactor) — "medium", the
+ * default when urgency is unset, reproduces a multiplier of exactly 1,
+ * i.e. today's plain halving formula, unchanged.
+ *
+ * Pass 4 (budgetFlexible): `effectiveCeiling` replaces `maxUnitPrice` as
+ * the bound in both the final-2-rounds capitulation and the clamp below
+ * — it defaults to `constraints.maxUnitPrice`, so every existing caller
+ * (and every hard-budget buyer) behaves exactly as before. A caller that
+ * has resolved a flexible buyer's real bound (resolveEffectiveBudgetCeiling)
+ * passes it explicitly. `target` itself (resolveBuyerTarget) is
+ * untouched — a flexible buyer still anchors its aspiration on the
+ * stated maxUnitPrice, never on the wider ceiling.
  */
 export function computeBuyerConcessionPrice(
   constraints: BuyerConstraints,
   merchantOfferUnitPrice: number,
   context: BuyerConcessionContext,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): number {
   const target = resolveBuyerTarget(constraints);
   const roundsLeft = Math.max(1, context.maxRounds - context.round + 1);
 
   if (roundsLeft <= 2) {
-    return constraints.maxUnitPrice;
+    return effectiveCeiling;
   }
 
-  const conceded = target + (merchantOfferUnitPrice - target) / 2;
-  return clamp(Math.round(conceded), target, constraints.maxUnitPrice);
+  const urgencyFactor = resolveUrgencyConcessionFactor(constraints.urgency);
+  // Negotiation Engine V2: leverage (opt-in, see BuyerConcessionContext's
+  // own doc comment) and round progression receive the symmetric
+  // treatment to the merchant side's own combinedSpeed — same outer
+  // clamp band, same "no-op when omitted / at the round-2-of-4 midpoint"
+  // properties. Deliberately inert on round 1, mirroring
+  // computeMerchantConcessionPrice's own opening-round exemption exactly
+  // (this function is never actually called on the buyer's real round 1
+  // in this codebase — buildOpeningRequest/resolveBuyerTarget handles
+  // that directly — but the guard keeps this function correct in
+  // isolation too, never dependent on that calling convention).
+  const isOpeningRound = context.round <= 1;
+  const leverageFactor = isOpeningRound ? 1 : (context.leverageSpeedFactor ?? 1);
+  const roundProgressFactor = isOpeningRound ? 1 : resolveRoundProgressFactor(context.round, context.maxRounds);
+  const combinedFactor = clamp(urgencyFactor * leverageFactor * roundProgressFactor, 0.3, 2.0);
+  const conceded = target + ((merchantOfferUnitPrice - target) / 2) * combinedFactor;
+  return clamp(Math.round(conceded), target, effectiveCeiling);
+}
+
+/**
+ * Pass 4 (budgetFlexible) — the ONE centralized definition of how far a
+ * flexible buyer's price movement is allowed to go, so buyerRules.ts /
+ * walkAway.ts / buyerMoveSelector.ts can never independently invent
+ * slightly different multipliers and disagree with each other.
+ *
+ * A hard budget (`budgetFlexible` falsy) is bounded by exactly
+ * `maxUnitPrice` — `listedPrice` is never consulted, so this is a
+ * complete no-op for every existing caller/session.
+ *
+ * A flexible budget is bounded by whichever is LARGER of the buyer's
+ * own stated `maxUnitPrice` and the merchant's real `listedPrice`:
+ * flexibility only ever loosens the buyer's own stated number, it can
+ * never tighten it below what the buyer already said (e.g. a buyer
+ * whose stated number is already above listed price keeps that higher
+ * number as its bound, not the lower listed price).
+ *
+ * `listedPrice` is optional so this stays callable from sites that
+ * don't have product context in scope — it's simply never read there.
+ * Omitting it while flexible falls back to the buyer's own stated
+ * number (the same bound as a hard budget) rather than leaving the
+ * buyer unbounded, so a flexible buyer is NEVER unbounded merely
+ * because a caller couldn't supply the merchant's listed price.
+ */
+export function resolveEffectiveBudgetCeiling(
+  constraints: Pick<BuyerConstraints, "maxUnitPrice" | "budgetFlexible">,
+  listedPrice?: number,
+): number {
+  if (!constraints.budgetFlexible) {
+    return constraints.maxUnitPrice;
+  }
+  return listedPrice !== undefined
+    ? Math.max(constraints.maxUnitPrice, listedPrice)
+    : constraints.maxUnitPrice;
 }

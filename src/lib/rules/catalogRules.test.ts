@@ -43,13 +43,27 @@ describe("checkPriceAtOrAboveFloor", () => {
 });
 
 describe("checkDeliveryAchievable", () => {
-  it("accepts a deadline at or after the standard lead time", () => {
+  it("accepts a deadline at or after the standard lead time, offering the standard lead time", () => {
     expect(checkDeliveryAchievable(item, 7).isAchievable).toBe(true);
+    expect(checkDeliveryAchievable(item, 7).offeredDeliveryDays).toBe(5);
     expect(checkDeliveryAchievable(item, 5).isAchievable).toBe(true);
+    expect(checkDeliveryAchievable(item, 5).offeredDeliveryDays).toBe(5);
   });
 
-  it("rejects a deadline faster than the standard lead time", () => {
-    expect(checkDeliveryAchievable(item, 2).isAchievable).toBe(false);
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // an unconditional impossibility — the merchant can meet it (a genuine
+  // rush capability); the caller (merchantAgent.ts) is what applies a
+  // price premium for it (see resolveDeliveryRushPremiumFraction,
+  // negotiationStrategy.ts) — this function only reports achievability
+  // and what the merchant would actually deliver.
+  it("accepts a deadline faster than the standard lead time, offering exactly that faster date", () => {
+    const result = checkDeliveryAchievable(item, 2);
+    expect(result.isAchievable).toBe(true);
+    expect(result.offeredDeliveryDays).toBe(2);
+  });
+
+  it("rejects a non-positive deadline regardless of price", () => {
+    expect(checkDeliveryAchievable(item, 0).isAchievable).toBe(false);
   });
 
   it("treats no deadline as achievable and offers the standard lead time", () => {
@@ -93,10 +107,22 @@ describe("evaluateFulfillment", () => {
     expect(outcome.offeredQuantity).toBeNull();
   });
 
-  it("returns impossible when the delivery deadline is faster than standard", () => {
+  // Scenario-behavior fix: a deadline faster than standard is no longer
+  // impossible on its own — see checkDeliveryAchievable's own tests
+  // above. A non-positive deadline remains genuinely impossible.
+  it("does not return impossible merely for a deadline faster than standard", () => {
     const outcome = evaluateFulfillment(item, {
       quantity: 10,
       deliveryDeadlineDays: 1,
+    });
+    expect(outcome.kind).not.toBe("impossible");
+    expect(outcome.offeredDeliveryDays).toBe(1);
+  });
+
+  it("returns impossible for a non-positive delivery deadline", () => {
+    const outcome = evaluateFulfillment(item, {
+      quantity: 10,
+      deliveryDeadlineDays: 0,
     });
     expect(outcome.kind).toBe("impossible");
   });
