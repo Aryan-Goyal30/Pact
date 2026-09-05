@@ -23,6 +23,45 @@ describe("isPriceGapUnbridgeable", () => {
       isPriceGapUnbridgeable({ minPrice: 44000, negotiationEnabled: false }, { maxUnitPrice: 30000 }),
     ).toBe(false);
   });
+
+  // Pass 4: budgetFlexible / effectiveCeiling.
+  describe("Pass 4 — budgetFlexible", () => {
+    it("a hard budget below the merchant floor still structurally walks away, unchanged", () => {
+      expect(
+        isPriceGapUnbridgeable(
+          { minPrice: 44000, negotiationEnabled: true },
+          { maxUnitPrice: 30000, budgetFlexible: false },
+        ),
+      ).toBe(true);
+    });
+
+    it("a flexible budget below the merchant floor does NOT structurally walk away when the listed price covers the floor", () => {
+      expect(
+        isPriceGapUnbridgeable(
+          { minPrice: 44000, negotiationEnabled: true, listedPrice: 48000 },
+          { maxUnitPrice: 30000, budgetFlexible: true },
+        ),
+      ).toBe(false);
+    });
+
+    it("a flexible budget remains bounded — still walks away when even the listed price is below the merchant floor", () => {
+      expect(
+        isPriceGapUnbridgeable(
+          { minPrice: 44000, negotiationEnabled: true, listedPrice: 40000 },
+          { maxUnitPrice: 30000, budgetFlexible: true },
+        ),
+      ).toBe(true);
+    });
+
+    it("a flexible budget with no listedPrice available falls back to the stated maxUnitPrice (still walks away)", () => {
+      expect(
+        isPriceGapUnbridgeable(
+          { minPrice: 44000, negotiationEnabled: true },
+          { maxUnitPrice: 30000, budgetFlexible: true },
+        ),
+      ).toBe(true);
+    });
+  });
 });
 
 describe("arePositionsRepeated", () => {

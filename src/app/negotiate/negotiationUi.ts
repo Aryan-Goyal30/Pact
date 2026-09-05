@@ -420,13 +420,44 @@ export function negotiationStatusBadgeClass(status: NegotiationStatus): string {
  * either reproduces the exact pre-Milestone-12.5 generic EXPIRED text,
  * so every existing single-argument call site is unaffected.
  */
+/**
+ * The real, positive rupee distance between the buyer's own stated
+ * maximum and the merchant's final offer — null whenever either number
+ * is unknown, or the merchant's final offer was actually at/below the
+ * buyer's maximum (in which case price wasn't the reason this
+ * negotiation failed to reach AGREED, so no gap is reported). Built
+ * entirely from two numbers already public to the buyer themselves
+ * (their own stated ceiling, and an offer the merchant already made
+ * out loud) — never touches, derives, or implies the merchant's private
+ * floor (Pass 11 addendum, "impossible-budget failure explanation").
+ */
+export function negotiationPriceGap(
+  buyerMaxPrice: number | undefined,
+  merchantFinalPrice: number | undefined,
+): number | null {
+  if (buyerMaxPrice === undefined || merchantFinalPrice === undefined) return null;
+  const gap = merchantFinalPrice - buyerMaxPrice;
+  return gap > 0 ? gap : null;
+}
+
 export function negotiationFailureExplanation(
   status: "REJECTED" | "EXPIRED",
   rounds?: number,
   maxRounds?: number,
+  buyerMaxPrice?: number,
+  merchantFinalPrice?: number,
 ): string {
   if (status === "REJECTED") {
     return "The negotiation could not find terms that satisfied both sides' requirements.";
+  }
+  // Pass 11 addendum: when the buyer's own stated max and the
+  // merchant's own already-public final offer show a genuine remaining
+  // price gap, that's a more useful and equally safe explanation than
+  // the generic "positions could not be reconciled" — still never
+  // mentions or implies the merchant's private floor, only restates two
+  // numbers the buyer already knows.
+  if (negotiationPriceGap(buyerMaxPrice, merchantFinalPrice) !== null) {
+    return "The merchant made a final concession, but the resulting price was still above your maximum budget. PACT could not authorize a lower offer while staying within the merchant's pricing constraints, so the Buyer Agent walked away.";
   }
   if (rounds !== undefined && maxRounds !== undefined && rounds < maxRounds) {
     return "Negotiation ended early — the two sides' positions could not be reconciled.";
@@ -524,4 +555,167 @@ const MOVE_BADGE_CLASSES: Record<CandidateMoveType, string> = {
 /** Badge color class for a strategic move — same convention as negotiationMessageTypeBadgeClass. */
 export function negotiationMoveBadgeClass(move: CandidateMoveType): string {
   return MOVE_BADGE_CLASSES[move];
+}
+
+/**
+ * Redesign 2.0.1 (D2) — a concise "what actually changed" line for a
+ * genuine non-price trade round, e.g. "8 → 12 days in exchange for a
+ * better price". Purely a comparison of two already-persisted buyer
+ * terms (this round's vs. the immediately preceding round's) — never a
+ * new computation, never invented: a dimension that didn't actually
+ * change (or for which one of the two rounds has no data) is simply
+ * left out. Returns null whenever `move` isn't one of the three real
+ * trade types, or the comparison yields nothing to report — the caller
+ * must never fabricate an annotation for an ordinary HOLD/CONCEDE round.
+ */
+export function describeTradeAnnotation(
+  move: CandidateMoveType | undefined,
+  previousBuyer: { quantity: number | null; deliveryDays: number | null } | null,
+  currentBuyer: { quantity: number | null; deliveryDays: number | null },
+): string | null {
+  if (!previousBuyer) return null;
+  if (move !== "QUANTITY_FOR_PRICE" && move !== "DELIVERY_FOR_PRICE" && move !== "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+    return null;
+  }
+
+  const parts: string[] = [];
+  if (
+    (move === "QUANTITY_FOR_PRICE" || move === "QUANTITY_AND_DELIVERY_FOR_PRICE") &&
+    previousBuyer.quantity !== null &&
+    currentBuyer.quantity !== null &&
+    previousBuyer.quantity !== currentBuyer.quantity
+  ) {
+    parts.push(`${previousBuyer.quantity} → ${currentBuyer.quantity} units`);
+  }
+  if (
+    (move === "DELIVERY_FOR_PRICE" || move === "QUANTITY_AND_DELIVERY_FOR_PRICE") &&
+    previousBuyer.deliveryDays !== null &&
+    currentBuyer.deliveryDays !== null &&
+    previousBuyer.deliveryDays !== currentBuyer.deliveryDays
+  ) {
+    parts.push(`${previousBuyer.deliveryDays} → ${currentBuyer.deliveryDays} day(s)`);
+  }
+
+  if (parts.length === 0) return null;
+  return `${parts.join(" and ")} in exchange for a better price`;
+}
+
+// ---------------------------------------------------------------------
+// ConvergenceChart's own data mapping (Pass 11, Objective B, item 12) —
+// pulled out of the component into a pure, DOM-free function so the
+// numeric side of the chart (round filtering, gap math, x/y scaling,
+// trade-round flagging) is directly testable, the same discipline
+// describeTradeAnnotation above already follows. The component itself
+// stays a thin renderer of whatever this returns; nothing here decides
+// negotiation outcomes, only reads already-persisted round data.
+// ---------------------------------------------------------------------
+
+export interface ConvergenceChartPoint {
+  x: number;
+  y: number;
+}
+
+export interface ConvergenceChartRound {
+  turn: number;
+  buyerPrice: number;
+  merchantPrice: number;
+  gap: number;
+  isTradeRound: boolean;
+  buyerPoint: ConvergenceChartPoint;
+  merchantPoint: ConvergenceChartPoint;
+}
+
+export interface ConvergenceChartData {
+  rounds: ConvergenceChartRound[];
+  buyerPath: string;
+  merchantPath: string;
+  gapPolygonPoints: string;
+  /** Always a real number when this object exists at all — computeConvergenceChartData only ever returns non-null once there are >= 2 priced rounds, so there is always a latest gap to report. */
+  currentGap: number;
+  gapDirection: "narrowing" | "widening" | "holding" | null;
+  /** True only when this negotiation ended in a real, persisted Agreement — a failed negotiation with a genuine remaining gap never gets a manufactured convergence point (Pass 11 addendum: "Failure = unresolved separation"). */
+  converged: boolean;
+}
+
+const TRADE_MOVES = new Set(["DELIVERY_FOR_PRICE", "QUANTITY_FOR_PRICE", "QUANTITY_AND_DELIVERY_FOR_PRICE"]);
+
+/** The minimal shape ConvergenceChart's data mapping actually reads off one transcript turn — deliberately structural rather than importing NegotiationDemo.tsx's own local TranscriptTurn type, so this stays a plain, standalone function. */
+export interface ConvergenceChartTurnInput {
+  turn: number;
+  buyer: { unitPrice: number | null; move?: string | null } | null;
+  merchant: { unitPrice: number | null; move?: string | null } | null;
+}
+
+/**
+ * Every number ConvergenceChart draws, computed once as plain data — x/y
+ * points on a fixed 0–100 (width) by 0–`viewHeight` (height) coordinate
+ * system, real per-round gaps, and which rounds were a genuine trade
+ * move. Returns null when there are fewer than 2 priced rounds (nothing
+ * to draw a trajectory between yet — the chart itself only renders once
+ * this is non-null, exactly mirroring the component's own prior
+ * `rounds.length >= 2` gate).
+ */
+export function computeConvergenceChartData(
+  transcript: ConvergenceChartTurnInput[],
+  hasAgreement: boolean,
+  isTerminal: boolean,
+  viewHeight = 42,
+): ConvergenceChartData | null {
+  const rounds = transcript.filter(
+    (t): t is ConvergenceChartTurnInput & { buyer: { unitPrice: number; move?: string | null }; merchant: { unitPrice: number; move?: string | null } } =>
+      t.buyer?.unitPrice != null && t.merchant?.unitPrice != null,
+  );
+  if (rounds.length < 2) return null;
+
+  const gaps = rounds.map((r) => Math.abs(r.merchant.unitPrice - r.buyer.unitPrice));
+  const currentGap = gaps[gaps.length - 1];
+  const prevGap = gaps.length >= 2 ? gaps[gaps.length - 2] : null;
+  const gapDirection: ConvergenceChartData["gapDirection"] =
+    prevGap !== null ? (currentGap < prevGap ? "narrowing" : currentGap > prevGap ? "widening" : "holding") : null;
+
+  const allPrices = rounds.flatMap((r) => [r.buyer.unitPrice, r.merchant.unitPrice]);
+  const rawMin = Math.min(...allPrices);
+  const rawMax = Math.max(...allPrices);
+  const rawRange = rawMax - rawMin || 1;
+  const pad = rawRange * 0.12;
+  const min = rawMin - pad;
+  const max = rawMax + pad;
+  const range = max - min || 1;
+
+  const topMargin = 6;
+  const bottomMargin = 6;
+  const sideMargin = 4;
+  const xFor = (i: number) => sideMargin + (i / Math.max(1, rounds.length - 1)) * (100 - 2 * sideMargin);
+  const yFor = (price: number) => topMargin + (1 - (price - min) / range) * (viewHeight - topMargin - bottomMargin);
+
+  const chartRounds: ConvergenceChartRound[] = rounds.map((r, i) => {
+    const move = r.merchant?.move ?? r.buyer?.move ?? null;
+    return {
+      turn: r.turn,
+      buyerPrice: r.buyer.unitPrice,
+      merchantPrice: r.merchant.unitPrice,
+      gap: gaps[i],
+      isTradeRound: move !== null && TRADE_MOVES.has(move),
+      buyerPoint: { x: xFor(i), y: yFor(r.buyer.unitPrice) },
+      merchantPoint: { x: xFor(i), y: yFor(r.merchant.unitPrice) },
+    };
+  });
+
+  const toPath = (points: ConvergenceChartPoint[]) => points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
+  const buyerPoints = chartRounds.map((r) => r.buyerPoint);
+  const merchantPoints = chartRounds.map((r) => r.merchantPoint);
+  const gapPolygonPoints = `${buyerPoints.map((p) => `${p.x},${p.y}`).join(" ")} ${[...merchantPoints]
+    .reverse()
+    .map((p) => `${p.x},${p.y}`)
+    .join(" ")}`;
+
+  return {
+    rounds: chartRounds,
+    buyerPath: toPath(buyerPoints),
+    merchantPath: toPath(merchantPoints),
+    gapPolygonPoints,
+    currentGap,
+    gapDirection,
+    converged: isTerminal && hasAgreement,
+  };
 }

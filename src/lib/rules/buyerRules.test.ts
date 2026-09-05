@@ -7,6 +7,7 @@ import {
   isQuantityAcceptable,
   isSkuMatch,
   resolveBuyerTarget,
+  resolveEffectiveBudgetCeiling,
   toNegotiationRequest,
   validateMerchantProposal,
   type BuyerConcessionContext,
@@ -243,5 +244,87 @@ describe("computeBuyerConcessionPrice", () => {
       const late = computeBuyerConcessionPrice(constraints, 45375, { round: 8, maxRounds: 10 });
       expect(late).toBeGreaterThan(early); // later progress -> more pressure to converge -> moves further toward the merchant
     });
+  });
+
+  // Pass 4: budgetFlexible / effectiveCeiling — the 4th parameter is
+  // purely additive. Omitting it (every test above) reproduces exactly
+  // today's hard-ceiling behavior, proven again explicitly here.
+  describe("Pass 4 — effectiveCeiling (budgetFlexible)", () => {
+    it("omitting effectiveCeiling reproduces the exact maxUnitPrice-bounded result", () => {
+      const withoutCeiling = computeBuyerConcessionPrice(constraints, 100000, roundContext(4));
+      const withExplicitMax = computeBuyerConcessionPrice(constraints, 100000, roundContext(4), constraints.maxUnitPrice);
+      expect(withoutCeiling).toBe(constraints.maxUnitPrice);
+      expect(withExplicitMax).toBe(constraints.maxUnitPrice);
+    });
+
+    it("a higher effectiveCeiling lets the buyer move above its stated maxUnitPrice on the final-rounds safety net", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, roundContext(4), 48000);
+      expect(price).toBe(48000);
+      expect(price).toBeGreaterThan(constraints.maxUnitPrice);
+    });
+
+    it("a higher effectiveCeiling raises the clamp bound on a middle round too, never exceeding the given ceiling", () => {
+      const price = computeBuyerConcessionPrice(constraints, 100000, roundContext(2), 48000);
+      expect(price).toBeLessThanOrEqual(48000);
+    });
+
+    it("target/aspiration (resolveBuyerTarget) is unaffected by effectiveCeiling — it still anchors on the stated maxUnitPrice", () => {
+      const target = resolveBuyerTarget(constraints);
+      const price = computeBuyerConcessionPrice(constraints, target - 5000, roundContext(2), 48000);
+      expect(price).toBeGreaterThanOrEqual(target);
+    });
+  });
+});
+
+describe("resolveEffectiveBudgetCeiling", () => {
+  const hard: BuyerConstraints = { ...constraints, budgetFlexible: false };
+  const flexible: BuyerConstraints = { ...constraints, budgetFlexible: true };
+
+  it("a hard budget is bounded by exactly maxUnitPrice, regardless of listedPrice", () => {
+    expect(resolveEffectiveBudgetCeiling(hard, 60000)).toBe(constraints.maxUnitPrice);
+    expect(resolveEffectiveBudgetCeiling(hard)).toBe(constraints.maxUnitPrice);
+  });
+
+  it("omitted budgetFlexible behaves exactly like a hard budget", () => {
+    expect(resolveEffectiveBudgetCeiling({ maxUnitPrice: constraints.maxUnitPrice }, 60000)).toBe(
+      constraints.maxUnitPrice,
+    );
+  });
+
+  it("a flexible budget is bounded by the merchant's listedPrice when it's higher than the stated maxUnitPrice", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible, 60000)).toBe(60000);
+  });
+
+  it("a flexible budget never drops BELOW the buyer's own stated maxUnitPrice, even if listedPrice is lower", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible, 30000)).toBe(constraints.maxUnitPrice);
+  });
+
+  it("a flexible budget with no listedPrice available falls back to the buyer's own stated maxUnitPrice, never unbounded", () => {
+    expect(resolveEffectiveBudgetCeiling(flexible)).toBe(constraints.maxUnitPrice);
+  });
+});
+
+describe("isPriceAcceptable / validateMerchantProposal — Pass 4 effectiveCeiling", () => {
+  it("isPriceAcceptable accepts a price above maxUnitPrice when an explicit higher effectiveCeiling is given", () => {
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 46500 })).toBe(false);
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 46500 }, 48000)).toBe(true);
+    expect(isPriceAcceptable(constraints, { ...acceptableProposal, unitPrice: 49000 }, 48000)).toBe(false);
+  });
+
+  it("validateMerchantProposal is ACCEPTABLE for a price above maxUnitPrice when an effectiveCeiling covers it", () => {
+    const result = validateMerchantProposal(
+      constraints,
+      { ...acceptableProposal, unitPrice: 46500 },
+      constraints.quantity,
+      constraints.deliveryDeadlineDays,
+      48000,
+    );
+    expect(result.outcome).toBe("ACCEPTABLE");
+  });
+
+  it("validateMerchantProposal omitting effectiveCeiling reproduces the exact hard-ceiling UNACCEPTABLE result", () => {
+    const result = validateMerchantProposal(constraints, { ...acceptableProposal, unitPrice: 46500 });
+    expect(result.outcome).toBe("UNACCEPTABLE");
+    expect(result.reasons.join(" ")).toMatch(/exceeds the buyer's maximum/i);
   });
 });

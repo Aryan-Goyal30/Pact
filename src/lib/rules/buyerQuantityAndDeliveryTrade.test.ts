@@ -251,3 +251,76 @@ describe("decideBuyerQuantityAndDeliveryTrade — urgency-calibrated delivery ex
     expect(high.deliveryDays).toBe(8); // 6 + round(6*0.3)
   });
 });
+
+// ---------------------------------------------------------------------
+// Pass 6: budgetFlexible consistency — effectiveCeiling threading.
+// ---------------------------------------------------------------------
+describe("decideBuyerQuantityAndDeliveryTrade — Pass 6: effectiveCeiling", () => {
+  // E. Hard budget (effectiveCeiling omitted, or explicitly equal to
+  // maxUnitPrice) reproduces byte-identical behavior.
+  it("E: omitting effectiveCeiling and passing it equal to maxUnitPrice produce identical results", () => {
+    const omitted = decideBuyerQuantityAndDeliveryTrade(constraints, 200000, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    const explicitMax = decideBuyerQuantityAndDeliveryTrade(
+      constraints,
+      200000,
+      50,
+      ctx(3),
+      null,
+      60,
+      false,
+      false,
+      maxDeliveryDays,
+      constraints.maxUnitPrice,
+    );
+    expect(explicitMax).toEqual(omitted);
+  });
+
+  // D. A flexible buyer's combined trade can reach a higher
+  // effectiveCeiling than its stated maxUnitPrice — same saturation
+  // technique as the two solo trades' own Pass 6 tests.
+  it("D: a higher effectiveCeiling raises the combined trade's own price ceiling above the hard maxUnitPrice", () => {
+    // Deliberately a very generous ceiling (not just barely above
+    // maxUnitPrice): the combined trade composes TWO sequential
+    // discounts (quantity then delivery), so a modestly higher ceiling
+    // can still discount back down to the same target-floor as the hard
+    // case — a large margin makes the comparison robust regardless of
+    // the exact discount-fraction math.
+    const flexibleCeiling = 100000; // well above constraints.maxUnitPrice (46000)
+    const hard = decideBuyerQuantityAndDeliveryTrade(constraints, 200000, 50, ctx(3), null, 60, false, false, maxDeliveryDays);
+    const flexible = decideBuyerQuantityAndDeliveryTrade(
+      constraints,
+      200000,
+      50,
+      ctx(3),
+      null,
+      60,
+      false,
+      false,
+      maxDeliveryDays,
+      flexibleCeiling,
+    );
+    expect(hard.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(flexible.move).toBe("QUANTITY_AND_DELIVERY_FOR_PRICE");
+    expect(hard.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    expect(flexible.unitPrice!).toBeLessThanOrEqual(flexibleCeiling);
+    expect(flexible.unitPrice!).toBeGreaterThan(hard.unitPrice!);
+  });
+
+  it("D: still respects previousBuyerUnitPrice as the tighter of the two bounds, even when effectiveCeiling is higher", () => {
+    const decision = decideBuyerQuantityAndDeliveryTrade(
+      constraints,
+      200000,
+      50,
+      ctx(3),
+      47200, // the buyer's own prior offer — below the flexible ceiling
+      60,
+      false,
+      false,
+      maxDeliveryDays,
+      52000,
+    );
+    if (decision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
+      expect(decision.unitPrice!).toBeLessThanOrEqual(47200);
+    }
+  });
+});

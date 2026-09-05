@@ -3,16 +3,20 @@ import type { NegotiationMessageType } from "@/lib/negotiation/protocol";
 import type { PublicManifestProduct } from "@/types/manifest";
 import {
   buyerThinkingLabel,
+  computeConvergenceChartData,
   computeMaxOrderValue,
+  describeTradeAnnotation,
   formatInr,
   getScenarioPresets,
   merchantThinkingLabel,
   negotiationFailureExplanation,
   negotiationMessageTypeBadgeClass,
   negotiationMessageTypeLabel,
+  negotiationPriceGap,
   negotiationStatusBadgeClass,
   negotiationStatusLabel,
   parseBuyerRequestForm,
+  type ConvergenceChartTurnInput,
   type BuyerRequestFormValues,
 } from "./negotiationUi";
 
@@ -326,5 +330,217 @@ describe("negotiationFailureExplanation", () => {
 
   it("never mentions minPrice or any private constraint in the early-end variant either", () => {
     expect(negotiationFailureExplanation("EXPIRED", 2, 6)).not.toMatch(/minprice|floor|reservation/i);
+  });
+
+  // Pass 11 addendum — impossible-budget failure explanation: when the
+  // buyer's own stated max and the merchant's own already-public final
+  // offer show a genuine remaining gap, that specific story is used
+  // instead of the generic "could not be reconciled" text.
+  describe("with a genuine buyer-max vs merchant-final-offer price gap (Pass 11 addendum)", () => {
+    it("uses the specific price-gap explanation for EXPIRED", () => {
+      const explanation = negotiationFailureExplanation("EXPIRED", 1, 6, 8000, 8550);
+      expect(explanation).toMatch(/final concession/i);
+      expect(explanation).toMatch(/walked away/i);
+      expect(explanation).not.toMatch(/could not be reconciled/i);
+      expect(explanation).not.toMatch(/maximum number of.*rounds/i);
+    });
+
+    it("never mentions minPrice/floor even in the specific price-gap explanation", () => {
+      expect(negotiationFailureExplanation("EXPIRED", 1, 6, 8000, 8550)).not.toMatch(/minprice|floor|reservation/i);
+    });
+
+    it("REJECTED keeps its own generic explanation even when a price gap is present", () => {
+      expect(negotiationFailureExplanation("REJECTED", 1, 6, 8000, 8550)).toBe(negotiationFailureExplanation("REJECTED"));
+    });
+
+    it("falls back to the generic explanation when the merchant's final offer was actually AT or BELOW the buyer's max (no real price-gap story)", () => {
+      expect(negotiationFailureExplanation("EXPIRED", 6, 6, 8000, 8000)).toBe(
+        "The maximum number of negotiation rounds was reached before both sides could agree on terms.",
+      );
+      expect(negotiationFailureExplanation("EXPIRED", 2, 6, 8000, 7500)).toBe(
+        "Negotiation ended early — the two sides' positions could not be reconciled.",
+      );
+    });
+
+    it("falls back to the generic explanation when either number is unknown", () => {
+      expect(negotiationFailureExplanation("EXPIRED", 2, 6, undefined, 8550)).toBe(
+        "Negotiation ended early — the two sides' positions could not be reconciled.",
+      );
+      expect(negotiationFailureExplanation("EXPIRED", 2, 6, 8000, undefined)).toBe(
+        "Negotiation ended early — the two sides' positions could not be reconciled.",
+      );
+    });
+  });
+});
+
+describe("negotiationPriceGap", () => {
+  it("returns the real positive gap when the merchant's final offer is above the buyer's max", () => {
+    expect(negotiationPriceGap(8000, 8550)).toBe(550);
+  });
+
+  it("returns null when the merchant's offer is at or below the buyer's max — not a price-gap failure", () => {
+    expect(negotiationPriceGap(8000, 8000)).toBeNull();
+    expect(negotiationPriceGap(8000, 7500)).toBeNull();
+  });
+
+  it("returns null when either number is undefined", () => {
+    expect(negotiationPriceGap(undefined, 8550)).toBeNull();
+    expect(negotiationPriceGap(8000, undefined)).toBeNull();
+    expect(negotiationPriceGap(undefined, undefined)).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------
+// Pass 9, Part D2 — trade annotation: a concise "what changed" line for
+// a genuine trade round, built only from two already-persisted buyer
+// terms. Never fabricated: no real dimension change -> null.
+// ---------------------------------------------------------------------
+describe("describeTradeAnnotation", () => {
+  it("describes a genuine delivery-for-price change", () => {
+    expect(
+      describeTradeAnnotation("DELIVERY_FOR_PRICE", { quantity: 7, deliveryDays: 8 }, { quantity: 7, deliveryDays: 12 }),
+    ).toBe("8 → 12 day(s) in exchange for a better price");
+  });
+
+  it("describes a genuine quantity-for-price change", () => {
+    expect(
+      describeTradeAnnotation("QUANTITY_FOR_PRICE", { quantity: 7, deliveryDays: 8 }, { quantity: 8, deliveryDays: 8 }),
+    ).toBe("7 → 8 units in exchange for a better price");
+  });
+
+  it("describes a combined quantity+delivery change", () => {
+    expect(
+      describeTradeAnnotation("QUANTITY_AND_DELIVERY_FOR_PRICE", { quantity: 7, deliveryDays: 8 }, { quantity: 9, deliveryDays: 12 }),
+    ).toBe("7 → 9 units and 8 → 12 day(s) in exchange for a better price");
+  });
+
+  it("returns null for HOLD/CONCEDE — never a fabricated annotation for an ordinary round", () => {
+    expect(describeTradeAnnotation("HOLD", { quantity: 7, deliveryDays: 8 }, { quantity: 7, deliveryDays: 8 })).toBeNull();
+    expect(describeTradeAnnotation("CONCEDE", { quantity: 7, deliveryDays: 8 }, { quantity: 7, deliveryDays: 8 })).toBeNull();
+  });
+
+  it("returns null when there is no previous round to compare against", () => {
+    expect(describeTradeAnnotation("DELIVERY_FOR_PRICE", null, { quantity: 7, deliveryDays: 12 })).toBeNull();
+  });
+
+  it("returns null when the trade move fired but the relevant dimension didn't actually change", () => {
+    expect(
+      describeTradeAnnotation("DELIVERY_FOR_PRICE", { quantity: 7, deliveryDays: 8 }, { quantity: 7, deliveryDays: 8 }),
+    ).toBeNull();
+  });
+
+  it("returns null when move is undefined", () => {
+    expect(describeTradeAnnotation(undefined, { quantity: 7, deliveryDays: 8 }, { quantity: 8, deliveryDays: 8 })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------
+// Pass 11, Objective B, item 12 — ConvergenceChart's data mapping,
+// extracted into computeConvergenceChartData so its numbers are directly
+// testable without a DOM. Every assertion here also describes what the
+// component actually renders, since the component now calls this same
+// function rather than duplicating the math.
+// ---------------------------------------------------------------------
+describe("computeConvergenceChartData", () => {
+  const turn = (
+    n: number,
+    buyerPrice: number | null,
+    merchantPrice: number | null,
+    merchantMove?: string | null,
+  ): ConvergenceChartTurnInput => ({
+    turn: n,
+    buyer: buyerPrice === null ? null : { unitPrice: buyerPrice },
+    merchant: merchantPrice === null ? null : { unitPrice: merchantPrice, move: merchantMove ?? null },
+  });
+
+  it("returns null for zero priced rounds — nothing to draw a trajectory between", () => {
+    expect(computeConvergenceChartData([], false, false)).toBeNull();
+  });
+
+  it("returns null for exactly one priced round — same as the component's own prior >= 2 gate", () => {
+    const single = [turn(1, 44175, 46541)];
+    expect(computeConvergenceChartData(single, false, false)).toBeNull();
+  });
+
+  it("renders a two-round negotiation with real gap values", () => {
+    const data = computeConvergenceChartData([turn(1, 44175, 46541), turn(2, 45492, 45492)], true, true);
+    expect(data).not.toBeNull();
+    expect(data!.rounds).toHaveLength(2);
+    expect(data!.rounds[0].gap).toBe(Math.abs(46541 - 44175));
+    expect(data!.rounds[1].gap).toBe(0);
+    expect(data!.currentGap).toBe(0);
+  });
+
+  it("renders a six-round negotiation safely, with every coordinate finite (no undefined/NaN)", () => {
+    const sixRounds = [
+      turn(1, 40000, 48000),
+      turn(2, 41000, 47000),
+      turn(3, 42000, 46000, "DELIVERY_FOR_PRICE"),
+      turn(4, 43000, 45500),
+      turn(5, 44000, 45000, "QUANTITY_FOR_PRICE"),
+      turn(6, 45000, 45000),
+    ];
+    const data = computeConvergenceChartData(sixRounds, true, true);
+    expect(data).not.toBeNull();
+    expect(data!.rounds).toHaveLength(6);
+    for (const r of data!.rounds) {
+      expect(Number.isFinite(r.buyerPoint.x)).toBe(true);
+      expect(Number.isFinite(r.buyerPoint.y)).toBe(true);
+      expect(Number.isFinite(r.merchantPoint.x)).toBe(true);
+      expect(Number.isFinite(r.merchantPoint.y)).toBe(true);
+      expect(Number.isFinite(r.gap)).toBe(true);
+    }
+  });
+
+  it("gap values correspond exactly to the real per-round unitPrice data, not an approximation", () => {
+    const data = computeConvergenceChartData([turn(1, 44175, 46541), turn(2, 45492, 45492), turn(3, 45492, 45492)], true, true);
+    expect(data!.rounds.map((r) => r.gap)).toEqual([2366, 0, 0]);
+  });
+
+  it("current-round emphasis: the last round in `rounds` is always the most recently played one, in order", () => {
+    const data = computeConvergenceChartData([turn(1, 40000, 48000), turn(2, 42000, 46000), turn(3, 45492, 45492)], true, true);
+    const lastRound = data!.rounds.at(-1)!;
+    expect(lastRound.turn).toBe(3);
+    expect(lastRound.buyerPrice).toBe(45492);
+    expect(lastRound.merchantPrice).toBe(45492);
+  });
+
+  it("flags a trade round exactly when the persisted move is a real trade type — never fabricated", () => {
+    const data = computeConvergenceChartData(
+      [turn(1, 44175, 46541, "CONCEDE"), turn(2, 44175, 45492, "DELIVERY_FOR_PRICE"), turn(3, 45492, 45492, "CONCEDE")],
+      true,
+      true,
+    );
+    expect(data!.rounds.map((r) => r.isTradeRound)).toEqual([false, true, false]);
+  });
+
+  it("does not flag HOLD/CONCEDE/ACCEPT-shaped rounds as a trade round", () => {
+    const data = computeConvergenceChartData([turn(1, 40000, 48000, "HOLD"), turn(2, 45000, 45000, "CONCEDE")], true, true);
+    expect(data!.rounds.every((r) => !r.isTradeRound)).toBe(true);
+  });
+
+  it("agreement endpoint: converged is true only with both a real Agreement AND a terminal negotiation", () => {
+    const rounds = [turn(1, 44175, 46541), turn(2, 45492, 45492)];
+    expect(computeConvergenceChartData(rounds, true, true)!.converged).toBe(true);
+    expect(computeConvergenceChartData(rounds, false, true)!.converged).toBe(false);
+    expect(computeConvergenceChartData(rounds, true, false)!.converged).toBe(false);
+  });
+
+  it("failure = unresolved separation: a terminal negotiation with no Agreement never converges, even with a real remaining gap", () => {
+    // e.g. an impossible-budget EXPIRED negotiation — the last priced
+    // round still shows a genuine, non-zero gap.
+    const data = computeConvergenceChartData([turn(1, 19000, 44000), turn(2, 19000, 44000)], false, true);
+    expect(data!.converged).toBe(false);
+    expect(data!.currentGap).toBeGreaterThan(0);
+  });
+
+  it("ignores an unpriced closing turn (e.g. a walk-away's null-priced message) when computing rounds/gaps", () => {
+    const data = computeConvergenceChartData(
+      [turn(1, 19000, 46000), turn(2, 19000, 44000), turn(3, null, null)],
+      false,
+      true,
+    );
+    expect(data!.rounds).toHaveLength(2);
+    expect(data!.currentGap).toBe(25000);
   });
 });

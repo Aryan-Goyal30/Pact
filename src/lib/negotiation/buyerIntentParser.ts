@@ -55,6 +55,14 @@ export interface BuyerIntent {
   deliveryDeadlineDays: number;
   urgency: UrgencyLevel;
   deliveryFlexible: boolean;
+  /**
+   * Pass 4: whether the buyer explicitly said `maxPrice` is a soft
+   * preference rather than a hard ceiling — see
+   * BuyerConstraints.budgetFlexible (buyerRules.ts). `maxPrice` itself
+   * remains independently required either way; this never lets the
+   * buyer omit a number, only marks the number as non-binding.
+   */
+  budgetFlexible: boolean;
 }
 
 /** A required field the parser could not confidently determine. */
@@ -101,6 +109,8 @@ function buildInstruction(catalog: PublicManifestProduct[]): string {
   return [
     `Catalog (choose the single sku the buyer most likely means, or null if nothing plausibly matches):\n${catalogLines}`,
     "",
+    "The buyer's message may span several turns of a conversation. If more than one candidate product is mentioned across it (e.g. they first said one thing and then named a different, real catalog product), treat the MOST RECENTLY stated one as authoritative — a correction, not two separate requirements.",
+    "",
     "Return ONLY a single JSON object with exactly these keys:",
     "{",
     '  "sku": string | null,',
@@ -109,11 +119,13 @@ function buildInstruction(catalog: PublicManifestProduct[]): string {
     '  "maxPrice": number | null,',
     '  "deliveryDeadlineDays": number | null,',
     '  "urgency": "low" | "medium" | "high" | null,',
-    '  "deliveryFlexible": boolean | null',
+    '  "deliveryFlexible": boolean | null,',
+    '  "budgetFlexible": boolean | null',
     "}",
     "",
-    '"maxPrice" is the buyer\'s hard ceiling per unit. If the buyer mentions a preferred/target number AND a higher number they could stretch to, the higher one is maxPrice and the lower one is targetPrice. If only one price is stated, use it as maxPrice and leave targetPrice null.',
+    '"maxPrice" is the buyer\'s stated ceiling per unit — always required whenever a price is stated at all. If the buyer mentions a preferred/target number AND a separate, higher number they could stretch to, the higher one is maxPrice and the lower one is targetPrice. If only ONE number is stated, that number is maxPrice — even when it\'s described as a "target" the buyer might exceed or stretch beyond (e.g. "45k is my target but I can stretch a little", "45k is my target but I could go higher if I have to") — do not leave maxPrice null and do not treat that one number as targetPrice merely because the word "target" was used; only set targetPrice when a genuinely separate, lower number is also given alongside a higher one.',
     '"deliveryFlexible" is true only if the buyer explicitly signals willingness to accept a later delivery date in exchange for a better price.',
+    '"budgetFlexible" is true ONLY if the buyer explicitly signals that their stated price/budget is flexible, negotiable, approximate, or that they are willing to go above it. Examples of TRUE: "My budget is around 50000 but I can stretch a little.", "I\'d prefer to stay under 50000, but the budget is flexible." Examples of FALSE (a plainly stated hard limit): "My maximum budget is 50000.", "I don\'t want to spend more than 50000.", "I\'d rather not go over 50000." Never infer flexibility merely from polite or uncertain phrasing — only an explicit signal counts. Still extract maxPrice normally either way; budgetFlexible never causes you to omit or invent a price.',
     '"urgency" reflects how time-pressured the buyer sounds — use "medium" only when genuinely unclear, "high" when the buyer stresses speed, "low" when the buyer says they can wait.',
   ].join("\n");
 }
@@ -168,14 +180,34 @@ function normalizeCandidate(
   catalog: PublicManifestProduct[],
 ): BuyerIntentParseResult {
   const quantity = toPositiveNumber(candidate.quantity, true);
-  const maxPrice = toPositiveNumber(candidate.maxPrice, false);
-  const targetPrice = toPositiveNumber(candidate.targetPrice, false);
+  let maxPrice = toPositiveNumber(candidate.maxPrice, false);
+  let targetPrice = toPositiveNumber(candidate.targetPrice, false);
   const deliveryDeadlineDays = toPositiveNumber(candidate.deliveryDeadlineDays, true);
   const urgency: UrgencyLevel =
     typeof candidate.urgency === "string" && VALID_URGENCY_LEVELS.has(candidate.urgency)
       ? (candidate.urgency as UrgencyLevel)
       : "medium";
   const deliveryFlexible = candidate.deliveryFlexible === true;
+  const budgetFlexible = candidate.budgetFlexible === true;
+
+  // Pass 6: deterministic safety net for the single-price + stretch-
+  // language ambiguity (e.g. "45k is my target but I can stretch a
+  // little") — despite the prompt instruction above, the model
+  // sometimes still files the one stated number as targetPrice and
+  // leaves maxPrice null, which would wrongly ask the buyer again for
+  // "your maximum budget" even though a flexible ceiling was already
+  // given. Only fires when budgetFlexible is true AND maxPrice is
+  // genuinely absent AND exactly one number (targetPrice) was given —
+  // a real two-number statement (a separate target AND a higher max)
+  // already has both fields populated directly by the model and is
+  // completely untouched by this. When budgetFlexible is false, a lone
+  // targetPrice with no maxPrice is left exactly as-is: that's a
+  // genuine "no ceiling stated yet" case, still correctly reported as
+  // missing.
+  if (maxPrice === null && targetPrice !== null && budgetFlexible) {
+    maxPrice = targetPrice;
+    targetPrice = null;
+  }
 
   const rawSku = typeof candidate.sku === "string" ? candidate.sku.trim() : "";
   const matchedProduct = rawSku
@@ -190,6 +222,7 @@ function normalizeCandidate(
     ...(deliveryDeadlineDays !== null ? { deliveryDeadlineDays } : {}),
     urgency,
     deliveryFlexible,
+    budgetFlexible,
   };
 
   // The model named something, but it isn't a real product — reported
@@ -232,6 +265,7 @@ function normalizeCandidate(
       deliveryDeadlineDays: deliveryDeadlineDays!,
       urgency,
       deliveryFlexible,
+      budgetFlexible,
     },
   };
 }
@@ -301,5 +335,6 @@ export function buyerIntentToSessionRequest(intent: BuyerIntent): NegotiationSes
     urgency: intent.urgency,
     deliveryFlexible: intent.deliveryFlexible,
     targetUnitPrice: intent.targetPrice,
+    budgetFlexible: intent.budgetFlexible,
   };
 }

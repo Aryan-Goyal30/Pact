@@ -5,7 +5,8 @@ import { createNegotiationSession } from "@/lib/negotiation/negotiationSessionRe
 import { ensureAgreementForSession } from "@/lib/negotiation/agreementRepository";
 import { getLlmProvider } from "@/lib/llm/provider";
 import type { BuyerConstraints } from "@/lib/rules/buyerRules";
-import { createOrderForAgreement } from "@/lib/payment/paymentService";
+import { createOrderForAgreement, verifyCheckoutPayment } from "@/lib/payment/paymentService";
+import { MOCK_VALID_SIGNATURE } from "@/types/payment";
 import { POST } from "./route";
 
 vi.mock("@/lib/llm/provider", async (importOriginal) => {
@@ -105,7 +106,14 @@ describe("POST /api/payments/webhook", () => {
     expect(agreement.status).toBe("paid");
   });
 
-  it("a valid payment.failed event resolves the matching attempt to failed, classified via the closed taxonomy", async () => {
+  // Pass 7: a webhook payment.failed event is per-PAYMENT, not per-ORDER
+  // — Razorpay's own Checkout retry may still succeed against the SAME
+  // order, so this must be recorded for audit ONLY, never terminalize
+  // the attempt/Agreement (mirrors recordReportedCheckoutFailure's own
+  // M13.2 treatment of a browser-reported decline). This replaces the
+  // pre-Pass-7 assertion that a webhook failure resolved the attempt to
+  // "failed" — that was the exact real bug this pass fixes.
+  it("a valid payment.failed event is recorded for audit only — the attempt/Agreement stay open, still resumable for a later genuine capture", async () => {
     const agreementId = await createTestAgreement();
     const order = await createOrderForAgreement(agreementId);
     const body = webhookPayload("payment.failed", order.razorpayOrderId, "pay_1", "GATEWAY_ERROR");
@@ -113,8 +121,12 @@ describe("POST /api/payments/webhook", () => {
     await callWebhook(body, { eventId: "evt_failed_1" });
 
     const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
-    expect(attempt.status).toBe("failed");
-    expect(attempt.failureReason).toBe("payment_declined");
+    expect(attempt.status).toBe("created"); // never terminalized
+    expect(attempt.failureReason).toBeNull();
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("pending_payment"); // never terminalized
+    const auditRows = await prisma.auditLog.findMany({ where: { agreementId, eventType: "PAYMENT_FAILURE_REPORTED" } });
+    expect(auditRows).toHaveLength(1); // the decline is still preserved as history
   });
 
   it("a DUPLICATE delivery of the same event is a safe no-op — no double resolution, still 200", async () => {
@@ -152,5 +164,138 @@ describe("POST /api/payments/webhook", () => {
     expect(response.status).toBe(200);
     const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
     expect(agreement.status).toBe("pending_payment"); // untouched
+  });
+});
+
+// ---------------------------------------------------------------------
+// Pass 7: payment recovery hardening — the exact real-provider bug this
+// pass fixes: PACT creates one order, Checkout fails, Razorpay/user
+// retries within the SAME still-open order, payment succeeds — and PACT
+// must NOT report "no matching unresolved payment attempt" for the
+// genuine capture.
+// ---------------------------------------------------------------------
+describe("POST /api/payments/webhook — Pass 7: failure -> retry -> success on the SAME order", () => {
+  // 1 / 3 / 7. The exact reported bug: webhook payment.failed, then
+  // webhook payment.captured, for the SAME Razorpay order.
+  it("payment.failed followed by payment.captured for the SAME order resolves the Agreement to paid — the exact real bug this pass fixes", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    const failedResponse = await callWebhook(
+      webhookPayload("payment.failed", order.razorpayOrderId, "pay_1", "GATEWAY_ERROR"),
+      { eventId: "evt_p7_failed" },
+    );
+    expect(failedResponse.status).toBe(200);
+
+    const midway = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(midway.status).toBe("pending_payment"); // never terminalized by the decline
+
+    const capturedResponse = await callWebhook(
+      webhookPayload("payment.captured", order.razorpayOrderId, "pay_2_retry"),
+      { eventId: "evt_p7_captured" },
+    );
+    expect(capturedResponse.status).toBe(200);
+
+    const finalAgreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(finalAgreement.status).toBe("paid");
+    // Exactly one PaymentAttempt/order throughout — no duplicate agreement,
+    // no second attempt.
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(1);
+    const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { agreementId } });
+    expect(attempt.status).toBe("success");
+
+    // Audit trail shows the full failure -> recovery/retry -> success
+    // history, understandable and never silently discarded.
+    const events = (
+      await prisma.auditLog.findMany({ where: { agreementId }, orderBy: { createdAt: "asc" } })
+    ).map((log) => log.eventType);
+    expect(events).toContain("PAYMENT_FAILURE_REPORTED");
+    expect(events).toContain("PAYMENT_SUCCEEDED");
+    expect(events).not.toContain("PAYMENT_FAILED"); // never a terminal-failure event for this attempt
+  });
+
+  // 5. Webhook success arriving BEFORE the client's own /verify call for
+  // the same order — the client call must then be a safe idempotent
+  // no-op, never an error, never a second transition.
+  it("webhook success before client verify success — the client call is a safe no-op reflecting the real state", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await callWebhook(webhookPayload("payment.captured", order.razorpayOrderId, "pay_webhook_first"), {
+      eventId: "evt_p7_webhook_first",
+    });
+    const afterWebhook = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(afterWebhook.status).toBe("paid");
+
+    const clientResult = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_webhook_first",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+    expect(clientResult.agreementStatus).toBe("paid"); // reflects real state, no error
+
+    expect(await prisma.auditLog.count({ where: { agreementId, eventType: "PAYMENT_SUCCEEDED" } })).toBe(1); // never double-applied
+  });
+
+  // 6. Client verify success arriving BEFORE the webhook for the same
+  // order — the webhook delivery must then be a safe idempotent no-op.
+  it("client verify success before webhook success — the webhook delivery is a safe no-op", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    const clientResult = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_client_first",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+    expect(clientResult.agreementStatus).toBe("paid");
+
+    const webhookResponse = await callWebhook(
+      webhookPayload("payment.captured", order.razorpayOrderId, "pay_client_first"),
+      { eventId: "evt_p7_client_first" },
+    );
+    expect(webhookResponse.status).toBe(200);
+
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid"); // unchanged
+    expect(await prisma.auditLog.count({ where: { agreementId, eventType: "PAYMENT_SUCCEEDED" } })).toBe(1); // never double-applied
+  });
+
+  // 8. A late failure webhook arriving AFTER a valid capture must never
+  // revert the paid Agreement — captured/paid is terminal.
+  it("a late payment.failed webhook after a successful capture can never revert the paid Agreement", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    await callWebhook(webhookPayload("payment.captured", order.razorpayOrderId, "pay_1"), { eventId: "evt_p7_success" });
+    const afterSuccess = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(afterSuccess.status).toBe("paid");
+
+    await callWebhook(webhookPayload("payment.failed", order.razorpayOrderId, "pay_1", "GATEWAY_ERROR"), {
+      eventId: "evt_p7_late_failure",
+    });
+
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid"); // unchanged — captured is terminal
+  });
+
+  // 9. GET status (page-refresh path) reflects the corrected final state
+  // — no stale "unresolved" attempt, no lost agreement.
+  it("GET status reflects paid with no resumable attempt after the failure -> success sequence, matching a page refresh", async () => {
+    const agreementId = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await callWebhook(webhookPayload("payment.failed", order.razorpayOrderId, "pay_1", "GATEWAY_ERROR"), {
+      eventId: "evt_p7_status_failed",
+    });
+    await callWebhook(webhookPayload("payment.captured", order.razorpayOrderId, "pay_2"), {
+      eventId: "evt_p7_status_captured",
+    });
+
+    const { getPaymentStatus } = await import("@/lib/payment/paymentService");
+    const status = await getPaymentStatus(agreementId);
+    expect(status.agreementStatus).toBe("paid");
+    expect(status.currentRazorpayOrderId).toBeNull(); // nothing left unresolved
+    expect(status.attempts).toHaveLength(1);
+    expect(status.attempts[0].status).toBe("success");
   });
 });

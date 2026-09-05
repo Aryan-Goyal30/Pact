@@ -13,6 +13,7 @@
 
 import {
   createPaymentAttempt,
+  findResolvableAttemptForSuccess,
   findUnresolvedAttempt,
   listPaymentAttempts,
   loadAgreementForPayment,
@@ -249,6 +250,18 @@ export interface VerifyCheckoutInput {
  * request, or an attempt to verify one Agreement's payment against
  * another's order) is rejected outright as VerificationMismatchError,
  * never partially trusted.
+ *
+ * Pass 7: when no "created" attempt matches, a genuine SUCCESS claim
+ * (razorpayPaymentId + razorpaySignature both present — a mere failure
+ * report never gets this fallback, since it has nothing to verify) gets
+ * one more chance via findResolvableAttemptForSuccess — the same
+ * Agreement, the same order id, but the attempt may already read
+ * "failed". This is what lets a genuine later capture still resolve an
+ * attempt that was prematurely/legitimately marked failed, instead of
+ * being rejected as VerificationMismatchError. Still requires an EXACT
+ * (agreementId, razorpayOrderId) match and still requires the signature
+ * to verify — this never weakens verification, it only widens WHICH
+ * attempt row a verified success is allowed to resolve.
  */
 export async function verifyCheckoutPayment(
   agreementId: string,
@@ -259,8 +272,15 @@ export async function verifyCheckoutPayment(
     throw new AgreementNotFoundError(agreementId);
   }
 
-  const attempt = await findUnresolvedAttempt(agreementId);
-  if (!attempt || attempt.razorpayOrderId !== input.razorpayOrderId) {
+  const isSuccessClaim = Boolean(input.razorpayPaymentId && input.razorpaySignature);
+  let attempt = await findUnresolvedAttempt(agreementId);
+  if (attempt && attempt.razorpayOrderId !== input.razorpayOrderId) {
+    attempt = null; // the currently-open attempt belongs to a different order — never trust it
+  }
+  if (!attempt && isSuccessClaim) {
+    attempt = await findResolvableAttemptForSuccess(agreementId, input.razorpayOrderId);
+  }
+  if (!attempt) {
     throw new VerificationMismatchError();
   }
 

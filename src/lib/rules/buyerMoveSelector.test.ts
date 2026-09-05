@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { decideBuyerConcessionMove } from "./buyerMoveSelector";
+import { computeBuyerConcessionPrice } from "@/lib/rules/buyerRules";
 import type { BuyerConcessionContext, BuyerConstraints } from "@/lib/rules/buyerRules";
 
 const constraints: BuyerConstraints = {
@@ -18,6 +19,43 @@ describe("decideBuyerConcessionMove — final rounds always concede (unchanged s
     const decision = decideBuyerConcessionMove(constraints, 47000, ctx(7, 8), 47500, 44000, 90);
     expect(decision.move).toBe("CONCEDE");
     expect(decision.unitPrice).toBe(constraints.maxUnitPrice);
+  });
+
+  // Pass 4: budgetFlexible / effectiveCeiling.
+  describe("Pass 4 — effectiveCeiling", () => {
+    it("omitting effectiveCeiling reproduces the exact maxUnitPrice capitulation (hard budget, unchanged)", () => {
+      const decision = decideBuyerConcessionMove(constraints, 47000, ctx(7, 8), 47500, 44000, 90);
+      expect(decision.unitPrice).toBe(constraints.maxUnitPrice);
+    });
+
+    it("a higher effectiveCeiling lets the final-round capitulation go above the stated maxUnitPrice", () => {
+      const decision = decideBuyerConcessionMove(constraints, 47000, ctx(7, 8), 47500, 44000, 90, 50000);
+      expect(decision.move).toBe("CONCEDE");
+      expect(decision.unitPrice).toBe(50000);
+      expect(decision.unitPrice).toBeGreaterThan(constraints.maxUnitPrice);
+    });
+
+    // The two independent final-round implementations (this module's own
+    // capitulation branch, and buyerRules.computeBuyerConcessionPrice's
+    // own roundsLeft<=2 branch) must never drift apart for the same
+    // effectiveCeiling — this is the exact regression guard Pass 4 asks
+    // for.
+    it("the final-round price matches computeBuyerConcessionPrice's own final-round result for the same effectiveCeiling", () => {
+      const concessionContext: BuyerConcessionContext = { round: 7, maxRounds: 8 };
+      const flexibleCeiling = 50000;
+      const fromMoveSelector = decideBuyerConcessionMove(constraints, 47000, concessionContext, 47500, 44000, 90, flexibleCeiling);
+      const fromConcessionPrice = computeBuyerConcessionPrice(constraints, 47000, concessionContext, flexibleCeiling);
+      expect(fromMoveSelector.unitPrice).toBe(fromConcessionPrice);
+    });
+
+    it("a flexible buyer's CONCEDE price outside the final rounds also stays consistent with computeBuyerConcessionPrice for the same effectiveCeiling", () => {
+      const concessionContext: BuyerConcessionContext = { round: 3, maxRounds: 8 };
+      const flexibleCeiling = 50000;
+      const decision = decideBuyerConcessionMove(constraints, 46800, concessionContext, 47500, 44000, undefined, flexibleCeiling);
+      expect(decision.move).toBe("CONCEDE");
+      const expected = computeBuyerConcessionPrice(constraints, 46800, concessionContext, flexibleCeiling);
+      expect(decision.unitPrice).toBe(expected);
+    });
   });
 });
 

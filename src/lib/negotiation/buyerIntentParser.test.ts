@@ -53,6 +53,7 @@ describe("parseBuyerIntent", () => {
         deliveryDeadlineDays: 5,
         urgency: "high",
         deliveryFlexible: false,
+        budgetFlexible: false,
       }),
     );
 
@@ -72,6 +73,7 @@ describe("parseBuyerIntent", () => {
       deliveryDeadlineDays: 5,
       urgency: "high",
       deliveryFlexible: false,
+      budgetFlexible: false,
     });
   });
 
@@ -220,6 +222,58 @@ describe("parseBuyerIntent", () => {
     expect(mockedGenerateAgentMessage).not.toHaveBeenCalled();
   });
 
+  // Pass 4: budgetFlexible extraction.
+  it("carries a genuinely stated budget flexibility through, distinct from the false default", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: null,
+        maxPrice: 50000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: true,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "I'd prefer to stay around ₹50,000 for 5 laptops, within 10 days, but my budget is flexible.",
+      catalog,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.budgetFlexible).toBe(true);
+    // The stated number is still extracted normally — flexibility never
+    // causes maxPrice to be omitted or invented.
+    expect(result.intent.maxPrice).toBe(50000);
+  });
+
+  it("defaults budgetFlexible to false for a plainly stated hard maximum", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: null,
+        maxPrice: 50000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: false,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "I don't want to spend more than ₹50,000 on 5 laptops, within 10 days.",
+      catalog,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.budgetFlexible).toBe(false);
+  });
+
   it("defaults urgency to medium and deliveryFlexible to false when genuinely unstated — never fabricating a stronger preference", async () => {
     mockedGenerateAgentMessage.mockResolvedValue(
       JSON.stringify({
@@ -242,6 +296,150 @@ describe("parseBuyerIntent", () => {
   });
 });
 
+// Pass 6: resolving the single-price + stretch-language ambiguity, where
+// the model sometimes files the buyer's one stated number as targetPrice
+// and leaves maxPrice null even though the buyer effectively stated a
+// (flexible) ceiling.
+describe("parseBuyerIntent — Pass 6: single-price + stretch language", () => {
+  // A. Single price + stretch language: the model returns exactly what a
+  // real Gemini call was observed to return for "45k is my target but I
+  // can stretch a little" (targetPrice set, maxPrice null, budgetFlexible
+  // true) — the deterministic post-processing must recover maxPrice from
+  // targetPrice rather than reporting it missing.
+  it("recovers maxPrice from targetPrice when budgetFlexible is true and only one number was given", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: 45000,
+        maxPrice: null,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: true,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "5 laptops within 10 days, 45k is my target but I can stretch a little.",
+      catalog,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.maxPrice).toBe(45000);
+    expect(result.intent.targetPrice).toBeUndefined();
+    expect(result.intent.budgetFlexible).toBe(true);
+  });
+
+  it("also recovers maxPrice for 'could go higher' phrasing, same shape", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: 45000,
+        maxPrice: null,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: true,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "5 laptops within 10 days, 45k is my target but I could go higher if I have to.",
+      catalog,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.maxPrice).toBe(45000);
+    expect(result.intent.targetPrice).toBeUndefined();
+  });
+
+  // B. A genuine two-number statement (separate target AND a higher max)
+  // must be completely untouched by the recovery logic — both fields
+  // stay exactly as the model reported them.
+  it("preserves a genuine separate target and maximum when both are given", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: 40000,
+        maxPrice: 45000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: true,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "5 laptops within 10 days, target 40k, but I can go up to 45k.",
+      catalog,
+    );
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.targetPrice).toBe(40000);
+    expect(result.intent.maxPrice).toBe(45000);
+  });
+
+  // C. Hard-budget language (no flexibility signaled) — a single number
+  // reported directly as maxPrice is untouched (nothing to recover).
+  it("leaves a plainly-stated hard maximum untouched", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: null,
+        maxPrice: 45000,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: false,
+      }),
+    );
+
+    const result = await parseBuyerIntent("5 laptops within 10 days, 45k max, don't exceed it.", catalog);
+
+    expect(result.status).toBe("ok");
+    if (result.status !== "ok") throw new Error("expected ok");
+    expect(result.intent.maxPrice).toBe(45000);
+    expect(result.intent.targetPrice).toBeUndefined();
+    expect(result.intent.budgetFlexible).toBe(false);
+  });
+
+  // The recovery must NEVER fire when budgetFlexible is false — a lone
+  // targetPrice with no stated ceiling and no flexibility signal is a
+  // genuine "still need your maximum budget" case, not this ambiguity.
+  it("does NOT recover maxPrice from targetPrice when budgetFlexible is false — still reports maxPrice missing", async () => {
+    mockedGenerateAgentMessage.mockResolvedValue(
+      JSON.stringify({
+        sku: "LAPTOP-14-I5",
+        quantity: 5,
+        targetPrice: 45000,
+        maxPrice: null,
+        deliveryDeadlineDays: 10,
+        urgency: "medium",
+        deliveryFlexible: false,
+        budgetFlexible: false,
+      }),
+    );
+
+    const result = await parseBuyerIntent(
+      "5 laptops within 10 days, I'm hoping for around 45k.",
+      catalog,
+    );
+
+    expect(result.status).toBe("missing_fields");
+    if (result.status !== "missing_fields") throw new Error("expected missing_fields");
+    expect(result.missingFields).toEqual(["maxPrice"]);
+    expect(result.understood.maxPrice).toBeUndefined();
+    expect(result.understood.targetPrice).toBe(45000);
+  });
+});
+
 // 7. The resulting structured intent maps correctly onto the existing
 // negotiation request shape (NegotiationSessionCreateRequest) — the
 // same request the existing structured form already sends to the
@@ -257,6 +455,7 @@ describe("buyerIntentToSessionRequest", () => {
       deliveryDeadlineDays: 5,
       urgency: "high",
       deliveryFlexible: false,
+      budgetFlexible: false,
     });
 
     expect(request).toEqual({
@@ -267,6 +466,7 @@ describe("buyerIntentToSessionRequest", () => {
       urgency: "high",
       deliveryFlexible: false,
       targetUnitPrice: 1200,
+      budgetFlexible: false,
     });
   });
 
@@ -279,9 +479,26 @@ describe("buyerIntentToSessionRequest", () => {
       deliveryDeadlineDays: 2,
       urgency: "high",
       deliveryFlexible: false,
+      budgetFlexible: false,
     });
 
     expect(request.targetUnitPrice).toBeUndefined();
     expect(JSON.stringify(request)).not.toContain("targetUnitPrice");
+  });
+
+  // Pass 4: budgetFlexible maps straight through, mirroring deliveryFlexible.
+  it("maps budgetFlexible: true through unchanged", () => {
+    const request = buyerIntentToSessionRequest({
+      sku: "LAPTOP-14-I5",
+      productName: "14-inch Business Laptop (i5, 16GB RAM)",
+      quantity: 5,
+      maxPrice: 50000,
+      deliveryDeadlineDays: 10,
+      urgency: "medium",
+      deliveryFlexible: false,
+      budgetFlexible: true,
+    });
+
+    expect(request.budgetFlexible).toBe(true);
   });
 });

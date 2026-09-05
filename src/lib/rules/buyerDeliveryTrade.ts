@@ -110,6 +110,16 @@ export function decideBuyerDeliveryTrade(
   buyerLeverageScore: number | undefined,
   deliveryTradeAlreadyUsed: boolean,
   maxDeliveryDays: number,
+  /**
+   * Pass 6 (budgetFlexible consistency): the buyer's resolved effective
+   * price bound for this round (resolveEffectiveBudgetCeiling,
+   * buyerRules.ts) — replaces constraints.maxUnitPrice as this trade's
+   * own ceiling, both for its baseline `normalAsk` and its upper-bound
+   * clamp, mirroring decideBuyerQuantityTrade's own Pass 6 change.
+   * Defaults to constraints.maxUnitPrice, so a hard-budget buyer (or any
+   * caller that predates this parameter) behaves exactly as before.
+   */
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerDeliveryTradeDecision {
   const noTrade = (reason: string): BuyerDeliveryTradeDecision => ({
     move: "NO_TRADE",
@@ -158,12 +168,12 @@ export function decideBuyerDeliveryTrade(
     // new trade type or a silently-truncated one.
     return noTrade("The merchant's maximum delivery window leaves no real slack beyond the buyer's own deadline to trade.");
   }
-  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
+  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext, effectiveCeiling);
   const askMultiplier = resolveLeverageAskMultiplier(buyerLeverageScore);
   const upperBound =
     previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
-      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
-      : constraints.maxUnitPrice;
+      ? Math.min(effectiveCeiling, previousBuyerUnitPrice)
+      : effectiveCeiling;
   const tradeUnitPrice = clamp(
     Math.round(normalAsk * (1 - DELIVERY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier)),
     target,

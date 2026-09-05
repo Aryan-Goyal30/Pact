@@ -101,6 +101,15 @@ export function buildMockVerifyRequestBody(order: PaymentOrderResponseDTO): Veri
   return { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" };
 }
 
+/** Same convention as every other formatInr in the app (negotiationUi.ts, dashboardUi.ts, buyerConversationUi.ts) — a small local copy, not a cross-import, matching this codebase's own established pattern for this trivial pure formatter. */
+export function formatInr(amount: number): string {
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 0,
+  }).format(amount);
+}
+
 export function attemptProgressLabel(attemptNumber: number, isRecovery: boolean, maxAttempts: number): string {
   return isRecovery
     ? `Attempt ${attemptNumber} of ${maxAttempts} (Recovery)`

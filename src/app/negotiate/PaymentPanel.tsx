@@ -21,6 +21,7 @@ import {
   buildCheckoutSuccessRequestBody,
   buildFailureReportRequestBody,
   buildMockVerifyRequestBody,
+  formatInr,
   paymentFailureLabel,
   paymentStatusLabel,
   type FailureReportRequestBody,
@@ -51,6 +52,18 @@ interface RazorpayCheckoutOptions {
   description?: string;
   handler: (response: RazorpayCheckoutHandlerResponse) => void;
   modal?: { ondismiss?: () => void };
+  /**
+   * Presentation only — official Razorpay Standard Checkout configuration
+   * (never a CSS/DOM hack against the cross-origin checkout iframe).
+   * `color` tints Razorpay's own header/CTA chrome to PACT's accent;
+   * `backdrop_color` sets RAZORPAY'S OWN backdrop layer (distinct from
+   * PACT's own dimmed backdrop below) to a dark tone so the two don't
+   * visually seam. The checkout card's own interior — the payment
+   * method list/card-entry form — is Razorpay-controlled cross-origin
+   * content and is not reachable or restyled by either option; see this
+   * file's own investigation notes.
+   */
+  theme?: { color?: string; backdrop_color?: string };
 }
 
 interface RazorpayCheckoutInstance {
@@ -85,11 +98,23 @@ type PanelPhase = "idle" | "starting" | "awaiting_checkout" | "verifying" | "err
 interface PaymentPanelProps {
   agreementId: string;
   productName: string;
+  /**
+   * Real, already-known agreement terms — passed straight through from
+   * AgreementFocal's own PersistedAgreementDTO (NegotiationDemo.tsx),
+   * never re-fetched here. Optional purely so this panel stays usable
+   * anywhere that context isn't available; when present, they drive the
+   * "Secure payment" transition card's real quantity/unit-price/total
+   * line — never fabricated, never derived from the Razorpay order
+   * (which only carries the total in paise, no quantity/unit breakdown).
+   */
+  quantity?: number;
+  unitPrice?: number;
+  totalAmount?: number;
   /** Presentation-only: resets NegotiationDemo's local UI state so a settled deal doesn't strand the user — see NegotiationDemo.tsx's own handleStartOver. Optional so this panel stays usable anywhere a "start over" concept doesn't apply. */
   onStartOver?: () => void;
 }
 
-export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentPanelProps) {
+export function PaymentPanel({ agreementId, productName, quantity, unitPrice, totalAmount, onStartOver }: PaymentPanelProps) {
   const [status, setStatus] = useState<PaymentStatusResponseDTO | null>(null);
   const [phase, setPhase] = useState<PanelPhase>("idle");
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -146,11 +171,24 @@ export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentP
   // logic, order data, or Checkout option changes anywhere in this
   // effect — purely a same-page presentation guarantee.
   useEffect(() => {
-    if (phase !== "awaiting_checkout") return;
-    const previousOverflow = document.body.style.overflow;
+    // Redesign: also locks during "starting" (the order-creation network
+    // round trip right after clicking Pay Now), not just once Checkout is
+    // actually open — closes the brief plain-page gap between clicking
+    // and Checkout appearing that previously showed no dimming at all.
+    if (phase !== "starting" && phase !== "awaiting_checkout") return;
     document.body.style.overflow = "hidden";
+    // Deliberately restores to "" (this app's own true rest state — see
+    // globals.css/layout.tsx, nothing else in this codebase ever sets
+    // body.style.overflow) rather than a captured "previous value".
+    // Capturing-and-restoring is the textbook footgun here: React 19's
+    // Strict Mode double-invokes this effect in development
+    // (setup -> cleanup -> setup again) on the SAME phase transition, so
+    // a second invocation's "previous value" would read back whatever
+    // the FIRST invocation just set ("hidden") instead of the real
+    // original — leaving the page permanently scroll-locked after a
+    // real dismiss, confirmed live via Razorpay's own "Yes, exit" flow.
     return () => {
-      document.body.style.overflow = previousOverflow;
+      document.body.style.overflow = "";
     };
   }, [phase]);
 
@@ -265,6 +303,9 @@ export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentP
           handler: (response) => {
             void submitVerification(buildCheckoutSuccessRequestBody(response));
           },
+          // Presentation-only Standard Checkout config — see this option's
+          // own doc comment above. Not an order/amount/handler change.
+          theme: { color: "#c98f4f", backdrop_color: "rgba(10, 10, 12, 0.92)" },
           modal: {
             ondismiss: () => {
               // The modal actually closed (success, the user closed it
@@ -388,17 +429,53 @@ export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentP
 
   const isSettled = status.agreementStatus === "paid" || status.agreementStatus === "recovered";
 
-  // Our own explicit dimmed overlay, present for exactly the lifetime of
-  // Razorpay's real Checkout — see the "awaiting_checkout" scroll-lock
-  // effect above for why this exists alongside (never instead of) the
-  // real Checkout.js overlay. z-40 sits below Razorpay's own
-  // (~10000+) iframe so its modal always renders on top of this dim
-  // layer, which sits above the rest of the negotiation page.
-  const checkoutBackdrop = phase === "awaiting_checkout" && (
-    <div
-      aria-hidden
-      className="animate-fade-in fixed inset-0 z-40 bg-black/70 backdrop-blur-[2px]"
-    />
+  // Our own explicit dimmed overlay, present from the moment "Pay Now" is
+  // clicked (phase "starting" — the order-creation round trip) through
+  // the lifetime of Razorpay's real Checkout ("awaiting_checkout") — see
+  // the scroll-lock effect above for why both phases are covered. z-40
+  // sits below Razorpay's own (~2147483647) iframe container so its
+  // modal always renders on top of this dim layer — confirmed live via
+  // direct DOM inspection (see this file's own investigation notes) —
+  // which sits above the rest of the negotiation page.
+  //
+  // The richer "Secure payment" card below is deliberately shown ONLY
+  // during "starting": that's the one window where PACT's own backdrop
+  // is actually the thing on screen (before Razorpay's real, full-
+  // viewport iframe opens and covers it). Once "awaiting_checkout"
+  // begins, this renders nothing but the plain dim layer — Razorpay's
+  // real checkout is the payment surface at that point, and duplicating
+  // any of its own form/copy would be misleading given it already fully
+  // occludes this backdrop.
+  const checkoutBackdrop = (phase === "starting" || phase === "awaiting_checkout") && (
+    <div aria-hidden className="animate-fade-in fixed inset-0 z-40 flex items-center justify-center bg-black/70 backdrop-blur-[2px]">
+      {phase === "starting" && (
+        <div className="mx-4 flex w-full max-w-xs flex-col gap-4 rounded-2xl border border-border bg-surface p-6 text-center">
+          <p className="text-[11px] font-semibold tracking-widest text-accent uppercase">Secure payment</p>
+          <div className="flex flex-col gap-1">
+            <p className="text-sm text-muted">Your agreement is ready.</p>
+            <p className="text-base font-medium text-foreground">{productName}</p>
+            {quantity !== undefined && unitPrice !== undefined && (
+              <p className="tabular-nums text-sm text-muted">
+                {quantity} × {formatInr(unitPrice)}
+              </p>
+            )}
+          </div>
+          {totalAmount !== undefined && (
+            <div className="border-t border-border pt-3">
+              <p className="text-xs text-muted">Total</p>
+              <p className="tabular-nums text-2xl font-semibold text-foreground">{formatInr(totalAmount)}</p>
+            </div>
+          )}
+          <p className="flex items-center justify-center gap-2 text-sm font-medium text-foreground/80">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+            Opening secure checkout…
+          </p>
+          <div className="border-t border-border pt-3">
+            <p className="text-xs text-muted">Protected by Razorpay</p>
+          </div>
+        </div>
+      )}
+    </div>
   );
 
   if (isSettled) {
@@ -406,8 +483,29 @@ export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentP
       <div className="animate-fade-in flex flex-col gap-4 rounded-xl border border-emerald-500/25 bg-emerald-400/[.05] p-5">
         <div>
           <p className="text-xs font-semibold tracking-widest text-emerald-300 uppercase">Transaction complete</p>
-          <p className="mt-1 text-lg font-medium text-foreground">Deal completed.</p>
+          <p className="mt-1 text-lg font-medium text-foreground">Payment complete.</p>
         </div>
+
+        {/* Real order context — the same quantity/unitPrice/totalAmount
+            AgreementFocal already threads through as props, never
+            re-fetched or recomputed here. Absent entirely (rather than
+            showing "—") when a caller doesn't supply them, same as the
+            "starting" transition card above. */}
+        {(productName || (quantity !== undefined && unitPrice !== undefined) || totalAmount !== undefined) && (
+          <div className="flex flex-wrap items-end justify-between gap-3 border-b border-emerald-500/20 pb-4">
+            <div className="flex flex-col gap-1">
+              {productName && <p className="text-sm font-medium text-foreground">{productName}</p>}
+              {quantity !== undefined && unitPrice !== undefined && (
+                <p className="tabular-nums text-sm text-muted">
+                  {quantity} × {formatInr(unitPrice)}
+                </p>
+              )}
+            </div>
+            {totalAmount !== undefined && (
+              <p className="tabular-nums text-2xl font-semibold text-emerald-300">{formatInr(totalAmount)}</p>
+            )}
+          </div>
+        )}
 
         <ul className="flex flex-col gap-1.5 text-sm text-foreground">
           <li className="flex items-center gap-2">
@@ -442,9 +540,30 @@ export function PaymentPanel({ agreementId, productName, onStartOver }: PaymentP
     );
   }
 
+  // Shown when the user has returned here having genuinely attempted
+  // payment before (a real PaymentAttempt exists — status="created" from
+  // a dismissed/abandoned Checkout, or "failed") and isn't mid-action
+  // right now. Not a new payment state: `status`/`totalAmount` are the
+  // exact same real, already-fetched values the row below already uses
+  // — this is presentation only, making the "you're returning from
+  // checkout, the agreement is still here" moment legible rather than
+  // silently reappearing identical to the very first "Pay Now" view.
+  const returnedFromAttempt = latestAttempt && !busy && (
+    <div className="flex flex-col gap-2">
+      <div>
+        <p className="text-xs font-semibold tracking-widest text-muted uppercase">Payment not completed</p>
+        <p className="text-xs text-muted">Your agreement is still active.</p>
+      </div>
+      {totalAmount !== undefined && (
+        <p className="text-2xl font-semibold tabular-nums text-foreground">{formatInr(totalAmount)}</p>
+      )}
+    </div>
+  );
+
   return (
     <div className="flex flex-col gap-3 border-t border-border pt-5">
       {checkoutBackdrop}
+      {returnedFromAttempt}
       <div className="flex items-center justify-between">
         <span className="text-sm font-medium text-foreground">{paymentStatusLabel(status.agreementStatus)}</span>
         {latestAttempt && (

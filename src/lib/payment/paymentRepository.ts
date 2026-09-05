@@ -122,6 +122,72 @@ export async function findUnresolvedAttemptByOrderId(razorpayOrderId: string): P
   return row ? toAttemptRow(row) : null;
 }
 
+/**
+ * Pass 7 (payment recovery hardening) — the most recent PaymentAttempt
+ * for an Agreement whose razorpayOrderId matches, in ANY status — used
+ * ONLY as a fallback lookup for a genuine SUCCESS report (checkout
+ * verification), never for a failure report and never as a replacement
+ * for findUnresolvedAttempt's own primary role.
+ *
+ * Two things this fallback exists to cover, both real:
+ *
+ *  1. "A failed ATTEMPT is not necessarily a failed ORDER." Razorpay's
+ *     own Checkout retry keeps a declined order usable, and this
+ *     codebase has legitimate ways an attempt can already be "failed"
+ *     when a later genuine capture arrives for the SAME order — a
+ *     reported checkout failure submitted through verify's own
+ *     reportedFailureCode path, or (rare) an invalid-signature
+ *     verification. Without this fallback, that later genuine success
+ *     would be rejected as VerificationMismatchError even though the
+ *     payment is real.
+ *  2. A genuine success report arriving for an attempt that has ALREADY
+ *     been resolved to "success" by the OTHER path (e.g. the webhook
+ *     settled it moments before the browser's own checkout `handler`
+ *     fires /verify for the same payment) must still be findable so
+ *     resolvePaymentAttempt's own idempotent no-op logic can return the
+ *     real current state, instead of this lookup itself manufacturing a
+ *     spurious "no matching attempt" error for a call that is actually
+ *     completely safe.
+ *
+ * Still requires an EXACT match on both agreementId and razorpayOrderId
+ * — this can never resolve one Agreement's payment against another's
+ * order, and resolvePaymentAttempt's own guard (status='created' OR
+ * 'failed' for the actual write) is what keeps this read-only widening
+ * from ever letting a success outcome apply twice.
+ */
+export async function findResolvableAttemptForSuccess(
+  agreementId: string,
+  razorpayOrderId: string,
+): Promise<PaymentAttemptRow | null> {
+  const row = await prisma.paymentAttempt.findFirst({
+    where: { agreementId, razorpayOrderId },
+    orderBy: { attemptNumber: "desc" },
+  });
+  return row ? toAttemptRow(row) : null;
+}
+
+/**
+ * Same as findResolvableAttemptForSuccess, but keyed by razorpayOrderId
+ * alone — used ONLY by the webhook handler, which (like
+ * findUnresolvedAttemptByOrderId) never receives an Agreement id from
+ * its caller at all. Closes the exact real bug this pass fixes: a
+ * webhook payment.captured event arriving for an order whose only
+ * PaymentAttempt row already reads "failed" (e.g. from a stale earlier
+ * failure report) must still resolve it, not be silently dropped — and,
+ * symmetrically, one arriving for an order already "success" (settled
+ * by the client path first) is still found so it can be recognized and
+ * recorded as the safe duplicate it is.
+ */
+export async function findResolvableAttemptByOrderIdForSuccess(
+  razorpayOrderId: string,
+): Promise<PaymentAttemptRow | null> {
+  const row = await prisma.paymentAttempt.findFirst({
+    where: { razorpayOrderId },
+    orderBy: { attemptNumber: "desc" },
+  });
+  return row ? toAttemptRow(row) : null;
+}
+
 function toAttemptRow(row: {
   id: string;
   agreementId: string;
@@ -254,7 +320,16 @@ export interface ResolvePaymentAttemptResult {
  * what guarantees the two paths can never disagree or race each other
  * into a contradictory state. Two conditional updates, one transaction:
  *
- *  1. PaymentAttempt: `UPDATE ... SET status=outcome WHERE id=? AND status='created'`.
+ *  1. PaymentAttempt: `UPDATE ... SET status=outcome WHERE id=? AND status='created'`
+ *     — EXCEPT for a "success" outcome (Pass 7), whose WHERE clause
+ *     additionally accepts `status='failed'`: "a failed ATTEMPT is not
+ *     necessarily a failed ORDER" — a genuine later capture for the same
+ *     Razorpay order must still be able to resolve an attempt that was
+ *     already marked failed (see findResolvableAttemptForSuccess's own
+ *     doc comment for the two legitimate ways that can happen). A
+ *     "failed" outcome's own WHERE clause is UNCHANGED (`status='created'`
+ *     only) — an attempt that has already settled, to either success or
+ *     failed, can never be re-terminalized by a later failure report.
  *     If this affects 0 rows, the attempt had already settled (by the
  *     other path, or a duplicate delivery of this same one) — `applied`
  *     comes back false and NOTHING ELSE in this function runs; the
@@ -284,8 +359,13 @@ export async function resolvePaymentAttempt(
   input: ResolvePaymentAttemptInput,
 ): Promise<ResolvePaymentAttemptResult> {
   return prisma.$transaction(async (tx) => {
+    // Pass 7: a success outcome may resolve an attempt currently
+    // "created" OR already "failed" (see this function's own doc
+    // comment); a failure outcome is unchanged — only "created".
+    const attemptWhereStatus =
+      input.outcome === "success" ? { in: ["created", "failed"] } : "created";
     const attemptUpdate = await tx.paymentAttempt.updateMany({
-      where: { id: input.attempt.id, status: "created" },
+      where: { id: input.attempt.id, status: attemptWhereStatus },
       data: {
         status: input.outcome,
         failureReason: input.outcome === "failed" ? (input.failureReason ?? "unknown") : null,
@@ -316,9 +396,19 @@ export async function resolvePaymentAttempt(
 
     if (input.outcome === "success") {
       const toStatus: AgreementPaymentStatus = isRecovery ? "recovered" : "paid";
-      const fromStatus: AgreementPaymentStatus = isRecovery ? "failed" : "pending_payment";
+      // Pass 7: a non-recovery attempt's success may promote the
+      // Agreement from EITHER "pending_payment" (the normal case) OR
+      // "failed" (the attempt itself had already been marked failed —
+      // see this function's own doc comment — and this same, ORIGINAL
+      // attempt is now resolving to a genuine success, so it still
+      // reaches "paid", never "recovered", since no recovery attempt was
+      // actually used). A recovery attempt's own precondition already
+      // requires "failed" — unchanged.
+      const fromStatuses: AgreementPaymentStatus[] = isRecovery
+        ? ["failed"]
+        : ["pending_payment", "failed"];
       const agreementUpdate = await tx.agreement.updateMany({
-        where: { id: input.attempt.agreementId, status: fromStatus },
+        where: { id: input.attempt.agreementId, status: { in: fromStatuses } },
         data: { status: toStatus },
       });
       // If 0 rows matched, the Agreement had already moved on (e.g. it
@@ -362,6 +452,11 @@ export async function resolvePaymentAttempt(
           outcome: input.outcome,
           failureReason: input.outcome === "failed" ? (input.failureReason ?? "unknown") : undefined,
           razorpayPaymentId: input.razorpayPaymentId,
+          // Pass 7: makes the audit trail explicit whenever a success
+          // resolved an attempt that had previously been marked failed
+          // (rather than the normal "created" case) — factual metadata
+          // only, no inferred reasoning.
+          resolvedFromFailedAttempt: input.outcome === "success" && input.attempt.status === "failed" ? true : undefined,
         }),
       },
     });

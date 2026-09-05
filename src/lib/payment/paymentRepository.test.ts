@@ -273,16 +273,44 @@ describe("resolvePaymentAttempt — the core state-transition function", () => {
     expect(agreement.status).toBe("paid"); // unchanged — never regressed
   });
 
-  it("success after a prior failure on the SAME (settled) attempt object is also a safe no-op — recovery is the correct path for that, not re-resolving attempt 1", async () => {
+  // Pass 7 (payment recovery hardening): "a failed ATTEMPT is not
+  // necessarily a failed ORDER" — a genuine success for the SAME
+  // attempt/order must still resolve it to "paid" even after an earlier
+  // failure, rather than being a permanent dead end recoverable only
+  // through a brand-new recovery attempt. This replaces the pre-Pass-7
+  // assertion that this was a no-op — that was the exact real bug
+  // (webhook payment.failed racing a legitimate retry-and-succeed) this
+  // pass fixes.
+  it("success after a prior failure on the SAME attempt/order resolves it to paid — the exact Pass 7 fix", async () => {
     const { agreementId } = await createTestAgreement();
     const { attempt } = await createPaymentAttempt({ agreementId, attemptNumber: 1, isRecovery: false, razorpayOrderId: "order_1" });
     await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason: "payment_declined", source: "verify" });
 
     const result = await resolvePaymentAttempt({ attempt, outcome: "success", razorpayPaymentId: "pay_1", source: "webhook" });
 
-    expect(result.applied).toBe(false);
+    expect(result.applied).toBe(true);
+    expect(result.attemptStatus).toBe("success");
+    expect(result.agreementStatus).toBe("paid");
     const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
-    expect(agreement.status).toBe("failed"); // unchanged by the stale success report on the settled attempt
+    expect(agreement.status).toBe("paid");
+    const persistedAttempt = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+    expect(persistedAttempt.status).toBe("success");
+    // Exactly ONE attempt row throughout — resolved in place, never a
+    // second (recovery) attempt created for this.
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(1);
+  });
+
+  it("a failure outcome can NEVER re-apply to an attempt that has already settled (to either success or failed) — unchanged", async () => {
+    const { agreementId } = await createTestAgreement();
+    const { attempt } = await createPaymentAttempt({ agreementId, attemptNumber: 1, isRecovery: false, razorpayOrderId: "order_1" });
+    await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason: "payment_declined", source: "verify" });
+
+    // A second, late failure report for the same already-failed attempt.
+    const result = await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason: "timeout", source: "webhook" });
+
+    expect(result.applied).toBe(false);
+    const persistedAttempt = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt.id } });
+    expect(persistedAttempt.failureReason).toBe("payment_declined"); // the first reason, never overwritten
   });
 });
 

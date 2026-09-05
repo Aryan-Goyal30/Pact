@@ -28,6 +28,7 @@ import type { PublicManifestProduct } from "@/types/manifest";
 import type { NegotiationResult, ProposedAgreement } from "@/lib/rules/negotiationEngine";
 import {
   resolveBuyerTarget,
+  resolveEffectiveBudgetCeiling,
   validateMerchantProposal,
   type BuyerConcessionContext,
   type BuyerConstraints,
@@ -219,6 +220,16 @@ function buildResponseToMerchantOffer(
    * header comment on that boundary, still intact.
    */
   maxDeliveryDays: number,
+  /**
+   * Pass 4 (budgetFlexible): the merchant's real listed price — public
+   * information (the exact same field GET /api/manifest already
+   * returns), used only to resolve a flexible buyer's centralized safety
+   * cap (resolveEffectiveBudgetCeiling). Never a private catalog field —
+   * this function already had structural access to it via manifestProduct
+   * before this pass, it just wasn't threaded through as its own
+   * parameter yet.
+   */
+  listedPrice: number,
   concessionContext?: BuyerConcessionContext,
   strategyContext?: BuyerStrategyContext,
 ): {
@@ -271,11 +282,18 @@ function buildResponseToMerchantOffer(
     constraints.deliveryDeadlineDays,
     strategyContext?.previousBuyerDeliveryDays ?? 0,
   );
+  // Pass 4 (budgetFlexible): resolved ONCE per round and reused for both
+  // the acceptance check below and the counter-offer candidates further
+  // down, so they can never disagree about a flexible buyer's real
+  // bound. Equal to constraints.maxUnitPrice whenever budgetFlexible is
+  // falsy — a hard-budget buyer's behavior is completely unaffected.
+  const effectiveCeiling = resolveEffectiveBudgetCeiling(constraints, listedPrice);
   const validation = validateMerchantProposal(
     constraints,
     proposal,
     maxAcceptableQuantity,
     maxAcceptableDeliveryDays,
+    effectiveCeiling,
   );
 
   // Milestone 6: technically satisfying every hard constraint
@@ -426,6 +444,7 @@ function buildResponseToMerchantOffer(
     concessionContext,
     strategyContext,
     maxDeliveryDays,
+    effectiveCeiling,
   );
   const selected = selectBestBuyerCandidate(candidates, constraints, proposal.quantity, proposal.deliveryDays);
 
@@ -534,6 +553,7 @@ export async function runBuyerAgent(
           constraints,
           merchantResult,
           manifestProduct.maxDeliveryDays,
+          manifestProduct.listedPrice,
           concessionContext,
           strategyContext,
         );

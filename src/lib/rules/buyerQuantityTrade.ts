@@ -149,6 +149,17 @@ export function decideBuyerQuantityTrade(
   previousBuyerUnitPrice: number | null | undefined,
   buyerLeverageScore: number | undefined,
   quantityTradeAlreadyUsed: boolean,
+  /**
+   * Pass 6 (budgetFlexible consistency): the buyer's resolved effective
+   * price bound for this round (resolveEffectiveBudgetCeiling,
+   * buyerRules.ts) — replaces constraints.maxUnitPrice as this trade's
+   * own ceiling, both for its baseline `normalAsk` and its upper-bound
+   * clamp, so a flexible buyer's trade offers can reach the same bound
+   * its ordinary concession path already can. Defaults to
+   * constraints.maxUnitPrice, so a hard-budget buyer (or any caller that
+   * predates this parameter) behaves exactly as before.
+   */
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerQuantityTradeDecision {
   void priorMerchantUnitPrice; // accepted for forward compatibility — see the doc comment above.
 
@@ -199,12 +210,12 @@ export function decideBuyerQuantityTrade(
     );
   }
 
-  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
+  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext, effectiveCeiling);
   const priceImprovementFraction = resolveQuantityTradePriceImprovementFraction(askMultiplier, constraints.urgency);
   const upperBound =
     previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
-      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
-      : constraints.maxUnitPrice;
+      ? Math.min(effectiveCeiling, previousBuyerUnitPrice)
+      : effectiveCeiling;
   const tradeUnitPrice = clamp(Math.round(normalAsk * (1 - priceImprovementFraction)), target, upperBound);
 
   if (previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined) {

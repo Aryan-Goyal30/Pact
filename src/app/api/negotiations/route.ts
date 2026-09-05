@@ -27,6 +27,7 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
     deliveryFlexible,
     quantityShortfallTolerance,
     targetUnitPrice,
+    budgetFlexible,
   } = body as Record<string, unknown>;
 
   if (typeof sku !== "string" || sku.trim().length === 0) {
@@ -71,6 +72,9 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
   ) {
     return null;
   }
+  if (budgetFlexible !== undefined && typeof budgetFlexible !== "boolean") {
+    return null;
+  }
 
   return {
     sku,
@@ -82,6 +86,7 @@ function parseCreateRequest(body: unknown): NegotiationSessionCreateRequest | nu
     deliveryFlexible,
     quantityShortfallTolerance: quantityShortfallTolerance as number | undefined,
     targetUnitPrice: targetUnitPrice as number | undefined,
+    budgetFlexible,
   };
 }
 
@@ -137,6 +142,7 @@ export async function POST(request: Request) {
         deliveryFlexible: createRequest.deliveryFlexible,
         quantityShortfallTolerance: createRequest.quantityShortfallTolerance,
         targetUnitPrice: createRequest.targetUnitPrice,
+        budgetFlexible: createRequest.budgetFlexible,
       },
       maxRounds,
     );

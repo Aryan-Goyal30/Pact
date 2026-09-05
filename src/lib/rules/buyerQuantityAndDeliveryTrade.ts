@@ -130,6 +130,16 @@ export function decideBuyerQuantityAndDeliveryTrade(
   deliveryTradeAlreadyUsed: boolean,
   /** Public information — see buyerDeliveryTrade.ts's decideBuyerDeliveryTrade for why this is safe to pass and why it's needed. */
   maxDeliveryDays: number,
+  /**
+   * Pass 6 (budgetFlexible consistency): the buyer's resolved effective
+   * price bound for this round (resolveEffectiveBudgetCeiling,
+   * buyerRules.ts) — replaces constraints.maxUnitPrice as this trade's
+   * own ceiling, both for its baseline `normalAsk` and its upper-bound
+   * clamp, mirroring the two solo trades' own Pass 6 change. Defaults to
+   * constraints.maxUnitPrice, so a hard-budget buyer (or any caller that
+   * predates this parameter) behaves exactly as before.
+   */
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerQuantityAndDeliveryTradeDecision {
   const noTrade = (reason: string): BuyerQuantityAndDeliveryTradeDecision => ({
     move: "NO_TRADE",
@@ -199,7 +209,7 @@ export function decideBuyerQuantityAndDeliveryTrade(
     );
   }
 
-  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext);
+  const normalAsk = computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, concessionContext, effectiveCeiling);
   const quantityPriceImprovementFraction = resolveQuantityTradePriceImprovementFraction(
     askMultiplier,
     constraints.urgency,
@@ -208,8 +218,8 @@ export function decideBuyerQuantityAndDeliveryTrade(
   const afterBothDiscounts = afterQuantityDiscount * (1 - DELIVERY_TRADE_PRICE_ASK_DISCOUNT * askMultiplier);
   const upperBound =
     previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined
-      ? Math.min(constraints.maxUnitPrice, previousBuyerUnitPrice)
-      : constraints.maxUnitPrice;
+      ? Math.min(effectiveCeiling, previousBuyerUnitPrice)
+      : effectiveCeiling;
   const tradeUnitPrice = clamp(Math.round(afterBothDiscounts), target, upperBound);
 
   if (previousBuyerUnitPrice !== null && previousBuyerUnitPrice !== undefined) {

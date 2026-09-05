@@ -446,3 +446,78 @@ describe("decideBuyerQuantityTrade — degenerate trades correctly fall back to 
     expect(decision.reason).toContain("not a meaningful improvement");
   });
 });
+
+// ---------------------------------------------------------------------
+// Pass 6: budgetFlexible consistency — effectiveCeiling threading.
+// ---------------------------------------------------------------------
+describe("decideBuyerQuantityTrade — Pass 6: effectiveCeiling", () => {
+  // E. Hard budget (effectiveCeiling omitted, or explicitly equal to
+  // maxUnitPrice) reproduces byte-identical behavior — every test above
+  // this block already proves this implicitly (none of them pass the new
+  // parameter); this makes it explicit.
+  it("E: omitting effectiveCeiling and passing it equal to maxUnitPrice produce identical results", () => {
+    const omitted = decideBuyerQuantityTrade(constraints, 100000, 50, concessionContext, null, null, 54, false);
+    const explicitMax = decideBuyerQuantityTrade(
+      constraints,
+      100000,
+      50,
+      concessionContext,
+      null,
+      null,
+      54,
+      false,
+      constraints.maxUnitPrice,
+    );
+    expect(explicitMax).toEqual(omitted);
+  });
+
+  it("E: the hard-budget price ceiling is unaffected by this parameter's mere existence — still never exceeds maxUnitPrice", () => {
+    const decision = decideBuyerQuantityTrade(constraints, 100000, 50, concessionContext, null, null, 54, false);
+    if (decision.move === "QUANTITY_FOR_PRICE") {
+      expect(decision.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    }
+  });
+
+  // D. A flexible buyer's trade can reach a higher effectiveCeiling than
+  // its stated maxUnitPrice — an extreme merchant offer forces the
+  // baseline (normalAsk) to saturate at whichever ceiling is given, so a
+  // higher ceiling produces a genuinely higher (never lower) trade price,
+  // while still never exceeding the ceiling actually supplied.
+  it("D: a higher effectiveCeiling raises the trade's own price ceiling above the hard maxUnitPrice", () => {
+    const flexibleCeiling = 52000; // above constraints.maxUnitPrice (45500)
+    const hard = decideBuyerQuantityTrade(constraints, 200000, 50, concessionContext, null, null, 54, false);
+    const flexible = decideBuyerQuantityTrade(
+      constraints,
+      200000,
+      50,
+      concessionContext,
+      null,
+      null,
+      54,
+      false,
+      flexibleCeiling,
+    );
+    expect(hard.move).toBe("QUANTITY_FOR_PRICE");
+    expect(flexible.move).toBe("QUANTITY_FOR_PRICE");
+    expect(hard.unitPrice!).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    expect(flexible.unitPrice!).toBeLessThanOrEqual(flexibleCeiling);
+    expect(flexible.unitPrice!).toBeGreaterThan(hard.unitPrice!);
+  });
+
+  it("D: still respects previousBuyerUnitPrice as the tighter of the two bounds, even when effectiveCeiling is higher", () => {
+    const decision = decideBuyerQuantityTrade(
+      constraints,
+      200000,
+      50,
+      concessionContext,
+      null,
+      46800, // the buyer's own prior offer — below the flexible ceiling
+      54,
+      false,
+      52000,
+    );
+    if (decision.move === "QUANTITY_FOR_PRICE") {
+      expect(decision.unitPrice!).toBeLessThanOrEqual(46800);
+    }
+  });
+});

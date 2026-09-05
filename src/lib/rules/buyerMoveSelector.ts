@@ -59,6 +59,15 @@ export const CONCEDE_LEVERAGE_THRESHOLD = 40;
  * buyer's leverage is strong enough to afford patience regardless.
  * Concedes when the merchant did move, unless leverage is weak enough
  * that protecting the deal matters more than holding firm.
+ *
+ * Pass 4 (budgetFlexible): `effectiveCeiling` defaults to
+ * `constraints.maxUnitPrice` — a hard-budget buyer's final-round
+ * capitulation is byte-identical to before this pass existed. A caller
+ * that has resolved a flexible buyer's real bound
+ * (resolveEffectiveBudgetCeiling, buyerRules.ts) passes it explicitly,
+ * and it's threaded into the CONCEDE branch's own computeBuyerConcessionPrice
+ * call too — the SAME value both paths use, so they can never disagree
+ * about where a flexible buyer's true bound is.
  */
 export function decideBuyerConcessionMove(
   constraints: BuyerConstraints,
@@ -67,14 +76,15 @@ export function decideBuyerConcessionMove(
   priorMerchantUnitPrice: number | null | undefined,
   previousBuyerUnitPrice: number | null | undefined,
   buyerLeverageScore: number | undefined,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerMoveDecision {
   const roundsLeft = Math.max(1, concessionContext.maxRounds - concessionContext.round + 1);
 
   if (roundsLeft <= 2) {
     return {
       move: "CONCEDE",
-      unitPrice: constraints.maxUnitPrice,
-      reason: "Few negotiation rounds remain, so moving to the true ceiling rather than risk losing the deal.",
+      unitPrice: effectiveCeiling,
+      reason: "Few negotiation rounds remain, so moving to its effective ceiling rather than risk losing the deal.",
     };
   }
 
@@ -119,10 +129,15 @@ export function decideBuyerConcessionMove(
 
   return {
     move: "CONCEDE",
-    unitPrice: computeBuyerConcessionPrice(constraints, merchantOfferUnitPrice, {
-      ...concessionContext,
-      leverageSpeedFactor,
-    }),
+    unitPrice: computeBuyerConcessionPrice(
+      constraints,
+      merchantOfferUnitPrice,
+      {
+        ...concessionContext,
+        leverageSpeedFactor,
+      },
+      effectiveCeiling,
+    ),
     reason: merchantMoved
       ? "The merchant moved, so the buyer reciprocates with its own concession."
       : "The buyer's bargaining position favors continuing to concede toward agreement.",

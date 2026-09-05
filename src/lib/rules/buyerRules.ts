@@ -51,6 +51,19 @@ export interface BuyerConstraints {
    */
   deliveryFlexible?: boolean;
   /**
+   * Pass 4: whether `maxUnitPrice` is a soft preference rather than a
+   * hard ceiling — the buyer explicitly said their stated price is
+   * flexible/negotiable/approximate, or that they're willing to go
+   * above it. Omitted (false) reproduces today's exact hard-ceiling
+   * behavior everywhere — every function that reads this only ever
+   * loosens its bound when it's true, and it never changes
+   * resolveBuyerTarget's own aspiration math (the stated maxUnitPrice
+   * remains the buyer's anchor either way). See
+   * resolveEffectiveBudgetCeiling below for the single, centralized
+   * definition of how much a flexible buyer can actually move.
+   */
+  budgetFlexible?: boolean;
+  /**
    * Milestone 6: how much shortfall from `quantity` (as a fraction,
    * e.g. 0.2 = up to 20% less than requested) the buyer will tolerate
    * without needing the price to compensate for it — see
@@ -105,12 +118,23 @@ export function isQuantityAcceptable(
   return proposal.quantity > 0 && proposal.quantity <= maxAcceptableQuantity;
 }
 
-/** Is the proposed unit price at or below the buyer's maximum? */
+/**
+ * Is the proposed unit price at or below the buyer's ceiling?
+ *
+ * `effectiveCeiling` defaults to `constraints.maxUnitPrice` — the exact
+ * pre-Pass-4 behavior every existing caller relies on. A caller that has
+ * already resolved a flexible buyer's real bound (see
+ * resolveEffectiveBudgetCeiling) passes it explicitly; omitting it means
+ * a `budgetFlexible` buyer is checked against its own stated number,
+ * same as a hard budget, which is the intentional safe fallback for any
+ * call site that doesn't have merchant listed-price context available.
+ */
 export function isPriceAcceptable(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): boolean {
-  return proposal.unitPrice <= constraints.maxUnitPrice;
+  return proposal.unitPrice <= effectiveCeiling;
 }
 
 /**
@@ -152,12 +176,15 @@ export interface BuyerValidationResult {
  * `constraints.quantity`, exactly the pre-Milestone-5 behavior.
  * `maxAcceptableDeliveryDays` — see isDeliveryAcceptable — defaults to
  * `constraints.deliveryDeadlineDays`, exactly the pre-Milestone-7 behavior.
+ * `effectiveCeiling` — see isPriceAcceptable — defaults to
+ * `constraints.maxUnitPrice`, exactly the pre-Pass-4 behavior.
  */
 export function validateMerchantProposal(
   constraints: BuyerConstraints,
   proposal: ProposedAgreement,
   maxAcceptableQuantity: number = constraints.quantity,
   maxAcceptableDeliveryDays: number = constraints.deliveryDeadlineDays,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): BuyerValidationResult {
   const reasons: string[] = [];
 
@@ -169,9 +196,9 @@ export function validateMerchantProposal(
       `Offered quantity ${proposal.quantity} is not acceptable (requested up to ${maxAcceptableQuantity}).`,
     );
   }
-  if (!isPriceAcceptable(constraints, proposal)) {
+  if (!isPriceAcceptable(constraints, proposal, effectiveCeiling)) {
     reasons.push(
-      `Offered unit price ${proposal.unitPrice} exceeds the buyer's maximum of ${constraints.maxUnitPrice}.`,
+      `Offered unit price ${proposal.unitPrice} exceeds the buyer's maximum of ${effectiveCeiling}.`,
     );
   }
   if (!isDeliveryAcceptable(constraints, proposal, maxAcceptableDeliveryDays)) {
@@ -277,17 +304,27 @@ export interface BuyerConcessionContext {
  * (negotiationStrategy.resolveUrgencyConcessionFactor) — "medium", the
  * default when urgency is unset, reproduces a multiplier of exactly 1,
  * i.e. today's plain halving formula, unchanged.
+ *
+ * Pass 4 (budgetFlexible): `effectiveCeiling` replaces `maxUnitPrice` as
+ * the bound in both the final-2-rounds capitulation and the clamp below
+ * — it defaults to `constraints.maxUnitPrice`, so every existing caller
+ * (and every hard-budget buyer) behaves exactly as before. A caller that
+ * has resolved a flexible buyer's real bound (resolveEffectiveBudgetCeiling)
+ * passes it explicitly. `target` itself (resolveBuyerTarget) is
+ * untouched — a flexible buyer still anchors its aspiration on the
+ * stated maxUnitPrice, never on the wider ceiling.
  */
 export function computeBuyerConcessionPrice(
   constraints: BuyerConstraints,
   merchantOfferUnitPrice: number,
   context: BuyerConcessionContext,
+  effectiveCeiling: number = constraints.maxUnitPrice,
 ): number {
   const target = resolveBuyerTarget(constraints);
   const roundsLeft = Math.max(1, context.maxRounds - context.round + 1);
 
   if (roundsLeft <= 2) {
-    return constraints.maxUnitPrice;
+    return effectiveCeiling;
   }
 
   const urgencyFactor = resolveUrgencyConcessionFactor(constraints.urgency);
@@ -306,5 +343,41 @@ export function computeBuyerConcessionPrice(
   const roundProgressFactor = isOpeningRound ? 1 : resolveRoundProgressFactor(context.round, context.maxRounds);
   const combinedFactor = clamp(urgencyFactor * leverageFactor * roundProgressFactor, 0.3, 2.0);
   const conceded = target + ((merchantOfferUnitPrice - target) / 2) * combinedFactor;
-  return clamp(Math.round(conceded), target, constraints.maxUnitPrice);
+  return clamp(Math.round(conceded), target, effectiveCeiling);
+}
+
+/**
+ * Pass 4 (budgetFlexible) — the ONE centralized definition of how far a
+ * flexible buyer's price movement is allowed to go, so buyerRules.ts /
+ * walkAway.ts / buyerMoveSelector.ts can never independently invent
+ * slightly different multipliers and disagree with each other.
+ *
+ * A hard budget (`budgetFlexible` falsy) is bounded by exactly
+ * `maxUnitPrice` — `listedPrice` is never consulted, so this is a
+ * complete no-op for every existing caller/session.
+ *
+ * A flexible budget is bounded by whichever is LARGER of the buyer's
+ * own stated `maxUnitPrice` and the merchant's real `listedPrice`:
+ * flexibility only ever loosens the buyer's own stated number, it can
+ * never tighten it below what the buyer already said (e.g. a buyer
+ * whose stated number is already above listed price keeps that higher
+ * number as its bound, not the lower listed price).
+ *
+ * `listedPrice` is optional so this stays callable from sites that
+ * don't have product context in scope — it's simply never read there.
+ * Omitting it while flexible falls back to the buyer's own stated
+ * number (the same bound as a hard budget) rather than leaving the
+ * buyer unbounded, so a flexible buyer is NEVER unbounded merely
+ * because a caller couldn't supply the merchant's listed price.
+ */
+export function resolveEffectiveBudgetCeiling(
+  constraints: Pick<BuyerConstraints, "maxUnitPrice" | "budgetFlexible">,
+  listedPrice?: number,
+): number {
+  if (!constraints.budgetFlexible) {
+    return constraints.maxUnitPrice;
+  }
+  return listedPrice !== undefined
+    ? Math.max(constraints.maxUnitPrice, listedPrice)
+    : constraints.maxUnitPrice;
 }

@@ -124,6 +124,80 @@ h3 {
   }
 }
 
+/* Redesign — fluid display type. clamp()-based so a "large" headline is
+   actually large at 1440px+ without a sm:/md:/lg: size ladder on every
+   heading. Kept to a handful of steps, not a full new scale. */
+.text-display-1 {
+  font-size: clamp(2.75rem, 1.7rem + 4.6vw, 6rem);
+  line-height: 0.98;
+  letter-spacing: -0.03em;
+}
+
+.text-display-2 {
+  font-size: clamp(2rem, 1.5rem + 2.2vw, 3.5rem);
+  line-height: 1.02;
+  letter-spacing: -0.025em;
+}
+
+.text-display-3 {
+  font-size: clamp(1.5rem, 1.25rem + 1.1vw, 2.25rem);
+  line-height: 1.08;
+  letter-spacing: -0.02em;
+}
+
+/* A one-shot settle pulse for the AGREED moment — fires once, never loops. */
+@keyframes pact-resolve {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 18px color-mix(in srgb, var(--accent) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 0%, transparent);
+  }
+}
+
+.animate-resolve {
+  animation: pact-resolve 1.1s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Redesign 2.0 — the acting agent's panel gets a soft, continuous glow
+   rather than a hard border/box change, so the panel itself communicates
+   "this side is active" without competing with AgentField's own canvas
+   signal. Restrained: a single low-intensity shadow tier, no color
+   cycling, no scale. */
+@keyframes pact-agent-glow {
+  0%,
+  100% {
+    opacity: 0.5;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.animate-agent-glow {
+  animation: pact-agent-glow 1.8s ease-in-out infinite;
+}
+
+/* The live state-progression rail's active dot — a soft breathing halo,
+   not a hard pulse or a generic "AI glow". One shared tier reused by
+   both the buyer and merchant tone via currentColor. */
+@keyframes pact-dot-halo {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 currentColor;
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, currentColor 30%, transparent);
+  }
+}
+
+.animate-dot-halo {
+  animation: pact-dot-halo 1.8s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

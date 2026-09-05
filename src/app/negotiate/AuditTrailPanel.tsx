@@ -55,14 +55,15 @@ export function AuditTrailPanel({ sessionId, productName }: AuditTrailPanelProps
   }
 
   return (
-    <div id="audit-trail" className="flex scroll-mt-24 flex-col gap-4 rounded-2xl border border-border p-6 sm:p-8">
+    <div id="audit-trail" className="flex scroll-mt-24 flex-col gap-5 rounded-2xl border border-border bg-surface/60 p-6 sm:p-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-lg font-medium text-foreground">Audit Trail</h2>
+        <div className="flex flex-col gap-1">
+          <p className="text-xs font-semibold tracking-widest text-muted uppercase">Transaction history</p>
+          <h2 className="text-display-3 font-semibold text-foreground">Audit Trail</h2>
           <p className="text-sm text-muted">
-            Persisted events from this negotiation
+            Every persisted decision and payment event for this negotiation
             {opened && entries && entries.length > 0 && (
-              <span className="text-muted"> · {entries.length} recorded</span>
+              <span className="tabular-nums text-muted"> · {entries.length} recorded</span>
             )}
           </p>
         </div>
@@ -85,7 +86,7 @@ export function AuditTrailPanel({ sessionId, productName }: AuditTrailPanelProps
           )}
 
           {!error && entries && entries.length > 0 && (
-            <ol className="flex flex-col">
+            <ol className="flex flex-col border-l border-border pl-5">
               {entries.map((entry) => (
                 <AuditTrailEntryRow key={entry.id} entry={entry} productName={productName} />
               ))}
@@ -144,23 +145,21 @@ function AuditTrailEntryRow({ entry, productName }: { entry: AuditTrailEntryDTO;
   const isFailure = FAILURE_EVENT_TYPES.has(entry.eventType);
 
   return (
-    <li className="border-b border-border last:border-0">
+    <li className="relative pb-1">
+      <span
+        className={`absolute top-4 -left-[26px] h-2.5 w-2.5 rounded-full ring-4 ring-background ${
+          isFailure ? "bg-red-400" : "bg-emerald-400"
+        }`}
+        aria-hidden
+      />
       <button
         type="button"
         onClick={() => expandable && setExpanded((v) => !v)}
         aria-expanded={expanded}
         className={`flex w-full items-center gap-3 py-3 text-left ${expandable ? "cursor-pointer" : "cursor-default"}`}
       >
-        <span
-          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] ${
-            isFailure ? "bg-red-500/15 text-red-300" : "bg-emerald-400/15 text-emerald-300"
-          }`}
-          aria-hidden
-        >
-          {isFailure ? "!" : "✓"}
-        </span>
         <span className="flex-1 text-sm font-medium text-foreground">{entryLabel(entry)}</span>
-        <span className="text-xs text-muted">{formatTimestamp(entry.createdAt)}</span>
+        <span className="tabular-nums text-xs text-muted">{formatTimestamp(entry.createdAt)}</span>
         {expandable && (
           <span className={`text-[10px] text-muted transition-transform ${expanded ? "rotate-180" : ""}`} aria-hidden>
             ⌄

@@ -47,3 +47,12 @@ yarn-error.log*
 next-env.d.ts
 
 /src/generated/prisma
+
+# development-agent artifacts (Next.js / local coding tools may regenerate
+# these — intentionally not part of the public repository, see Pass 11.1)
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/.agents/
+/.windsurf/
+/skills-lock.json

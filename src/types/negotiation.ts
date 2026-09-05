@@ -88,6 +88,13 @@ export interface NegotiationSessionCreateRequest {
    * 5%-below-ceiling heuristic) as before this field existed.
    */
   targetUnitPrice?: number;
+  /**
+   * Pass 4: whether `maxUnitPrice` is a soft preference rather than a
+   * hard ceiling — see BuyerConstraints.budgetFlexible (buyerRules.ts).
+   * Optional and additive: omitted (or false) reproduces the exact
+   * hard-ceiling behavior every existing caller already relies on.
+   */
+  budgetFlexible?: boolean;
 }
 
 /**

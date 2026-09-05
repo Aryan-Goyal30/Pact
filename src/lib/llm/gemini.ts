@@ -69,19 +69,30 @@ export class GeminiProvider implements LlmProvider {
         },
       });
     } catch (error) {
-      // Provider-failure handling: a 429 (ApiError with status 429) —
-      // observed in practice as Gemini's free-tier generate_content
-      // quota (5 requests/minute was the figure observed for the
-      // previously-used gemini-3.6-flash model; the exact limit for
-      // GEMINI_MODEL above may differ) — is a transient, expected
-      // condition, not a code bug. Recognized here and
-      // re-thrown as the provider-agnostic ProviderRateLimitedError so
-      // agent code falls back to its deterministic message via the SAME
-      // `instanceof LlmUnavailableError` check it already uses for
-      // "no API key configured," instead of failing the whole
-      // negotiation turn. Every other error (auth, malformed request,
-      // network failure, etc.) is rethrown completely unchanged.
-      if (error instanceof ApiError && error.status === 429) {
+      // Provider-failure handling: two distinct but equally transient
+      // ApiError statuses are both treated as "no LLM is currently
+      // usable this turn" rather than a code bug:
+      //  - 429 — observed in practice as Gemini's free-tier
+      //    generate_content quota (5 requests/minute was the figure
+      //    observed for the previously-used gemini-3.6-flash model; the
+      //    exact limit for GEMINI_MODEL above may differ).
+      //  - 503 (status text "UNAVAILABLE") — observed in practice as
+      //    Gemini reporting the model itself is overloaded ("This model
+      //    is currently experiencing high demand"), independent of any
+      //    per-caller quota.
+      // Both are recognized here and re-thrown as the same provider-
+      // agnostic ProviderRateLimitedError so agent code falls back to
+      // its deterministic message via the SAME `instanceof
+      // LlmUnavailableError` check it already uses for "no API key
+      // configured" and for a 429, instead of failing the whole
+      // negotiation turn (or, for the buyer-intent parser specifically,
+      // instead of the intent route returning a generic 500 and losing
+      // its own intended friendly "Automatic understanding isn't
+      // available right now" fallback message — see
+      // buyerIntentParser.ts's own catch). Every other error (auth,
+      // malformed request, network failure, etc.) is rethrown completely
+      // unchanged.
+      if (error instanceof ApiError && (error.status === 429 || error.status === 503)) {
         throw new ProviderRateLimitedError("Gemini");
       }
       throw error;

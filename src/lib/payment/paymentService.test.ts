@@ -238,11 +238,17 @@ describe("verifyCheckoutPayment", () => {
     const input = { razorpayOrderId: order.razorpayOrderId, razorpayPaymentId: "pay_1", razorpaySignature: MOCK_VALID_SIGNATURE };
 
     const first = await verifyCheckoutPayment(agreementId, input);
-    // A second verify call for the SAME (now-resolved) order — the
-    // attempt is no longer "unresolved", so this is expected to reject
-    // as a mismatch (nothing left to verify), never to silently re-apply.
-    await expect(verifyCheckoutPayment(agreementId, input)).rejects.toBeInstanceOf(VerificationMismatchError);
+    // Pass 7: a second verify call for the SAME (now-resolved) order —
+    // the attempt is no longer "unresolved" via the primary lookup, but
+    // the success-claim fallback still finds it (see
+    // findResolvableAttemptForSuccess's own doc comment), and
+    // resolvePaymentAttempt's own guard makes re-applying it a safe
+    // no-op — this now genuinely IS idempotent, reporting the same real
+    // outcome rather than throwing.
+    const second = await verifyCheckoutPayment(agreementId, input);
     expect(first.agreementStatus).toBe("paid");
+    expect(second.agreementStatus).toBe("paid");
+    expect(await prisma.auditLog.count({ where: { agreementId, eventType: "PAYMENT_SUCCEEDED" } })).toBe(1); // never double-written
   });
 
   it("recoveryAvailable is true after the first attempt fails, and reflects MAX_LOGICAL_PAYMENT_ATTEMPTS", async () => {
@@ -486,5 +492,121 @@ describe("reportCheckoutFailure — M13.2 informational-only failure reporting",
 
   it("404s (AgreementNotFoundError) for a genuinely unknown Agreement id", async () => {
     await expect(reportCheckoutFailure("not-a-real-id", { razorpayOrderId: "order_x" })).rejects.toBeInstanceOf(AgreementNotFoundError);
+  });
+});
+
+// ---------------------------------------------------------------------
+// Pass 7: payment recovery hardening — the real bug this pass fixes:
+// "A failed ATTEMPT is not necessarily a failed ORDER." A genuine
+// success for the SAME Razorpay order must still resolve the Agreement
+// to paid even after an earlier failure was recorded against the same
+// attempt — never a permanent "No matching unresolved payment attempt"
+// dead end.
+// ---------------------------------------------------------------------
+describe("verifyCheckoutPayment — Pass 7: success after failure on the SAME order", () => {
+  // 1 / 3. failure -> success on the SAME order resolves to paid.
+  it("a genuine success after an earlier reported failure on the SAME order resolves the Agreement to paid", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+
+    const failure = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      reportedFailureCode: "GATEWAY_ERROR",
+    });
+    expect(failure.agreementStatus).toBe("failed");
+
+    // The SAME order, now a genuine signed success (Razorpay's own
+    // in-Checkout retry against the still-open order).
+    const success = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_retry_success",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+
+    expect(success.agreementStatus).toBe("paid");
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid");
+    // Resolved the SAME attempt in place — never a second row.
+    expect(await prisma.paymentAttempt.count({ where: { agreementId } })).toBe(1);
+  });
+
+  // 2. Failure does not permanently terminate recoverability — the
+  // agreement stays reachable via the SAME order even without an
+  // explicit /recover call, since recovery only matters when a genuinely
+  // NEW attempt/order is needed (never the case here).
+  it("recoveryAvailable is still reported true after the failure, and the SAME order remains valid for the eventual success", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+
+    const status = await getPaymentStatus(agreementId);
+    expect(status.recoveryAvailable).toBe(true);
+
+    const success = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId, // the SAME order, not a new recovery order
+      razorpayPaymentId: "pay_2",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+    });
+    expect(success.agreementStatus).toBe("paid");
+  });
+
+  // 10. Invalid signature still cannot mark paid, even via the new
+  // fallback path onto a previously-failed attempt.
+  it("an invalid signature after a prior failure still cannot mark the Agreement paid", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+
+    const result = await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "pay_forged",
+      razorpaySignature: "definitely-not-valid",
+    });
+
+    expect(result.attemptStatus).toBe("failed");
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("failed"); // never paid
+  });
+
+  // 11. Wrong order_id still cannot resolve the Agreement, even via the
+  // new fallback path — the fallback requires an EXACT (agreementId,
+  // razorpayOrderId) match, never a bare agreement-only lookup.
+  it("a genuine success submitted with a DIFFERENT order id (not the failed attempt's own) is still rejected", async () => {
+    const { agreementId } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    await verifyCheckoutPayment(agreementId, { razorpayOrderId: order.razorpayOrderId, reportedFailureCode: "GATEWAY_ERROR" });
+
+    await expect(
+      verifyCheckoutPayment(agreementId, {
+        razorpayOrderId: "order_completely_different",
+        razorpayPaymentId: "pay_x",
+        razorpaySignature: MOCK_VALID_SIGNATURE,
+      }),
+    ).rejects.toBeInstanceOf(VerificationMismatchError);
+
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("failed"); // unchanged
+  });
+
+  // 12. verify's own request contract has no amount field at all —
+  // structurally nothing to mismatch. Extra/unrelated body fields are
+  // ignored, same discipline as the existing "Agreement terms cannot be
+  // overridden" security test.
+  it("has no amount field in its contract — an agreement can only ever reach paid via its own server-derived totalAmount", async () => {
+    const { agreementId, totalAmount } = await createTestAgreement();
+    const order = await createOrderForAgreement(agreementId);
+    expect(order.amount).toBe(rupeesToPaise(totalAmount));
+
+    await verifyCheckoutPayment(agreementId, {
+      razorpayOrderId: order.razorpayOrderId,
+      razorpayPaymentId: "p",
+      razorpaySignature: MOCK_VALID_SIGNATURE,
+      // @ts-expect-error — intentionally probing an unsupported field; VerifyCheckoutInput has no `amount`.
+      amount: 1,
+    });
+
+    const agreement = await prisma.agreement.findUniqueOrThrow({ where: { id: agreementId } });
+    expect(agreement.status).toBe("paid");
+    expect(agreement.totalAmount).toBe(totalAmount); // untouched by the bogus field
   });
 });

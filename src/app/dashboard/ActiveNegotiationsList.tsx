@@ -9,8 +9,11 @@
 // verbatim here) — no new backend behavior, no negotiation state ever
 // written from this console.
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { AuditTrailPanel } from "@/app/negotiate/AuditTrailPanel";
+import { InspectorPanel } from "@/components/InspectorPanel";
+import { formatInr, formatRelativeTime } from "./dashboardUi";
+import { useNow } from "./useNow";
 
 export interface ActiveNegotiationSummary {
   sessionId: string;
@@ -21,125 +24,152 @@ export interface ActiveNegotiationSummary {
   statusLabel: string;
   round: number;
   maxRounds: number;
-}
-
-function formatInr(amount: number) {
-  return new Intl.NumberFormat("en-IN", {
-    style: "currency",
-    currency: "INR",
-    maximumFractionDigits: 0,
-  }).format(amount);
+  /** ISO 8601 — NegotiationSession.updatedAt, i.e. the last real turn activity on this session. */
+  updatedAt: string;
+  /** Real server-computed comparison (page.tsx's own requestTime vs updatedAt) — never a client-side timer pretending something just changed. Drives a brief, restrained highlight only. */
+  recentlyUpdated: boolean;
 }
 
 export function ActiveNegotiationsList({ sessions }: { sessions: ActiveNegotiationSummary[] }) {
   const [openSessionId, setOpenSessionId] = useState<string | null>(null);
   const open = sessions.find((s) => s.sessionId === openSessionId) ?? null;
+  // Client-only, mount-deferred — see useNow's own doc comment for why
+  // this must never be read directly during render.
+  const now = useNow();
 
   if (sessions.length === 0) {
     return (
-      <div className="rounded-xl border border-dashed border-border p-8 text-center text-sm text-muted">
-        No negotiations in progress right now.
+      <div className="flex flex-col gap-1 border-t border-border py-8 text-center">
+        <p className="text-sm font-medium text-foreground">No negotiations in progress.</p>
+        <p className="text-xs text-muted">Your agent will surface new activity here when a buyer starts negotiating.</p>
       </div>
     );
   }
 
   return (
     <>
-      <ul className="flex flex-col gap-2">
-        {sessions.map((session) => (
-          <li key={session.sessionId}>
-            <button
-              type="button"
-              onClick={() => setOpenSessionId(session.sessionId)}
-              className="flex w-full flex-wrap items-center justify-between gap-3 rounded-xl border border-border p-4 text-left transition-colors hover:border-border-strong hover:bg-white/[.02]"
-            >
-              <div className="flex flex-col gap-0.5">
+      {/* Column header — real labels once, not repeated per row (keeps
+          each row compact rather than re-stating "Buyer target"/"Gap"
+          five times over). Desktop/tablet only; the mobile stack below
+          relies on position + color instead, same convention the rest
+          of this redesign already uses. */}
+      <div className="hidden border-t border-border px-1 pt-3 text-[10px] font-semibold tracking-widest text-muted uppercase sm:grid sm:grid-cols-[auto_1fr_auto_auto_auto_auto] sm:gap-4">
+        <span>Status</span>
+        <span>Product</span>
+        <span>Target → current</span>
+        <span className="text-right">Gap</span>
+        <span className="text-right">Round · updated</span>
+        <span aria-hidden />
+      </div>
+
+      <ul className="flex flex-col divide-y divide-border">
+        {sessions.map((session) => {
+          const gap =
+            session.buyerTarget !== null && session.currentOffer !== null
+              ? Math.abs(session.currentOffer - session.buyerTarget)
+              : null;
+          return (
+            <li key={session.sessionId}>
+              <button
+                type="button"
+                onClick={() => setOpenSessionId(session.sessionId)}
+                className={`grid w-full grid-cols-1 items-center gap-2 px-1 py-3.5 text-left transition-colors hover:bg-white/[.03] sm:grid-cols-[auto_1fr_auto_auto_auto_auto] sm:gap-4 ${
+                  session.recentlyUpdated ? "bg-accent/[.04]" : ""
+                }`}
+              >
+                <span className="flex items-center gap-1.5 text-[11px] font-medium tracking-wide text-yellow-300 uppercase">
+                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-yellow-400" />
+                  {session.statusLabel}
+                </span>
+
                 <span className="font-medium text-foreground">
                   {session.quantity ?? "—"} × {session.sku}
                 </span>
-                <span className="text-xs text-muted">
-                  Buyer target: {session.buyerTarget !== null ? formatInr(session.buyerTarget) : "—"} · Current
-                  offer: {session.currentOffer !== null ? formatInr(session.currentOffer) : "—"} · Round{" "}
-                  {session.round}/{session.maxRounds}
+
+                <span className="tabular-nums text-sm text-muted">
+                  {session.buyerTarget !== null ? formatInr(session.buyerTarget) : "—"}
+                  <span className="mx-1 text-muted/50">→</span>
+                  <span className="text-foreground">
+                    {session.currentOffer !== null ? formatInr(session.currentOffer) : "—"}
+                  </span>
                 </span>
-              </div>
-              <span className="rounded-full border border-yellow-500/30 px-3 py-1 text-xs font-medium text-yellow-300">
-                {session.statusLabel}
-              </span>
-            </button>
-          </li>
-        ))}
+
+                <span className="tabular-nums text-right text-sm font-medium text-accent">
+                  {gap !== null ? formatInr(gap) : "—"}
+                </span>
+
+                <span className="tabular-nums text-right text-[11px] text-muted">
+                  Round {session.round}/{session.maxRounds}
+                  {now !== null && (
+                    <>
+                      <span className="mx-1 text-muted/40">·</span>
+                      {formatRelativeTime(session.updatedAt, now)}
+                    </>
+                  )}
+                </span>
+
+                <span className="hidden shrink-0 items-center gap-1 text-[11px] font-medium text-muted sm:flex">
+                  View <span aria-hidden>→</span>
+                </span>
+              </button>
+            </li>
+          );
+        })}
       </ul>
 
-      {open && <NegotiationDrawer session={open} onClose={() => setOpenSessionId(null)} />}
+      {open && <NegotiationDrawer session={open} now={now} onClose={() => setOpenSessionId(null)} />}
     </>
   );
 }
 
-function NegotiationDrawer({ session, onClose }: { session: ActiveNegotiationSummary; onClose: () => void }) {
-  useEffect(() => {
-    const previousOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [onClose]);
-
+function NegotiationDrawer({
+  session,
+  now,
+  onClose,
+}: {
+  session: ActiveNegotiationSummary;
+  now: number | null;
+  onClose: () => void;
+}) {
   return (
-    <div className="fixed inset-0 z-50 flex justify-end">
-      <div className="animate-fade-in absolute inset-0 bg-black/70" onClick={onClose} aria-hidden />
-      <div className="animate-slide-in-right relative flex h-full w-full max-w-lg flex-col gap-6 overflow-y-auto border-l border-border bg-background p-6 sm:p-8">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <p className="text-xs font-semibold tracking-widest text-muted uppercase">Negotiation detail</p>
-            <h2 className="text-xl font-medium text-foreground">
-              {session.quantity ?? "—"} × {session.sku}
-            </h2>
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close"
-            className="rounded-full border border-border p-2 text-muted transition-colors hover:text-foreground"
-          >
-            ✕
-          </button>
+    <InspectorPanel eyebrow="Negotiation detail" title={`${session.quantity ?? "—"} × ${session.sku}`} onClose={onClose} wide>
+      <dl className="grid grid-cols-2 gap-4 rounded-xl border border-border p-4 text-sm sm:grid-cols-4">
+        <div>
+          <dt className="text-xs text-muted">Status</dt>
+          <dd className="font-medium text-foreground">{session.statusLabel}</dd>
         </div>
+        <div>
+          <dt className="text-xs text-muted">Round</dt>
+          <dd className="tabular-nums font-medium text-foreground">
+            {session.round}/{session.maxRounds}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted">Buyer target</dt>
+          <dd className="tabular-nums font-medium text-foreground">
+            {session.buyerTarget !== null ? formatInr(session.buyerTarget) : "—"}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted">Current offer</dt>
+          <dd className="tabular-nums font-medium text-foreground">
+            {session.currentOffer !== null ? formatInr(session.currentOffer) : "—"}
+          </dd>
+        </div>
+        <div>
+          <dt className="text-xs text-muted">Last activity</dt>
+          <dd className="font-medium text-foreground">{now !== null ? formatRelativeTime(session.updatedAt, now) : "—"}</dd>
+        </div>
+      </dl>
 
-        <dl className="grid grid-cols-2 gap-4 rounded-xl border border-border p-4 text-sm sm:grid-cols-4">
-          <div>
-            <dt className="text-xs text-muted">Status</dt>
-            <dd className="font-medium text-foreground">{session.statusLabel}</dd>
-          </div>
-          <div>
-            <dt className="text-xs text-muted">Round</dt>
-            <dd className="font-medium text-foreground">
-              {session.round}/{session.maxRounds}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs text-muted">Buyer target</dt>
-            <dd className="font-medium text-foreground">
-              {session.buyerTarget !== null ? formatInr(session.buyerTarget) : "—"}
-            </dd>
-          </div>
-          <div>
-            <dt className="text-xs text-muted">Current offer</dt>
-            <dd className="font-medium text-foreground">
-              {session.currentOffer !== null ? formatInr(session.currentOffer) : "—"}
-            </dd>
-          </div>
-        </dl>
+      <p className="text-xs leading-5 text-muted">
+        Merchant Agent is handling this negotiation automatically, operating within this product&rsquo;s
+        configured price, stock, and delivery constraints — see the Catalog table below for the exact bounds.
+      </p>
 
-        {/* The exact same persisted audit trail the buyer-facing page
-            uses — reused verbatim, never a second implementation. */}
-        <AuditTrailPanel sessionId={session.sessionId} productName={session.sku} />
-      </div>
-    </div>
+      {/* The exact same persisted audit trail the buyer-facing page
+          uses — reused verbatim, never a second implementation. */}
+      <AuditTrailPanel sessionId={session.sessionId} productName={session.sku} />
+    </InspectorPanel>
   );
 }

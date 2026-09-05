@@ -150,3 +150,71 @@ describe("geminiProvider.generateAgentMessage — rate limit (HTTP 429)", () => 
     ).rejects.toThrow("network exploded");
   });
 });
+
+// Provider-failure handling: a 503 from Gemini ("This model is currently
+// experiencing high demand" / status text UNAVAILABLE — observed live
+// against the real API) must be recognized exactly like a 429 and turned
+// into the same provider-agnostic ProviderRateLimitedError, so it follows
+// the same recoverable path — see gemini.ts's own catch block. Before
+// this fix, a 503 escaped uncaught: parseBuyerIntent re-threw it (it
+// isn't an LlmUnavailableError), the intent API route's outer catch
+// returned a generic 500, and the buyer never saw the intended
+// "Automatic understanding isn't available right now" fallback message.
+describe("geminiProvider.generateAgentMessage — provider unavailable (HTTP 503)", () => {
+  const originalKey = process.env.GEMINI_API_KEY;
+
+  beforeEach(() => {
+    process.env.GEMINI_API_KEY = "test-key";
+    mockedGenerateContent.mockReset();
+  });
+
+  afterEach(() => {
+    if (originalKey === undefined) {
+      delete process.env.GEMINI_API_KEY;
+    } else {
+      process.env.GEMINI_API_KEY = originalKey;
+    }
+  });
+
+  it("turns a real Gemini 503 ApiError into ProviderRateLimitedError", async () => {
+    mockedGenerateContent.mockRejectedValue(
+      new ApiError({ message: "This model is currently experiencing high demand.", status: 503 }),
+    );
+
+    await expect(
+      geminiProvider.generateAgentMessage({
+        systemPrompt: "You are a test persona.",
+        context: {},
+        instruction: "Say something.",
+      }),
+    ).rejects.toBeInstanceOf(ProviderRateLimitedError);
+  });
+
+  it("is still an instance of the provider-agnostic LlmUnavailableError", async () => {
+    mockedGenerateContent.mockRejectedValue(new ApiError({ message: "model overloaded", status: 503 }));
+
+    await expect(
+      geminiProvider.generateAgentMessage({
+        systemPrompt: "You are a test persona.",
+        context: {},
+        instruction: "Say something.",
+      }),
+    ).rejects.toBeInstanceOf(LlmUnavailableError);
+  });
+
+  it("names the provider as Gemini in the resulting error", async () => {
+    mockedGenerateContent.mockRejectedValue(new ApiError({ message: "model overloaded", status: 503 }));
+
+    try {
+      await geminiProvider.generateAgentMessage({
+        systemPrompt: "You are a test persona.",
+        context: {},
+        instruction: "Say something.",
+      });
+      expect.unreachable("expected generateAgentMessage to reject");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ProviderRateLimitedError);
+      expect((error as InstanceType<typeof ProviderRateLimitedError>).provider).toBe("Gemini");
+    }
+  });
+});

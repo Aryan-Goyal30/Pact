@@ -21,22 +21,36 @@
 //     codebase's round-aware concession formulas are only ever flat
 //     when there is genuinely nothing left to concede.
 
+import { resolveEffectiveBudgetCeiling } from "@/lib/rules/buyerRules";
+
 export type WalkAwayReason = "price_gap_unbridgeable" | "repeated_positions";
 
 /**
- * True when the buyer's stated ceiling is below the merchant's private
- * floor on a negotiable item — no combination of rounds, trades, or
- * concessions can ever produce a mutually acceptable price. Gated on
- * `negotiationEnabled` so this never interferes with the existing,
- * already-correct REJECTED path a non-negotiable item's price mismatch
- * already takes (evaluateNegotiationRequest / resolvePrice) — that path
- * is untouched by this module.
+ * True when the buyer's effective ceiling is below the merchant's
+ * private floor on a negotiable item — no combination of rounds,
+ * trades, or concessions can ever produce a mutually acceptable price.
+ * Gated on `negotiationEnabled` so this never interferes with the
+ * existing, already-correct REJECTED path a non-negotiable item's price
+ * mismatch already takes (evaluateNegotiationRequest / resolvePrice) —
+ * that path is untouched by this module.
+ *
+ * Pass 4 (budgetFlexible): for a hard budget, "effective ceiling" is
+ * exactly `maxUnitPrice` — byte-identical to before this pass existed.
+ * For a flexible budget, it's the SAME centralized safety cap
+ * buyerRules.ts's concession logic uses (resolveEffectiveBudgetCeiling)
+ * — a flexible buyer whose stated number is below floor does NOT
+ * structurally walk away merely because of that stated number, but
+ * still walks away once even the bounded safety cap can't reach the
+ * floor. `item.listedPrice` is optional here only so existing test
+ * fixtures that construct a minimal `item` without it keep compiling;
+ * every real caller (orchestrator.ts) always has a real listedPrice.
  */
 export function isPriceGapUnbridgeable(
-  item: { minPrice: number; negotiationEnabled: boolean },
-  buyerConstraints: { maxUnitPrice: number },
+  item: { minPrice: number; negotiationEnabled: boolean; listedPrice?: number },
+  buyerConstraints: { maxUnitPrice: number; budgetFlexible?: boolean },
 ): boolean {
-  return item.negotiationEnabled && buyerConstraints.maxUnitPrice < item.minPrice;
+  const effectiveCeiling = resolveEffectiveBudgetCeiling(buyerConstraints, item.listedPrice);
+  return item.negotiationEnabled && effectiveCeiling < item.minPrice;
 }
 
 /**

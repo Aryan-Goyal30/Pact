@@ -285,3 +285,60 @@ describe("Milestone 11: compareBuyerPackages — lexicographic tiers", () => {
     expect(candidates).toEqual(snapshot);
   });
 });
+
+// ---------------------------------------------------------------------
+// Pass 6: budgetFlexible consistency — effectiveCeiling now threads into
+// all three trade generators, not just the ordinary candidate.
+// ---------------------------------------------------------------------
+describe("generateBuyerCandidates — Pass 6: effectiveCeiling reaches the trade candidates too", () => {
+  // No previousBuyerUnitPrice, so each trade's own upperBound is exactly
+  // effectiveCeiling (see buyerQuantityTrade.test.ts's own Pass 6 tests
+  // for why this isolates the effect cleanly).
+  const openNoPreviousPrice: BuyerCandidateStrategyContext = {
+    priorMerchantUnitPrice: 47000,
+    previousBuyerUnitPrice: undefined,
+    leverageScore: 60,
+    quantityTradeAlreadyUsed: false,
+    deliveryTradeAlreadyUsed: false,
+  };
+
+  it("a higher effectiveCeiling raises the QUANTITY_FOR_PRICE candidate's price above the hard maxUnitPrice", () => {
+    const hard = generateBuyerCandidates(constraints, 200000, 50, ctx(3), openNoPreviousPrice, maxDeliveryDays);
+    const flexible = generateBuyerCandidates(constraints, 200000, 50, ctx(3), openNoPreviousPrice, maxDeliveryDays, 100000);
+
+    const hardTrade = hard.find((c) => c.move === "QUANTITY_FOR_PRICE");
+    const flexibleTrade = flexible.find((c) => c.move === "QUANTITY_FOR_PRICE");
+    expect(hardTrade).toBeDefined();
+    expect(flexibleTrade).toBeDefined();
+    expect(hardTrade!.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    expect(flexibleTrade!.unitPrice).toBeLessThanOrEqual(100000);
+    expect(flexibleTrade!.unitPrice).toBeGreaterThan(hardTrade!.unitPrice);
+  });
+
+  it("a higher effectiveCeiling raises the DELIVERY_FOR_PRICE candidate's price above the hard maxUnitPrice", () => {
+    const hard = generateBuyerCandidates(constraints, 200000, 50, ctx(3), openNoPreviousPrice, maxDeliveryDays);
+    const flexible = generateBuyerCandidates(constraints, 200000, 50, ctx(3), openNoPreviousPrice, maxDeliveryDays, 100000);
+
+    const hardTrade = hard.find((c) => c.move === "DELIVERY_FOR_PRICE");
+    const flexibleTrade = flexible.find((c) => c.move === "DELIVERY_FOR_PRICE");
+    expect(hardTrade).toBeDefined();
+    expect(flexibleTrade).toBeDefined();
+    expect(hardTrade!.unitPrice).toBeLessThanOrEqual(constraints.maxUnitPrice);
+    expect(flexibleTrade!.unitPrice).toBeLessThanOrEqual(100000);
+    expect(flexibleTrade!.unitPrice).toBeGreaterThan(hardTrade!.unitPrice);
+  });
+
+  it("omitting effectiveCeiling entirely reproduces the exact pre-Pass-6 candidate set", () => {
+    const withoutParam = generateBuyerCandidates(constraints, 46800, 50, ctx(3), openStrategy, maxDeliveryDays);
+    const withExplicitMax = generateBuyerCandidates(
+      constraints,
+      46800,
+      50,
+      ctx(3),
+      openStrategy,
+      maxDeliveryDays,
+      constraints.maxUnitPrice,
+    );
+    expect(withExplicitMax).toEqual(withoutParam);
+  });
+});

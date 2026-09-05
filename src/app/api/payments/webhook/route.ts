@@ -1,11 +1,12 @@
 import { verifyWebhookSignature } from "@/lib/payment/razorpayClient";
 import {
+  findResolvableAttemptByOrderIdForSuccess,
   findUnresolvedAttemptByOrderId,
   hasWebhookEventBeenProcessed,
+  recordReportedCheckoutFailure,
   recordWebhookReceived,
+  resolvePaymentAttempt,
 } from "@/lib/payment/paymentRepository";
-import { resolvePaymentAttempt } from "@/lib/payment/paymentRepository";
-import { classifyCheckoutFailure } from "@/lib/payment/paymentFailure";
 
 function jsonResponse(body: unknown, status: number) {
   return new Response(JSON.stringify(body), {
@@ -87,32 +88,56 @@ export async function POST(request: Request) {
     return jsonResponse({ status: "ok" }, 200);
   }
 
-  const attempt = await findUnresolvedAttemptByOrderId(orderId);
-  if (!attempt) {
-    // No currently-unresolved attempt for this order — either already
-    // settled by the other path, or an order this deployment has no
-    // record of. Never an error; still recorded for idempotency.
-    await recordWebhookReceived({ eventId: effectiveEventId, eventType, rawPayload: payload });
-    return jsonResponse({ status: "ok" }, 200);
-  }
+  // The "created"-only lookup — the normal case, and the only one a
+  // FAILURE event is ever allowed to correlate against (see below).
+  const openAttempt = await findUnresolvedAttemptByOrderId(orderId);
+  // Correlation actually used to decide/record what happened this call —
+  // populated below per event type.
+  let resolvedAttempt: { agreementId: string; id: string } | null = null;
 
   if (SUCCESS_EVENTS.has(eventType)) {
-    await resolvePaymentAttempt({ attempt, outcome: "success", razorpayPaymentId: paymentId, source: "webhook" });
+    // Pass 7: a genuine capture must still resolve the order even when
+    // the only PaymentAttempt row already reads "failed" — see
+    // findResolvableAttemptByOrderIdForSuccess's own doc comment for why
+    // ("a failed ATTEMPT is not necessarily a failed ORDER").
+    const attempt = openAttempt ?? (await findResolvableAttemptByOrderIdForSuccess(orderId));
+    if (attempt) {
+      await resolvePaymentAttempt({ attempt, outcome: "success", razorpayPaymentId: paymentId, source: "webhook" });
+      resolvedAttempt = attempt;
+    }
   } else if (FAILURE_EVENTS.has(eventType)) {
-    const failureReason = classifyCheckoutFailure(payload.payload?.payment?.entity?.error_code);
-    await resolvePaymentAttempt({ attempt, outcome: "failed", failureReason, source: "webhook" });
+    // Pass 7: a webhook `payment.failed` event is per-PAYMENT, not
+    // per-ORDER — Razorpay's own Checkout retry (enabled by default,
+    // see PaymentPanel.tsx) may still succeed against the SAME order, so
+    // this must never terminalize the attempt/Agreement (the exact bug
+    // this pass fixes — a premature "failed" made the later genuine
+    // capture unmatchable). Recorded as audit-only history instead,
+    // mirroring recordReportedCheckoutFailure's own treatment of a
+    // browser-reported decline exactly (M13.2) — only linked to the
+    // attempt when it's still the currently-open one, never invented.
+    if (openAttempt) {
+      await recordReportedCheckoutFailure({
+        agreementId: openAttempt.agreementId,
+        paymentAttemptId: openAttempt.id,
+        razorpayOrderId: orderId,
+        errorCode: payload.payload?.payment?.entity?.error_code,
+        reportedPaymentId: paymentId,
+      });
+      resolvedAttempt = openAttempt;
+    }
   }
-  // Any other event type: recorded (below) but no state transition — see
-  // this route's own comment on SUCCESS_EVENTS/FAILURE_EVENTS being the
-  // only two outcomes PACT's current flow needs to act on (Milestone 13
-  // §"payment events": implement only what the chosen flow requires,
-  // never a giant provider-event enum).
+  // Any other event type, or no matching attempt at all: recorded
+  // (below) but no state transition — see this route's own comment on
+  // SUCCESS_EVENTS/FAILURE_EVENTS being the only two outcomes PACT's
+  // current flow needs to act on (Milestone 13 §"payment events":
+  // implement only what the chosen flow requires, never a giant
+  // provider-event enum).
 
   await recordWebhookReceived({
     eventId: effectiveEventId,
     eventType,
-    agreementId: attempt.agreementId,
-    paymentAttemptId: attempt.id,
+    agreementId: resolvedAttempt?.agreementId,
+    paymentAttemptId: resolvedAttempt?.id,
     rawPayload: payload,
   });
 

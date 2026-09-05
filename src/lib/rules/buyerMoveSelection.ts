@@ -74,6 +74,21 @@ export function generateBuyerCandidates(
    * own doc comment for the real-world case this fixes.
    */
   maxDeliveryDays: number,
+  /**
+   * Pass 4 (budgetFlexible): the buyer's resolved effective price bound
+   * for this round (resolveEffectiveBudgetCeiling, buyerRules.ts).
+   * Optional and additive: omitting it reproduces exactly today's
+   * (pre-Pass-4) behavior, since every callee below defaults it to
+   * constraints.maxUnitPrice on its own.
+   *
+   * Pass 6: now threaded into ALL FOUR candidate generators (previously
+   * only the "ordinary" HOLD/CONCEDE candidate) so a flexible buyer's
+   * quantity/delivery/combined trade offers can reach the same bound its
+   * ordinary concession path already could — closing the Pass 5 P2
+   * finding that the three trade modules stayed capped at the hard
+   * maxUnitPrice regardless of budgetFlexible.
+   */
+  effectiveCeiling?: number,
 ): CandidateMove[] {
   const candidates: CandidateMove[] = [];
 
@@ -84,6 +99,7 @@ export function generateBuyerCandidates(
     strategyContext?.priorMerchantUnitPrice,
     strategyContext?.previousBuyerUnitPrice,
     strategyContext?.leverageScore,
+    effectiveCeiling,
   );
   candidates.push({
     move: ordinary.move,
@@ -100,6 +116,7 @@ export function generateBuyerCandidates(
     strategyContext?.previousBuyerUnitPrice,
     strategyContext?.leverageScore,
     strategyContext?.quantityTradeAlreadyUsed ?? false,
+    effectiveCeiling,
   );
   if (quantityDecision.move === "QUANTITY_FOR_PRICE") {
     candidates.push({
@@ -118,6 +135,7 @@ export function generateBuyerCandidates(
     strategyContext?.leverageScore,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,
     maxDeliveryDays,
+    effectiveCeiling,
   );
   if (deliveryDecision.move === "DELIVERY_FOR_PRICE") {
     candidates.push({
@@ -146,6 +164,7 @@ export function generateBuyerCandidates(
     strategyContext?.quantityTradeAlreadyUsed ?? false,
     strategyContext?.deliveryTradeAlreadyUsed ?? false,
     maxDeliveryDays,
+    effectiveCeiling,
   );
   if (packageDecision.move === "QUANTITY_AND_DELIVERY_FOR_PRICE") {
     candidates.push({

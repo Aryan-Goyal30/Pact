@@ -11,13 +11,13 @@ export default async function NegotiatePage() {
   const manifest = await getPublicManifest();
 
   return (
-    <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-8 px-6 py-10 sm:py-14">
+    <div className="flex w-full flex-1 flex-col gap-8 py-6">
       <NegotiationDemo products={manifest.products} />
 
       {/* Catalog is deliberately secondary — a collapsed reference panel,
           not the dominant visual element of the page. */}
-      <details className="group rounded-xl border border-border">
-        <summary className="flex cursor-pointer list-none items-center justify-between px-5 py-4 text-sm font-medium text-foreground">
+      <details className="group mx-auto w-full max-w-5xl rounded-xl border border-border px-4 sm:px-6">
+        <summary className="flex cursor-pointer list-none items-center justify-between py-4 text-sm font-medium text-foreground">
           <span>
             Available products <span className="text-muted">({manifest.products.length})</span>
           </span>

@@ -123,7 +123,12 @@ describe("POST /api/agreements/:id/payment/verify", () => {
     expect(status).toBe(400);
   });
 
-  it("a duplicate verification of an already-resolved attempt does not re-apply or double-write", async () => {
+  // Pass 7: a duplicate verification of an already-resolved attempt is
+  // now a safe, idempotent 200 reporting the same real (paid) outcome —
+  // see findResolvableAttemptForSuccess's own doc comment for why this
+  // no longer needs to reject (the exact "webhook success before client
+  // success" ordering this pass hardens).
+  it("a duplicate verification of an already-resolved attempt is a safe idempotent no-op, never a double-write", async () => {
     const agreementId = await createTestAgreement();
     const order = await createOrderForAgreement(agreementId);
     const input = { razorpayOrderId: order.razorpayOrderId, razorpayPaymentId: "pay_1", razorpaySignature: MOCK_VALID_SIGNATURE };
@@ -132,7 +137,8 @@ describe("POST /api/agreements/:id/payment/verify", () => {
     const second = await callVerify(agreementId, input);
 
     expect(first.status).toBe(200);
-    expect(second.status).toBe(400); // no unresolved attempt left to verify — rejected, never silently re-applied
-    expect(await prisma.auditLog.count({ where: { agreementId, eventType: "PAYMENT_SUCCEEDED" } })).toBe(1);
+    expect(second.status).toBe(200);
+    expect(second.body.agreementStatus).toBe("paid");
+    expect(await prisma.auditLog.count({ where: { agreementId, eventType: "PAYMENT_SUCCEEDED" } })).toBe(1); // never double-written
   });
 });
