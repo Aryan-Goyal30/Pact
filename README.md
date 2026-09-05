@@ -367,7 +367,3 @@ agent that can actually negotiate bounded commercial terms with an AI
 buyer, under real inventory and pricing constraints, and hand off a
 genuine agreement into a real Razorpay payment — with the LLM kept
 strictly out of the decisions that move money or inventory.
-
-## Demo / video
-
-*Placeholder — add the demo video/deployment URL here before submission.*
